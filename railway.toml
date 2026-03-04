@@ -1,6 +1,14 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "cd saas-platform && npm install && npm run build"
+
+[build.nixpacksPlan.phases.setup]
+nixPkgs = ["nodejs_20", "npm-9_x"]
+
+[build.nixpacksPlan.phases.install]
+cmds = ["cd saas-platform && npm install"]
+
+[build.nixpacksPlan.phases.build]
+cmds = ["cd saas-platform && npm run build"]
 
 [deploy]
 startCommand = "cd saas-platform && node dist/index.js"
