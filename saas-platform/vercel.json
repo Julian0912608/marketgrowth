@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "src/index.ts",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "src/index.ts"
+    }
+  ]
+}
+```
+
+**Stap 2 — Commit** het bestand (klik "Commit changes")
+
+Vercel detecteert de wijziging automatisch en start een nieuwe deploy. Na ± 30 seconden ga je opnieuw naar:
+```
+https://marketgrowth.vercel.app/health
