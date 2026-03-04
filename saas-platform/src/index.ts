@@ -1,11 +1,10 @@
-// ============================================================
-// src/index.ts
-// ============================================================
-
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import { errorHandler } from './shared/middleware/error-handler';
-import { logger } from './shared/logging/logger';
+import { authRouter }       from './modules/auth/api/auth.routes';
+import { onboardingRouter } from './modules/onboarding/api/onboarding.routes';
+import { billingRouter }    from './modules/billing/api/billing.routes';
+import { errorHandler }     from './shared/middleware/error-handler';
+import { logger }           from './shared/logging/logger';
 
 const app = express();
 
@@ -21,7 +20,12 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Error handler
+// Routes
+app.use('/api/auth',       authRouter);
+app.use('/api/onboarding', onboardingRouter);
+app.use('/api/billing',    billingRouter);
+
+// Error handler (altijd als laatste)
 app.use(errorHandler());
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
