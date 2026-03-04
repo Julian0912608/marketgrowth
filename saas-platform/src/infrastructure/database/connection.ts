@@ -6,13 +6,13 @@
 // cross-tenant data access.
 // ============================================================
 
-import { Pool, PoolClient, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { getTenantContextOrNull } from '../../shared/middleware/tenant-context';
 import { logger } from '../../shared/logging/logger';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 20,                        // max connections in pool
+  max: 20,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
 });
@@ -21,19 +21,13 @@ pool.on('error', (err) => {
   logger.error('db.pool.error', { error: err.message });
 });
 
-// ─── Safe Query Wrapper ──────────────────────────────────────
-// Automatically sets app.tenant_id before every query so RLS
-// policies are always enforced. Throws if no tenant context
-// is active and allowNoTenant is not explicitly set to true.
-async function query<T = unknown>(
+async function query<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: unknown[],
   options?: { allowNoTenant?: boolean }
 ): Promise<QueryResult<T>> {
   const ctx = getTenantContextOrNull();
 
-  // Guard: prevent queries without tenant context unless explicitly allowed
-  // (allowed for: migrations, admin operations, auth queries)
   if (!ctx && !options?.allowNoTenant) {
     throw new Error(
       `[DB] Query attempted without tenant context.\n` +
@@ -45,7 +39,6 @@ async function query<T = unknown>(
   const start = Date.now();
 
   try {
-    // Set tenant context for RLS if we have one
     if (ctx) {
       await pool.query(`SELECT set_config('app.tenant_id', $1, true)`, [ctx.tenantId]);
     }
@@ -54,7 +47,6 @@ async function query<T = unknown>(
 
     const duration = Date.now() - start;
     if (duration > 1000) {
-      // Log slow queries for performance monitoring
       logger.warn('db.query.slow', {
         durationMs: duration,
         sql: sql.slice(0, 200),
@@ -71,9 +63,6 @@ async function query<T = unknown>(
   }
 }
 
-// ─── Transaction Helper ──────────────────────────────────────
-// Runs multiple queries in a single transaction.
-// Usage: await transaction(async (client) => { ... })
 async function transaction<T>(
   fn: (client: PoolClient) => Promise<T>
 ): Promise<T> {
@@ -83,7 +72,6 @@ async function transaction<T>(
   try {
     await client.query('BEGIN');
 
-    // Set tenant context for all queries in this transaction
     if (ctx) {
       await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [ctx.tenantId]);
     }
