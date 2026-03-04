@@ -17,7 +17,7 @@ import { logger } from '../../../shared/logging/logger';
 import { cache } from '../../../infrastructure/cache/redis';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
+  apiVersion: '2023-10-16',
 });
 
 // Stripe Price IDs per plan — stel deze in als environment variables
@@ -200,7 +200,7 @@ export class BillingService {
         amount:      inv.amount_paid / 100,
         currency:    inv.currency.toUpperCase(),
         status:      inv.status ?? 'unknown',
-        downloadUrl: inv.invoice_pdf,
+        downloadUrl: inv.invoice_pdf ?? null,
       })),
     };
 
