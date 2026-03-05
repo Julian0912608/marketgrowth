@@ -1,5 +1,6 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
+import cors from 'cors';
 import { authRouter }         from './modules/auth/api/auth.routes';
 import { onboardingRouter }   from './modules/onboarding/api/onboarding.routes';
 import { billingRouter }      from './modules/billing/api/billing.routes';
@@ -9,6 +10,18 @@ import { errorHandler }       from './shared/middleware/error-handler';
 import { logger }             from './shared/logging/logger';
 
 const app = express();
+
+app.use(cors({
+  origin: [
+    'https://marketgrowth-frontend.vercel.app',
+    'https://marketgrowth-frontend-hsxhw87fx-julian0912608s-projects.vercel.app',
+    /\.vercel\.app$/,
+    'http://localhost:3000',
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
