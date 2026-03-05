@@ -1,31 +1,29 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import { authRouter }       from './modules/auth/api/auth.routes';
-import { onboardingRouter } from './modules/onboarding/api/onboarding.routes';
-import { billingRouter }    from './modules/billing/api/billing.routes';
-import { errorHandler }     from './shared/middleware/error-handler';
-import { logger }           from './shared/logging/logger';
+import { authRouter }         from './modules/auth/api/auth.routes';
+import { onboardingRouter }   from './modules/onboarding/api/onboarding.routes';
+import { billingRouter }      from './modules/billing/api/billing.routes';
+import { integrationsRouter } from './modules/integrations/api/integrations.routes';
+import { analyticsRouter }    from './modules/analytics/api/analytics.routes';
+import { errorHandler }       from './shared/middleware/error-handler';
+import { logger }             from './shared/logging/logger';
 
 const app = express();
 
-// Stripe webhook heeft raw body nodig — vóór express.json()
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
-
-// Standaard middleware
 app.use(express.json());
 app.use(cookieParser());
 
-// Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Routes
-app.use('/api/auth',       authRouter);
-app.use('/api/onboarding', onboardingRouter);
-app.use('/api/billing',    billingRouter);
+app.use('/api/auth',         authRouter);
+app.use('/api/onboarding',   onboardingRouter);
+app.use('/api/billing',      billingRouter);
+app.use('/api/integrations', integrationsRouter);
+app.use('/api/analytics',    analyticsRouter);
 
-// Error handler (altijd als laatste)
 app.use(errorHandler());
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
