@@ -46,7 +46,7 @@ integrationsRouter.get('/shopify/callback', async (req: Request, res: Response) 
 
   // Direct eerste sync starten
   syncService.syncConnection(connectionId).catch(err =>
-    logger.error('shopify.initial_sync.failed', { connectionId, error: err.message })
+    logger.error('shopify.initial_sync.failed', { connectionId, error: ((err as Error).message) })
   );
 
   res.redirect(`${process.env.APP_URL}/dashboard/integrations?connected=shopify&shop=${shopName}`);
