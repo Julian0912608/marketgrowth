@@ -47,8 +47,8 @@ export class ShopifyConnector extends PlatformConnector {
     // Rate limit handling: Shopify gebruikt 2 req/sec (40 bucket)
     // Bij 429: wacht en retry
     this.client.interceptors.response.use(
-      res => res,
-      async err => {
+      (res: any) => res,
+      async (err: any) => {
         if (err.response?.status === 429) {
           const retryAfter = parseInt(err.response.headers['retry-after'] ?? '2', 10);
           await new Promise(r => setTimeout(r, retryAfter * 1000));
