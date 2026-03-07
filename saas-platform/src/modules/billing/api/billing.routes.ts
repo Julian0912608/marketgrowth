@@ -1,78 +1,27 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import { db } from '../../../infrastructure/database/connection';
 import { getTenantContext } from '../../../infrastructure/database/connection';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { logger } from '../../../shared/logging/logger';
 
-export const billingRouter = Router();
-
-// Tenant middleware op alle billing routes
-billingRouter.use((req, res, next) => tenantMiddleware()(req, res, next));
+const router = Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
   apiVersion: '2023-10-16' as any,
 });
 
-// ── GET /api/billing/subscription ────────────────────────────
-billingRouter.get('/subscription', async (req: Request, res: Response) => {
-  try {
-    const { tenantId } = getTenantContext();
-
-    const result = await db.query(
-      `SELECT t.plan_slug, t.stripe_customer_id, t.stripe_subscription_id,
-              t.billing_status, t.trial_ends_at, t.current_period_end
-       FROM tenants t
-       WHERE t.id = $1`,
-      [tenantId]
-    );
-
-    res.json(result.rows[0] || { plan_slug: 'starter', billing_status: 'active' });
-  } catch (err: any) {
-    logger.error('billing.subscription.error', { error: err.message });
-    res.status(500).json({ error: 'Kon abonnement niet ophalen' });
-  }
-});
-
-// ── POST /api/billing/portal ──────────────────────────────────
-billingRouter.post('/portal', async (req: Request, res: Response) => {
-  try {
-    const { tenantId } = getTenantContext();
-
-    const result = await db.query(
-      'SELECT stripe_customer_id FROM tenants WHERE id = $1',
-      [tenantId]
-    );
-
-    const customerId = result.rows[0]?.stripe_customer_id;
-    if (!customerId) {
-      res.status(400).json({ error: 'Geen Stripe klant gevonden' });
-      return;
-    }
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer:   customerId,
-      return_url: `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard/settings`,
-    });
-
-    res.json({ url: session.url });
-  } catch (err: any) {
-    logger.error('billing.portal.error', { error: err.message });
-    res.status(500).json({ error: 'Kon portal niet openen' });
-  }
-});
+const priceMap: Record<string, string> = {
+  starter: process.env.STRIPE_PRICE_STARTER || '',
+  growth:  process.env.STRIPE_PRICE_GROWTH  || '',
+  scale:   process.env.STRIPE_PRICE_SCALE   || '',
+};
 
 // ── POST /api/billing/checkout ────────────────────────────────
-billingRouter.post('/checkout', async (req: Request, res: Response) => {
+router.post('/checkout', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
     const { planSlug } = req.body;
-
-    const priceMap: Record<string, string> = {
-      starter: process.env.STRIPE_PRICE_STARTER || '',
-      growth:  process.env.STRIPE_PRICE_GROWTH  || '',
-      scale:   process.env.STRIPE_PRICE_SCALE   || '',
-    };
 
     const priceId = priceMap[planSlug];
     if (!priceId) {
@@ -95,19 +44,55 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
       line_items:           [{ price: priceId, quantity: 1 }],
       success_url:          `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard?upgraded=true`,
       cancel_url:           `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/onboarding`,
-      metadata:             { tenantId },
+      metadata:             { tenantId, planSlug },
     });
 
     res.json({ url: session.url });
-  } catch (err: any) {
-    logger.error('billing.checkout.error', { error: err.message });
-    res.status(500).json({ error: 'Kon checkout niet starten' });
-  }
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/billing/subscription ────────────────────────────
+router.get('/subscription', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+
+    const result = await db.query(
+      `SELECT plan_slug, billing_status FROM tenants WHERE id = $1`,
+      [tenantId]
+    );
+
+    res.json(result.rows[0] || { plan_slug: 'starter', billing_status: 'active' });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/billing/portal ──────────────────────────────────
+router.post('/portal', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+
+    const result = await db.query(
+      'SELECT stripe_customer_id FROM tenants WHERE id = $1',
+      [tenantId]
+    );
+
+    const customerId = result.rows[0]?.stripe_customer_id;
+    if (!customerId) {
+      res.status(400).json({ error: 'Geen Stripe klant gevonden' });
+      return;
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer:   customerId,
+      return_url: `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard/settings`,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) { next(err); }
 });
 
 // ── POST /api/billing/webhook ─────────────────────────────────
-// Webhook heeft GEEN tenantMiddleware nodig — komt van Stripe
-billingRouter.post('/webhook', async (req: Request, res: Response) => {
+// Geen tenantMiddleware — komt van Stripe
+router.post('/webhook', async (req: Request, res: Response, next: NextFunction) => {
   const sig    = req.headers['stripe-signature'];
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -120,7 +105,6 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, secret);
   } catch (err: any) {
-    logger.warn('billing.webhook.invalid', { error: err.message });
     res.status(400).json({ error: 'Ongeldige webhook' });
     return;
   }
@@ -130,35 +114,18 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
       case 'checkout.session.completed': {
         const session  = event.data.object as Stripe.Checkout.Session;
         const tenantId = session.metadata?.tenantId;
+        const planSlug = session.metadata?.planSlug;
         if (!tenantId) break;
 
         await db.query(
           `UPDATE tenants SET
              stripe_customer_id     = $2,
              stripe_subscription_id = $3,
+             plan_slug              = $4,
              billing_status         = 'active',
              updated_at             = now()
            WHERE id = $1`,
-          [tenantId, session.customer, session.subscription],
-          { allowNoTenant: true }
-        );
-        break;
-      }
-
-      case 'customer.subscription.updated':
-      case 'customer.subscription.deleted': {
-        const sub = event.data.object as Stripe.Subscription;
-        await db.query(
-          `UPDATE tenants SET
-             billing_status     = $2,
-             current_period_end = to_timestamp($3),
-             updated_at         = now()
-           WHERE stripe_subscription_id = $1`,
-          [
-            sub.id,
-            sub.status === 'active' ? 'active' : 'cancelled',
-            (sub as any).current_period_end,
-          ],
+          [tenantId, session.customer, session.subscription, planSlug],
           { allowNoTenant: true }
         );
         break;
@@ -166,8 +133,7 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
     }
 
     res.json({ received: true });
-  } catch (err: any) {
-    logger.error('billing.webhook.processing.error', { type: event.type, error: err.message });
-    res.status(500).json({ error: 'Webhook verwerking mislukt' });
-  }
+  } catch (err) { next(err); }
 });
+
+export { router as billingRouter };
