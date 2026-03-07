@@ -5,12 +5,12 @@ import { db } from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 
 interface RegisterInput {
-  firstName: string;
-  lastName:  string;
-  email:     string;
-  password:  string;
+  firstName:   string;
+  lastName:    string;
+  email:       string;
+  password:    string;
   companyName?: string;
-  planSlug?: string;
+  planSlug?:   string;
 }
 
 interface LoginInput {
@@ -70,9 +70,9 @@ export class AuthService {
     const tenantSlug = generateSlug(tenantName);
 
     await db.query(
-      `INSERT INTO tenants (id, name, slug, plan_slug, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, 'active', now(), now())`,
-      [tenantId, tenantName, tenantSlug, planSlug],
+      `INSERT INTO tenants (id, name, slug, email, plan_slug, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', now(), now())`,
+      [tenantId, tenantName, tenantSlug, email.toLowerCase(), planSlug],
       { allowNoTenant: true }
     );
 
@@ -142,12 +142,12 @@ export class AuthService {
   }
 
   private generateTokens(
-    userId: string,
-    tenantId: string,
-    email: string,
+    userId:    string,
+    tenantId:  string,
+    email:     string,
     firstName: string,
-    lastName: string,
-    planSlug: string
+    lastName:  string,
+    planSlug:  string
   ): AuthResult {
     const secret = JWT_SECRET();
 
@@ -205,12 +205,12 @@ export class AuthService {
 
     const accessToken = jwt.sign(
       {
-        sub: payload.sub,
-        tenantId: payload.tenantId,
-        email: user.email,
-        planSlug: user.plan_slug,
+        sub:       payload.sub,
+        tenantId:  payload.tenantId,
+        email:     user.email,
+        planSlug:  user.plan_slug,
         firstName: user.first_name,
-        lastName: user.last_name,
+        lastName:  user.last_name,
       },
       JWT_SECRET(),
       { expiresIn: ACCESS_TOKEN_TTL }
