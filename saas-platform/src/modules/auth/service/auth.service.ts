@@ -1,11 +1,3 @@
-// src/modules/auth/service/auth.service.ts
-//
-// KRITIEKE FIXES:
-// 1. Registratie werkt zonder Redis (Redis is optioneel)
-// 2. Juiste tenant aanmaken bij registratie
-// 3. JWT tokens correct aanmaken
-// 4. Wachtwoord hashing met bcrypt
-
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
@@ -17,6 +9,7 @@ interface RegisterInput {
   lastName:  string;
   email:     string;
   password:  string;
+  companyName?: string;
   planSlug?: string;
 }
 
@@ -38,18 +31,26 @@ interface AuthResult {
   };
 }
 
-const JWT_SECRET          = () => process.env.JWT_SECRET || 'dev-secret-change-in-production';
-const ACCESS_TOKEN_TTL    = '15m';
-const REFRESH_TOKEN_TTL   = '30d';
-const BCRYPT_ROUNDS       = 12;
+const JWT_SECRET        = () => process.env.JWT_SECRET || 'dev-secret-change-in-production';
+const ACCESS_TOKEN_TTL  = '15m';
+const REFRESH_TOKEN_TTL = '30d';
+const BCRYPT_ROUNDS     = 12;
+
+function generateSlug(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 50)
+    + '-' + uuidv4().substring(0, 8);
+}
 
 export class AuthService {
 
-  // ── Registratie ───────────────────────────────────────────
   async register(input: RegisterInput): Promise<AuthResult> {
-    const { firstName, lastName, email, password, planSlug = 'starter' } = input;
+    const { firstName, lastName, email, password, companyName, planSlug = 'starter' } = input;
 
-    // Check of email al bestaat
     const existing = await db.query(
       'SELECT id FROM users WHERE email = $1',
       [email.toLowerCase()],
@@ -62,21 +63,19 @@ export class AuthService {
       throw err;
     }
 
-    // Wachtwoord hashen
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    // Tenant aanmaken
     const tenantId   = uuidv4();
-    const tenantName = `${firstName} ${lastName}'s workspace`;
+    const tenantName = companyName || `${firstName} ${lastName}'s workspace`;
+    const tenantSlug = generateSlug(tenantName);
 
     await db.query(
-      `INSERT INTO tenants (id, name, plan_slug, status, created_at, updated_at)
-       VALUES ($1, $2, $3, 'active', now(), now())`,
-      [tenantId, tenantName, planSlug],
+      `INSERT INTO tenants (id, name, slug, plan_slug, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'active', now(), now())`,
+      [tenantId, tenantName, tenantSlug, planSlug],
       { allowNoTenant: true }
     );
 
-    // User aanmaken
     const userId = uuidv4();
     await db.query(
       `INSERT INTO users (
@@ -93,14 +92,12 @@ export class AuthService {
     return this.generateTokens(userId, tenantId, email, firstName, lastName, planSlug);
   }
 
-  // ── Login ─────────────────────────────────────────────────
   async login(input: LoginInput): Promise<AuthResult> {
     const { email, password } = input;
 
-    // User ophalen
     const result = await db.query<{
       id: string; tenant_id: string; password_hash: string;
-      first_name: string; last_name: string; status: string;
+      first_name: string; last_name: string; status: string; plan_slug: string;
     }>(
       `SELECT u.id, u.tenant_id, u.password_hash, u.first_name, u.last_name, u.status,
               t.plan_slug
@@ -125,7 +122,6 @@ export class AuthService {
       throw err;
     }
 
-    // Wachtwoord controleren
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       const err: any = new Error('Onjuist e-mailadres of wachtwoord');
@@ -141,11 +137,10 @@ export class AuthService {
       email,
       user.first_name,
       user.last_name,
-      (result.rows[0] as any).plan_slug || 'starter'
+      user.plan_slug || 'starter'
     );
   }
 
-  // ── Token generatie ───────────────────────────────────────
   private generateTokens(
     userId: string,
     tenantId: string,
@@ -175,7 +170,6 @@ export class AuthService {
     };
   }
 
-  // ── Refresh token ─────────────────────────────────────────
   async refreshToken(token: string): Promise<{ accessToken: string }> {
     let payload: any;
     try {
@@ -192,7 +186,6 @@ export class AuthService {
       throw err;
     }
 
-    // Haal user info op voor nieuwe token
     const result = await db.query<{
       email: string; first_name: string; last_name: string; plan_slug: string;
     }>(
@@ -226,7 +219,6 @@ export class AuthService {
     return { accessToken };
   }
 
-  // ── Profiel ophalen ───────────────────────────────────────
   async getProfile(userId: string): Promise<object> {
     const result = await db.query(
       `SELECT u.id, u.email, u.first_name, u.last_name, u.role, u.created_at,
