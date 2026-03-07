@@ -43,8 +43,3 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 export default app;
-```
-
-Daarna ga je naar Railway → je backend service → **Variables** en voeg toe:
-```
-FRONTEND_URL=https://marketgrowth-frontend.vercel.app
