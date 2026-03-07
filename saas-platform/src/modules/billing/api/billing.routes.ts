@@ -1,15 +1,14 @@
-// src/modules/billing/api/billing.routes.ts
-//
-// FIX: getTenantContext() heeft geen argumenten nodig
-// FIX: errorHandler is geen functie-aanroep meer
-
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
 import { db } from '../../../infrastructure/database/connection';
 import { getTenantContext } from '../../../infrastructure/database/connection';
+import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { logger } from '../../../shared/logging/logger';
 
 export const billingRouter = Router();
+
+// Tenant middleware op alle billing routes
+billingRouter.use(tenantMiddleware());
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
   apiVersion: '2023-10-16' as any,
@@ -70,8 +69,9 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
     const { planSlug } = req.body;
 
     const priceMap: Record<string, string> = {
-      growth: process.env.STRIPE_PRICE_GROWTH || '',
-      pro:    process.env.STRIPE_PRICE_PRO    || '',
+      starter: process.env.STRIPE_PRICE_STARTER || '',
+      growth:  process.env.STRIPE_PRICE_GROWTH  || '',
+      scale:   process.env.STRIPE_PRICE_SCALE   || '',
     };
 
     const priceId = priceMap[planSlug];
@@ -88,14 +88,14 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
     const { email, stripe_customer_id: existingCustomerId } = userResult.rows[0] || {};
 
     const session = await stripe.checkout.sessions.create({
-      mode:               'subscription',
+      mode:                 'subscription',
       payment_method_types: ['card'],
-      customer:           existingCustomerId || undefined,
-      customer_email:     existingCustomerId ? undefined : email,
-      line_items:         [{ price: priceId, quantity: 1 }],
-      success_url:        `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard?upgraded=true`,
-      cancel_url:         `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard/settings`,
-      metadata:           { tenantId },
+      customer:             existingCustomerId || undefined,
+      customer_email:       existingCustomerId ? undefined : email,
+      line_items:           [{ price: priceId, quantity: 1 }],
+      success_url:          `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard?upgraded=true`,
+      cancel_url:           `${process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app'}/onboarding`,
+      metadata:             { tenantId },
     });
 
     res.json({ url: session.url });
@@ -106,6 +106,7 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
 });
 
 // ── POST /api/billing/webhook ─────────────────────────────────
+// Webhook heeft GEEN tenantMiddleware nodig — komt van Stripe
 billingRouter.post('/webhook', async (req: Request, res: Response) => {
   const sig    = req.headers['stripe-signature'];
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -149,9 +150,9 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
         const sub = event.data.object as Stripe.Subscription;
         await db.query(
           `UPDATE tenants SET
-             billing_status   = $2,
+             billing_status     = $2,
              current_period_end = to_timestamp($3),
-             updated_at       = now()
+             updated_at         = now()
            WHERE stripe_subscription_id = $1`,
           [
             sub.id,
