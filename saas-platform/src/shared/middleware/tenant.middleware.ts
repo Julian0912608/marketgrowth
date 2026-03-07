@@ -1,20 +1,46 @@
-// src/shared/middleware/tenant.middleware.ts
-//
-// Zet de tenant context op basis van het JWT token.
-// Wordt aangeroepen NA authenticate middleware.
-
 import { Request, Response, NextFunction } from 'express';
-import { runWithTenant } from '../../infrastructure/database/connection';
+import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from 'uuid';
+import { runWithTenantContext } from './tenant-context';
+import { db } from '../../infrastructure/database/connection';
 
-export function tenantMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const user = (req as any).user;
+export function tenantMiddleware() {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const authHeader = req.headers.authorization;
 
-  if (!user?.tenantId) {
-    // Geen tenant — dit kan bij sommige publieke endpoints
-    next();
-    return;
-  }
+    if (!authHeader?.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Niet ingelogd' });
+      return;
+    }
 
-  // Wrap de rest van de request in tenant context
-  runWithTenant(user.tenantId, () => next());
+    const token = authHeader.split(' ')[1];
+
+    let payload: any;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret-change-in-production');
+    } catch (err) {
+      res.status(401).json({ error: 'Ongeldige of verlopen sessie' });
+      return;
+    }
+
+    const context = {
+      tenantId:         payload.tenantId,
+      tenantSlug:       payload.tenantSlug || '',
+      userId:           payload.sub,
+      planSlug:         payload.planSlug || 'starter',
+      traceId:          uuidv4(),
+      requestStartedAt: new Date(),
+    };
+
+    try {
+      await db.query(
+        `SELECT set_config('app.tenant_id', $1, true)`,
+        [context.tenantId]
+      );
+    } catch {
+      // Doorgaan ook als set_config faalt
+    }
+
+    runWithTenantContext(context, () => next());
+  };
 }
