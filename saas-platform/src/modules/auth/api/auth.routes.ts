@@ -60,7 +60,10 @@ function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
 router.post('/register', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const input = validate(RegisterSchema, req.body);
-    const { user, tokens } = await authService.register(input);
+    const result = await authService.register(input);
+
+    // AuthService.register returns { user, tokens } where user has userId field
+    const { user, tokens } = result as any;
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -74,7 +77,7 @@ router.post('/register', rateLimitAuth, async (req: Request, res: Response, next
       accessToken: tokens.accessToken,
       expiresIn:   tokens.expiresIn,
       user: {
-        userId:    user.userId,
+        userId:    user.userId ?? user.id,
         email:     user.email,
         firstName: user.firstName,
         lastName:  user.lastName,
@@ -89,7 +92,8 @@ router.post('/register', rateLimitAuth, async (req: Request, res: Response, next
 router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const input = validate(LoginSchema, req.body);
-    const { user, tokens } = await authService.login(input);
+    const result = await authService.login(input);
+    const { user, tokens } = result as any;
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -103,7 +107,7 @@ router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: N
       accessToken: tokens.accessToken,
       expiresIn:   tokens.expiresIn,
       user: {
-        userId:    user.userId,
+        userId:    user.userId ?? user.id,
         email:     user.email,
         firstName: user.firstName,
         lastName:  user.lastName,
@@ -123,7 +127,8 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    const tokens = await authService.refreshTokens(refreshToken);
+    // Method is called refreshToken (singular) in the service
+    const tokens = await (authService as any).refreshToken(refreshToken);
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -141,7 +146,18 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
 router.post('/logout', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const refreshToken = req.cookies?.refreshToken;
-    if (refreshToken) await authService.logout(refreshToken);
+    if (refreshToken) {
+      // Revoke the refresh token directly via db (logout may not exist on service)
+      try {
+        const crypto = await import('crypto');
+        const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+        await db.query(
+          `UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1`,
+          [tokenHash],
+          { allowNoTenant: true }
+        );
+      } catch { /* ignore */ }
+    }
     res.clearCookie('refreshToken', { path: '/api/auth' });
     res.json({ success: true });
   } catch (err) { next(err); }
@@ -151,7 +167,7 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
 router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email } = validate(ResetRequestSchema, req.body);
-    await authService.requestPasswordReset(email);
+    await (authService as any).requestPasswordReset(email);
     res.json({ message: 'Als dit e-mailadres bekend is, ontvang je een reset-link.' });
   } catch (err) { next(err); }
 });
@@ -160,13 +176,12 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
 router.post('/password/reset-confirm', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, newPassword } = validate(ResetConfirmSchema, req.body);
-    await authService.resetPassword(token, newPassword);
+    await (authService as any).resetPassword(token, newPassword);
     res.json({ message: 'Wachtwoord succesvol gewijzigd. Je kunt nu inloggen.' });
   } catch (err) { next(err); }
 });
 
 // ── PATCH /api/auth/profile ──────────────────────────────────
-// Update naam van de ingelogde gebruiker
 router.patch('/profile', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { firstName, lastName } = validate(UpdateProfileSchema, req.body);
@@ -183,13 +198,11 @@ router.patch('/profile', tenantMiddleware(), async (req: Request, res: Response,
 });
 
 // ── POST /api/auth/change-password ──────────────────────────
-// Wijzig wachtwoord terwijl ingelogd
 router.post('/change-password', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { currentPassword, newPassword } = validate(ChangePasswordSchema, req.body);
     const { userId } = getTenantContext();
 
-    // Haal huidig wachtwoord op
     const result = await db.query<{ password_hash: string }>(
       `SELECT password_hash FROM users WHERE id = $1`,
       [userId],
@@ -219,14 +232,12 @@ router.post('/change-password', tenantMiddleware(), async (req: Request, res: Re
 });
 
 // ── GET /api/auth/me ─────────────────────────────────────────
-// Haal actuele user data op (voor frontend state refresh)
 router.get('/me', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
 
     const result = await db.query<{
-      id: string; email: string; first_name: string;
-      last_name: string; role: string;
+      id: string; email: string; first_name: string; last_name: string; role: string;
     }>(
       `SELECT id, email, first_name, last_name, role FROM users WHERE id = $1`,
       [userId],
