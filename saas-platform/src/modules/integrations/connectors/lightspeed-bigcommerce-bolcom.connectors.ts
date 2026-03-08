@@ -335,8 +335,8 @@ export class BolcomConnector implements IPlatformConnector {
         const detail = await this.apiGet(token, `/retailer/orders/${orderId}`) as Record<string, unknown>;
         orders.push(this.normalizeOrderDetail(detail));
       } catch {
-        // Fallback: gebruik shipment data zonder prijs (beter dan niets)
-        orders.push(this.normalizeShipment(s));
+        // Fallback: gebruik shipment maar met orderId als externalId (NIET shipmentId/UUID)
+        orders.push(this.normalizeShipment({ ...s, _overrideExternalId: orderId }));
       }
     }
 
@@ -370,11 +370,24 @@ export class BolcomConnector implements IPlatformConnector {
     // Haal detail op per order voor correcte prijzen
     const orders: NormalizedOrder[] = [];
     for (const o of rawOrders) {
+      // orderId kan op meerdere niveaus zitten in de bol.com API response
+      const orderId = String(
+        o.orderId ??
+        (o.order as Record<string, unknown> | undefined)?.orderId ??
+        ''
+      );
+
+      if (!orderId || orderId === 'undefined') {
+        // Geen orderId → sla over, niet opslaan met UUID als externalId
+        continue;
+      }
+
       try {
-        const detail = await this.apiGet(token, `/retailer/orders/${o.orderId}`) as Record<string, unknown>;
+        const detail = await this.apiGet(token, `/retailer/orders/${orderId}`) as Record<string, unknown>;
         orders.push(this.normalizeOrderDetail(detail));
       } catch {
-        orders.push(this.normalizeOrderSummary(o));
+        // Fallback: gebruik summary data — maar ALLEEN als er een echte orderId is
+        orders.push(this.normalizeOrderSummary({ ...o, orderId }));
       }
     }
 
@@ -525,7 +538,10 @@ export class BolcomConnector implements IPlatformConnector {
     const shipDate    = s.shipmentDate ?? s.orderPlacedDateTime;
 
     return {
-      externalId:        String(s.shipmentId ?? s.orderId ?? ''),
+      // _overrideExternalId: gebruik orderId als externalId, NIET shipmentId (UUID)
+      externalId:        s._overrideExternalId
+        ? String(s._overrideExternalId)
+        : (s.orderId ? String(s.orderId) : String(s.shipmentId ?? '')),
       externalNumber:    s.orderId ? String(s.orderId) : undefined,
       totalAmount,
       subtotalAmount:    totalAmount,
