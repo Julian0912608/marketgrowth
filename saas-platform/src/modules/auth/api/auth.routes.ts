@@ -60,10 +60,8 @@ function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
 router.post('/register', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const input = validate(RegisterSchema, req.body);
-    const result = await authService.register(input);
-
-    // AuthService.register returns { user, tokens } where user has userId field
-    const { user, tokens } = result as any;
+    const result = await authService.register(input) as any;
+    const { user, tokens } = result;
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -92,8 +90,8 @@ router.post('/register', rateLimitAuth, async (req: Request, res: Response, next
 router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const input = validate(LoginSchema, req.body);
-    const result = await authService.login(input);
-    const { user, tokens } = result as any;
+    const result = await authService.login(input) as any;
+    const { user, tokens } = result;
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -127,8 +125,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    // Method is called refreshToken (singular) in the service
-    const tokens = await (authService as any).refreshToken(refreshToken);
+    const tokens = await (authService as any).refreshToken(refreshToken) as any;
 
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
@@ -147,16 +144,13 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
   try {
     const refreshToken = req.cookies?.refreshToken;
     if (refreshToken) {
-      // Revoke the refresh token directly via db (logout may not exist on service)
-      try {
-        const crypto = await import('crypto');
-        const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
-        await db.query(
-          `UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1`,
-          [tokenHash],
-          { allowNoTenant: true }
-        );
-      } catch { /* ignore */ }
+      const crypto = require('crypto');
+      const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+      await db.query(
+        `UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1`,
+        [tokenHash],
+        { allowNoTenant: true }
+      );
     }
     res.clearCookie('refreshToken', { path: '/api/auth' });
     res.json({ success: true });
@@ -187,13 +181,32 @@ router.patch('/profile', tenantMiddleware(), async (req: Request, res: Response,
     const { firstName, lastName } = validate(UpdateProfileSchema, req.body);
     const { userId } = getTenantContext();
 
+    // Gebruik geen updated_at — kolom bestaat mogelijk nog niet
+    // Migration 004 voegt dit toe, maar query werkt ook zonder
     await db.query(
-      `UPDATE users SET first_name = $1, last_name = $2, updated_at = now() WHERE id = $3`,
+      `UPDATE users SET first_name = $1, last_name = $2 WHERE id = $3`,
       [firstName, lastName, userId],
       { allowNoTenant: true }
     );
 
-    res.json({ success: true, firstName, lastName });
+    // Haal bijgewerkte data terug voor bevestiging
+    const result = await db.query<{
+      id: string; email: string; first_name: string; last_name: string; role: string;
+    }>(
+      `SELECT id, email, first_name, last_name, role FROM users WHERE id = $1`,
+      [userId],
+      { allowNoTenant: true }
+    );
+
+    const u = result.rows[0];
+    res.json({
+      success:   true,
+      userId:    u.id,
+      email:     u.email,
+      firstName: u.first_name,
+      lastName:  u.last_name,
+      role:      u.role,
+    });
   } catch (err) { next(err); }
 });
 
@@ -222,7 +235,7 @@ router.post('/change-password', tenantMiddleware(), async (req: Request, res: Re
 
     const newHash = await bcrypt.hash(newPassword, 12);
     await db.query(
-      `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
       [newHash, userId],
       { allowNoTenant: true }
     );
