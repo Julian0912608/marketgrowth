@@ -218,8 +218,6 @@ export class WooCommerceConnector implements IPlatformConnector {
       acceptsMarketing: false,
       totalSpent:       parseFloat(c.total_spent ?? '0'),
       orderCount:       c.orders_count ?? 0,
-      firstOrderAt:     undefined,
-      lastOrderAt:      undefined,
       updatedAt:        new Date(c.date_modified ?? c.date_created),
     };
   }
