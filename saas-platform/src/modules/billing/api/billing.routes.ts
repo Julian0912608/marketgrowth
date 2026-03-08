@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import { db } from '../../../infrastructure/database/connection';
-import { getTenantContext } from '../../../infrastructure/database/connection';
+import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { logger } from '../../../shared/logging/logger';
 
