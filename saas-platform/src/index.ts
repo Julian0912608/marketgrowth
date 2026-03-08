@@ -79,6 +79,24 @@ try {
   console.error('  billingRouter FAILED:', e.message);
 }
 
+// ── FIX: integrationRouter was niet geregistreerd → 404 op /api/integrations ──
+try {
+  const { integrationRouter } = require('./modules/integrations/api/integration.routes');
+  app.use('/api/integrations', integrationRouter);
+  console.log('  integrationRouter OK');
+} catch (e: any) {
+  console.error('  integrationRouter FAILED:', e.message);
+}
+
+// ── FIX: analyticsRouter was niet geregistreerd → 404 op /api/analytics ──
+try {
+  const { analyticsRouter } = require('./modules/analytics/api/analytics.routes');
+  app.use('/api/analytics', analyticsRouter);
+  console.log('  analyticsRouter OK');
+} catch (e: any) {
+  console.error('  analyticsRouter FAILED:', e.message);
+}
+
 console.log('All routers loaded.');
 
 app.use(errorHandler());
