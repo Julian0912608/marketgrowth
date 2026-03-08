@@ -1,3 +1,16 @@
+// Vang ALLE onverwachte errors op zodat het process niet stopt
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err.message);
+  console.error(err.stack);
+  // Niet afsluiten — log en blijf draaien
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  console.error('UNHANDLED REJECTION:', reason?.message ?? reason);
+  console.error(reason?.stack ?? '');
+  // Niet afsluiten
+});
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -40,7 +53,6 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Laad elke router apart met try/catch zodat we zien welke crasht
 console.log('Loading routers...');
 
 try {
@@ -74,6 +86,7 @@ app.use(errorHandler());
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
   logger.info('server.started', { port: PORT, env: process.env.NODE_ENV });
+  console.log('Server draait op poort', PORT, '- blijft actief');
 });
 
 export default app;
