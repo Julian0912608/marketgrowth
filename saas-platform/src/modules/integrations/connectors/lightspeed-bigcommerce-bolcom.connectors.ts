@@ -14,7 +14,7 @@ import {
   ConnectionTestResult,
   TokenRefreshResult,
   NormalizedLineItem,
-} from '../types/integration.types';
+} from '../types/integration.types'
 
 // ============================================================
 // LIGHTSPEED
@@ -408,7 +408,7 @@ export class BolcomConnector implements IPlatformConnector {
     const token = await this.getAccessToken(creds);
 
     // Stap 1: vraag export aan
-    const exportReq = await this.apiPost(token, '/retailer/offers/export', {}) as {
+    const exportReq = await this.apiPost(token, '/retailer/offers/export', { filterType: 'ALL' }) as {
       processStatusId?: string;
     };
     const processStatusId = exportReq?.processStatusId;
