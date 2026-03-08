@@ -5,18 +5,35 @@
 import Redis from 'ioredis';
 import { logger } from '../../shared/logging/logger';
 
-const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
+function createRedisClient(): Redis {
+  const url = process.env.REDIS_URL ?? '';
 
-// Upstash en andere TLS Redis providers gebruiken rediss:// 
-// ioredis heeft extra TLS opties nodig voor zelfgetekende certificaten
-const redis = new Redis(redisUrl, {
-  maxRetriesPerRequest: 3,
-  lazyConnect:          true,
-  retryStrategy: (times) => Math.min(times * 100, 3000),
-  tls: redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
-});
+  if (!url) {
+    logger.warn('redis.no_url', { message: 'REDIS_URL niet ingesteld, gebruik localhost' });
+    return new Redis({ host: 'localhost', port: 6379, lazyConnect: true, maxRetriesPerRequest: 1 });
+  }
 
-redis.on('error',   (err) => logger.error('redis.error',     { error: err.message }));
+  // Parse de URL handmatig voor maximale compatibiliteit met Upstash
+  const parsed = new URL(url);
+  const isTls  = parsed.protocol === 'rediss:';
+
+  logger.info('redis.init', { host: parsed.hostname, port: parsed.port, tls: isTls });
+
+  return new Redis({
+    host:     parsed.hostname,
+    port:     parseInt(parsed.port || '6379', 10),
+    password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+    username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+    tls:      isTls ? { rejectUnauthorized: false } : undefined,
+    lazyConnect:          true,
+    maxRetriesPerRequest: 3,
+    retryStrategy: (times) => Math.min(times * 200, 5000),
+  });
+}
+
+const redis = createRedisClient();
+
+redis.on('error',   (err) => logger.error('redis.error',   { error: err.message }));
 redis.on('connect', ()    => logger.info('redis.connected'));
 
 const cache = {
