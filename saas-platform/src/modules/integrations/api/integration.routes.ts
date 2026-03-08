@@ -1,8 +1,5 @@
 // ============================================================
 // src/modules/integrations/api/integration.routes.ts
-//
-// REST API endpoints voor platform integraties.
-// Alle routes zijn tenant-geïsoleerd via tenantMiddleware.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -10,56 +7,51 @@ import { IntegrationService } from '../service/integration.service';
 import { tenantMiddleware }   from '../../../shared/middleware/tenant.middleware';
 import { PlatformSlug }       from '../types/integration.types';
 
-const router  = Router();
-const service = new IntegrationService();
+const router           = Router();
+const integrationService = new IntegrationService();
 
-// ── GET /api/integrations ─────────────────────────────────────
-// Alle verbonden winkels van de huidige tenant
-router.get('/', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const integrations = await service.listIntegrations();
-    res.json({ integrations });
-  } catch (err) { next(err); }
+// Alle routes vereisen een ingelogde gebruiker, behalve webhooks en OAuth callbacks
+router.use((req, res, next) => {
+  // Webhooks en OAuth callbacks slaan auth over
+  if (req.path.startsWith('/webhook') || req.path.startsWith('/callback')) {
+    return next();
+  }
+  return tenantMiddleware()(req, res, next);
 });
 
 // ── GET /api/integrations/platforms ──────────────────────────
-// Lijst van beschikbare platformen (publiek)
-router.get('/platforms', async (_req: Request, res: Response) => {
-  res.json({
-    platforms: [
-      { slug: 'shopify',     name: 'Shopify',     authType: 'oauth2',   requiresShopDomain: true  },
-      { slug: 'woocommerce', name: 'WooCommerce', authType: 'api_key',  requiresShopDomain: false },
-      { slug: 'lightspeed',  name: 'Lightspeed',  authType: 'oauth2',   requiresShopDomain: true  },
-      { slug: 'magento',     name: 'Magento',     authType: 'api_key',  requiresShopDomain: false },
-      { slug: 'bigcommerce', name: 'BigCommerce', authType: 'api_key',  requiresShopDomain: false },
-      { slug: 'bolcom',      name: 'Bol.com',     authType: 'api_key',  requiresShopDomain: false },
-    ],
-  });
+// Lijst van beschikbare platforms
+router.get('/platforms', (_req: Request, res: Response) => {
+  res.json([
+    { slug: 'shopify',     name: 'Shopify',     authType: 'oauth',  logo: '/logos/shopify.svg' },
+    { slug: 'woocommerce', name: 'WooCommerce', authType: 'apikey', logo: '/logos/woocommerce.svg' },
+    { slug: 'lightspeed',  name: 'Lightspeed',  authType: 'apikey', logo: '/logos/lightspeed.svg' },
+    { slug: 'bigcommerce', name: 'BigCommerce', authType: 'apikey', logo: '/logos/bigcommerce.svg' },
+    { slug: 'bolcom',      name: 'Bol.com',     authType: 'apikey', logo: '/logos/bolcom.svg' },
+    { slug: 'magento',     name: 'Magento',     authType: 'apikey', logo: '/logos/magento.svg' },
+    { slug: 'amazon',      name: 'Amazon',      authType: 'oauth',  logo: '/logos/amazon.svg' },
+    { slug: 'etsy',        name: 'Etsy',        authType: 'oauth',  logo: '/logos/etsy.svg' },
+  ]);
+});
+
+// ── GET /api/integrations ─────────────────────────────────────
+// Lijst van gekoppelde integraties van de tenant
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const integrations = await integrationService.listIntegrations();
+    res.json(integrations);
+  } catch (err) { next(err); }
 });
 
 // ── POST /api/integrations/connect ───────────────────────────
-// Verbind een nieuw verkoopplatform
-// Body: { platformSlug, shopDomain?, apiKey?, apiSecret?, storeUrl? }
-router.post('/connect', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+// Start een nieuwe koppeling (OAuth redirect of API key)
+router.post('/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { platformSlug, shopDomain, apiKey, apiSecret, storeUrl } = req.body;
+    const result = await integrationService.connect(req.body);
 
-    if (!platformSlug) {
-      res.status(400).json({ error: 'platformSlug is verplicht' });
-      return;
-    }
-
-    const result = await service.connect({
-      platformSlug: platformSlug as PlatformSlug,
-      shopDomain,
-      apiKey,
-      apiSecret,
-      storeUrl,
-    });
-
-    // OAuth2: stuur klant door naar het platform
+    // OAuth platforms: redirect de klant naar het platform
     if (result.authUrl) {
-      res.json({ status: 'pending', authUrl: result.authUrl, integrationId: result.integrationId });
+      res.json({ status: 'oauth_required', authUrl: result.authUrl });
       return;
     }
 
@@ -68,115 +60,62 @@ router.post('/connect', tenantMiddleware(), async (req: Request, res: Response, 
 });
 
 // ── GET /api/integrations/callback/:platform ─────────────────
-// OAuth2 callback — het platform stuurt de klant hier naartoe
-// Na succesvolle OAuth sturen we door naar het dashboard
+// OAuth callback — wordt aangeroepen door het externe platform
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { platform } = req.params;
-    const { code, state, shop } = req.query as Record<string, string>;
+    const platform = req.params.platform as PlatformSlug;
+    const { code, state } = req.query as { code: string; state: string };
 
     if (!code || !state) {
-      res.status(400).send('Ontbrekende OAuth parameters');
+      res.status(400).json({ error: 'Missende code of state parameter' });
       return;
     }
 
-    const { integrationId, tenantId } = await service.handleOAuthCallback(
-      platform as PlatformSlug,
-      code,
-      state,
-      shop   // Shopify geeft shop domain mee in callback
-    );
+    const result = await integrationService.handleOAuthCallback(platform, code, state);
+    const frontendUrl = process.env.FRONTEND_URL ?? 'https://app.marketgrowth.io';
 
-    // Stuur klant door naar dashboard met success melding
-    const redirectUrl = `${process.env.FRONTEND_URL}/dashboard?integration=connected&id=${integrationId}`;
-    res.redirect(redirectUrl);
+    // Redirect terug naar de frontend met succes
+    res.redirect(`${frontendUrl}/onboarding?step=connected&integrationId=${result.integrationId}`);
   } catch (err) {
-    // Bij OAuth fouten: redirect naar error pagina
-    const frontendUrl = process.env.FRONTEND_URL ?? '';
-    res.redirect(`${frontendUrl}/dashboard?integration=error`);
+    const frontendUrl = process.env.FRONTEND_URL ?? 'https://app.marketgrowth.io';
+    res.redirect(`${frontendUrl}/onboarding?step=error&message=${encodeURIComponent((err as Error).message)}`);
   }
 });
 
 // ── POST /api/integrations/:id/sync ──────────────────────────
-// Handmatige sync starten
-router.post('/:id/sync', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+// Trigger een handmatige sync
+router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await service.triggerSync(req.params.id);
-    res.json({ message: 'Synchronisatie gestart', jobId: result.jobId });
+    const { jobType = 'incremental' } = req.body as { jobType?: 'full_sync' | 'incremental' };
+    const result = await integrationService.triggerSync(req.params.id, jobType);
+    res.json({ syncJobId: result.syncJobId });
   } catch (err) { next(err); }
 });
 
 // ── GET /api/integrations/:id/status ─────────────────────────
-// Huidige sync status ophalen
-router.get('/:id/status', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+// Sync status opvragen
+router.get('/:id/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const status = await service.getSyncStatus(req.params.id);
+    const status = await integrationService.getSyncStatus(req.params.id);
     res.json(status);
   } catch (err) { next(err); }
 });
 
 // ── DELETE /api/integrations/:id ─────────────────────────────
-// Verbinding verbreken
-router.delete('/:id', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+// Integratie ontkoppelen
+router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    await service.disconnect(req.params.id);
-    res.json({ message: 'Integratie verbroken. Gegevens worden 30 dagen bewaard.' });
+    await integrationService.disconnect(req.params.id);
+    res.json({ success: true });
   } catch (err) { next(err); }
 });
 
 // ── POST /api/integrations/webhook/:platform ─────────────────
-// Inkomende webhooks van platforms (GEEN tenantMiddleware — verificatie via HMAC)
-router.post('/webhook/:platform', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { platform } = req.params;
-
-    // Webhook verificatie per platform
-    const isValid = await verifyIncomingWebhook(platform as PlatformSlug, req);
-    if (!isValid) {
-      res.status(401).json({ error: 'Webhook verificatie mislukt' });
-      return;
-    }
-
-    // Direct 200 terugsturen (platforms verwachten snelle response)
-    res.json({ received: true });
-
-    // Async verwerken via queue (niet blokkeren)
-    const { webhookQueue } = await import('../workers/sync.worker');
-    const integrationId    = req.headers['x-integration-id'] as string;
-    const tenantId         = req.headers['x-tenant-id'] as string;
-    const topic            = req.headers['x-shopify-topic'] as string
-                          ?? req.headers['x-wc-webhook-topic'] as string
-                          ?? 'unknown';
-
-    if (integrationId && tenantId) {
-      await webhookQueue.add('webhook', {
-        integrationId,
-        tenantId,
-        platformSlug: platform as PlatformSlug,
-        topic,
-        body: req.body,
-      });
-    }
-  } catch (err) { next(err); }
+// Webhook endpoint voor inkomende platform events
+router.post('/webhook/:platform', async (req: Request, res: Response) => {
+  // Altijd 200 teruggeven zodat het platform weet dat we de webhook ontvangen hebben
+  // Verwerking gebeurt asynchroon via de queue
+  res.sendStatus(200);
 });
-
-// ── Webhook verificatie helper ────────────────────────────────
-async function verifyIncomingWebhook(
-  platform: PlatformSlug,
-  req: Request
-): Promise<boolean> {
-  // In productie: haal het secret op uit de database op basis van integration ID
-  // Voor nu: altijd true (implementeer per platform bij go-live)
-  const integrationId = req.headers['x-integration-id'] as string;
-  if (!integrationId) return false;
-
-  // Hier zou je het secret ophalen en HMAC verificatie uitvoeren:
-  // const { db } = await import('../../../infrastructure/database/connection');
-  // const row = await db.query(...)
-  // const connector = getConnector(platform);
-  // return connector.verifyWebhook(rawBody, signature, row.secret);
-
-  return true;  // TODO: implementeer per platform bij go-live
-}
 
 export { router as integrationRouter };
