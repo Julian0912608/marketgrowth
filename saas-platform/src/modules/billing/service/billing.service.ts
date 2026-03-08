@@ -1,12 +1,5 @@
 // ============================================================
-// src/modules/billing/service/billing.service.ts  (FIXED)
-//
-// Fixes:
-//  1. onCheckoutCompleted: gebruik UPSERT zodat de starter-rij
-//     (zonder stripe_sub_id) correct wordt bijgewerkt
-//  2. changePlan: ook 'trialing' status meenemen
-//  3. cancelSubscription: ook 'trialing' meenemen
-//  4. getBillingOverview: robuuster wanneer stripe_sub_id nog null is
+// src/modules/billing/service/billing.service.ts
 // ============================================================
 
 import Stripe from 'stripe';
@@ -52,13 +45,12 @@ export interface Invoice {
 
 export class BillingService {
 
-  // ── Checkout: klant kiest een plan en betaalt ────────────────
   async createCheckoutSession(planSlug: string): Promise<CheckoutSession> {
     const { tenantId, userId } = getTenantContext();
 
     const priceId = PLAN_PRICE_IDS[planSlug];
     if (!priceId) {
-      throw new Error(`Onbekend plan: ${planSlug}`);
+      throw Object.assign(new Error(`Ongeldig plan: ${planSlug}`), { httpStatus: 400, error: 'Ongeldig plan' });
     }
 
     const stripeCustomerId = await this.getOrCreateStripeCustomer(tenantId);
@@ -67,97 +59,68 @@ export class BillingService {
       customer:   stripeCustomerId,
       mode:       'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${process.env.APP_URL}/onboarding/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${process.env.APP_URL}/onboarding/plan`,
-      metadata: {
-        tenantId,
-        userId,
-        planSlug,
-      },
+      // 14-dagen gratis trial
       subscription_data: {
+        trial_period_days: 14,
         metadata: { tenantId, planSlug },
       },
+      success_url: `${process.env.APP_URL}/onboarding?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.APP_URL}/onboarding`,
+      metadata: { tenantId, userId, planSlug },
       allow_promotion_codes: true,
     });
 
     logger.info('billing.checkout.created', { tenantId, planSlug });
 
-    return {
-      url:       session.url!,
-      sessionId: session.id,
-    };
+    return { url: session.url!, sessionId: session.id };
   }
 
-  // ── Plan wijzigen (upgrade of downgrade) ────────────────────
   async changePlan(newPlanSlug: string): Promise<void> {
     const { tenantId } = getTenantContext();
 
     const priceId = PLAN_PRICE_IDS[newPlanSlug];
     if (!priceId) throw new Error(`Onbekend plan: ${newPlanSlug}`);
 
-    // FIX: ook 'trialing' meenemen — klant kan vanuit trial upgraden
     const subResult = await db.query<{ stripe_sub_id: string; plan_slug: string }>(
       `SELECT ts.stripe_sub_id, p.slug AS plan_slug
        FROM tenant_subscriptions ts
        JOIN plans p ON p.id = ts.plan_id
-       WHERE ts.tenant_id = $1 AND ts.status IN ('active', 'trialing')
-       ORDER BY ts.created_at DESC
+       WHERE ts.tenant_id = $1 AND ts.status IN ('active','trialing')
        LIMIT 1`,
       [tenantId], { allowNoTenant: true }
     );
 
     const currentSub = subResult.rows[0];
-
-    // Als er nog geen stripe_sub_id is (starter zonder betaling),
-    // maak dan een nieuwe checkout sessie in plaats van update
-    if (!currentSub?.stripe_sub_id) {
-      throw new Error(
-        'Geen Stripe abonnement gevonden. Gebruik /billing/checkout om een abonnement te starten.'
-      );
-    }
+    if (!currentSub?.stripe_sub_id) throw new Error('Geen actief abonnement gevonden.');
 
     const subscription = await stripe.subscriptions.retrieve(currentSub.stripe_sub_id);
     await stripe.subscriptions.update(currentSub.stripe_sub_id, {
-      items: [{
-        id:    subscription.items.data[0].id,
-        price: priceId,
-      }],
+      items: [{ id: subscription.items.data[0].id, price: priceId }],
       proration_behavior: 'create_prorations',
     });
 
-    logger.info('billing.plan.changed', {
-      tenantId,
-      oldPlan: currentSub.plan_slug,
-      newPlan: newPlanSlug,
-    });
+    logger.info('billing.plan.changed', { tenantId, oldPlan: currentSub.plan_slug, newPlan: newPlanSlug });
 
     await permissionService.invalidateTenantCache(tenantId);
     await cache.invalidateTenant(tenantId);
   }
 
-  // ── Abonnement opzeggen ──────────────────────────────────────
   async cancelSubscription(): Promise<void> {
     const { tenantId } = getTenantContext();
 
-    // FIX: ook 'trialing' meenemen
     const subResult = await db.query<{ stripe_sub_id: string }>(
       `SELECT stripe_sub_id FROM tenant_subscriptions
-       WHERE tenant_id = $1 AND status IN ('active', 'trialing')
-       ORDER BY created_at DESC LIMIT 1`,
+       WHERE tenant_id = $1 AND status IN ('active','trialing') LIMIT 1`,
       [tenantId], { allowNoTenant: true }
     );
 
     const stripeSubId = subResult.rows[0]?.stripe_sub_id;
     if (!stripeSubId) throw new Error('Geen actief abonnement gevonden.');
 
-    await stripe.subscriptions.update(stripeSubId, {
-      cancel_at_period_end: true,
-    });
-
+    await stripe.subscriptions.update(stripeSubId, { cancel_at_period_end: true });
     logger.info('billing.subscription.cancelled', { tenantId });
   }
 
-  // ── Factuur-overzicht ────────────────────────────────────────
   async getBillingOverview(): Promise<BillingOverview> {
     const { tenantId } = getTenantContext();
     const cacheKey = cache.key(tenantId, 'billing', 'overview');
@@ -166,11 +129,8 @@ export class BillingService {
     if (cached) return cached;
 
     const subResult = await db.query<{
-      stripe_sub_id: string | null;
-      plan_slug: string;
-      plan_name: string;
-      status: string;
-      current_period_end: Date;
+      stripe_sub_id: string; plan_slug: string; plan_name: string;
+      status: string; current_period_end: Date;
     }>(
       `SELECT ts.stripe_sub_id, p.slug AS plan_slug, p.name AS plan_name,
               ts.status, ts.current_period_end
@@ -184,15 +144,12 @@ export class BillingService {
     const sub = subResult.rows[0];
     if (!sub) throw new Error('Geen abonnement gevonden.');
 
-    // FIX: alleen Stripe aanroepen als er een stripe_sub_id is
     const stripeCustomerId = await this.getOrCreateStripeCustomer(tenantId);
+    const stripeInvoices = await stripe.invoices.list({ customer: stripeCustomerId, limit: 12 });
 
-    const [stripeInvoices, stripeSub] = await Promise.all([
-      stripe.invoices.list({ customer: stripeCustomerId, limit: 12 }),
-      sub.stripe_sub_id
-        ? stripe.subscriptions.retrieve(sub.stripe_sub_id)
-        : Promise.resolve(null),
-    ]);
+    const stripeSub = sub.stripe_sub_id
+      ? await stripe.subscriptions.retrieve(sub.stripe_sub_id)
+      : null;
 
     const overview: BillingOverview = {
       planSlug:          sub.plan_slug,
@@ -214,16 +171,11 @@ export class BillingService {
     return overview;
   }
 
-  // ── Stripe webhook verwerking ────────────────────────────────
   async handleWebhook(payload: Buffer, signature: string): Promise<void> {
     let event: Stripe.Event;
 
     try {
-      event = stripe.webhooks.constructEvent(
-        payload,
-        signature,
-        process.env.STRIPE_WEBHOOK_SECRET!
-      );
+      event = stripe.webhooks.constructEvent(payload, signature, process.env.STRIPE_WEBHOOK_SECRET!);
     } catch (err) {
       throw Object.assign(new Error('Webhook signature verificatie mislukt'), { httpStatus: 400 });
     }
@@ -248,158 +200,136 @@ export class BillingService {
     }
   }
 
-  // ── Private webhook handlers ─────────────────────────────────
-
   private async onCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-    const tenantId   = session.metadata?.tenantId;
-    const planSlug   = session.metadata?.planSlug;
+    const tenantId    = session.metadata?.tenantId;
+    const planSlug    = session.metadata?.planSlug;
     const stripeSubId = session.subscription as string;
 
-    if (!tenantId || !planSlug) {
-      logger.warn('billing.checkout.missing_metadata', { sessionId: session.id });
-      return;
-    }
+    if (!tenantId || !planSlug) return;
 
-    // FIX: gebruik UPSERT-patroon.
-    // De starter-rij (zonder stripe_sub_id) matcht op tenant_id.
-    // We updaten die rij met het nieuwe plan + stripe_sub_id.
-    // Als er om een of andere reden geen rij is, voegen we een nieuwe in.
+    // Haal trial end op uit Stripe subscription
+    const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
+    const status = stripeSub.status; // 'trialing' of 'active'
+    const periodEnd = new Date(stripeSub.current_period_end * 1000);
+
     await db.query(
-      `INSERT INTO tenant_subscriptions
-         (tenant_id, plan_id, stripe_sub_id, status, current_period_start, current_period_end)
-       SELECT
-         $1,
-         (SELECT id FROM plans WHERE slug = $2),
-         $3,
-         'active',
-         now(),
-         now() + INTERVAL '30 days'
-       ON CONFLICT (tenant_id)
-         -- Als er al een rij is (bv. de starter-rij), update die dan
-         DO UPDATE SET
-           plan_id       = EXCLUDED.plan_id,
-           stripe_sub_id = EXCLUDED.stripe_sub_id,
-           status        = 'active',
-           updated_at    = now()`,
-      [tenantId, planSlug, stripeSubId],
+      `INSERT INTO tenant_subscriptions (tenant_id, plan_id, stripe_sub_id, status, current_period_end)
+       VALUES ($1, (SELECT id FROM plans WHERE slug = $2), $3, $4, $5)
+       ON CONFLICT (tenant_id) DO UPDATE SET
+         plan_id = EXCLUDED.plan_id,
+         stripe_sub_id = EXCLUDED.stripe_sub_id,
+         status = EXCLUDED.status,
+         current_period_end = EXCLUDED.current_period_end,
+         updated_at = now()`,
+      [tenantId, planSlug, stripeSubId, status, periodEnd],
       { allowNoTenant: true }
     );
 
-    // Onboarding stap afronden: zowel plan_selected als payment_completed
+    // Onboarding stappen bijwerken
     await db.query(
       `UPDATE onboarding_progress
-       SET current_step    = 'payment_completed',
+       SET current_step = 'shop_connected',
            completed_steps = array_append(
-             array_append(
-               completed_steps,
-               'plan_selected'
-             ),
+             array_append(completed_steps, 'plan_selected'),
              'payment_completed'
            ),
            updated_at = now()
-       WHERE tenant_id = $1
-         AND NOT ('payment_completed' = ANY(completed_steps))`,
-      [tenantId],
+       WHERE tenant_id = $1`,
+      [tenantId], { allowNoTenant: true }
+    );
+
+    await permissionService.invalidateTenantCache(tenantId);
+    await cache.invalidateTenant(tenantId);
+
+    logger.info('billing.checkout.completed', { tenantId, planSlug, status });
+
+    await eventBus.publish({
+      type: 'subscription.created',
+      tenantId,
+      occurredAt: new Date(),
+      payload: { planSlug, status },
+    });
+  }
+
+  private async onSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
+    const tenantId = subscription.metadata?.tenantId;
+    if (!tenantId) return;
+
+    await db.query(
+      `UPDATE tenant_subscriptions
+       SET status = $2, current_period_end = $3, updated_at = now()
+       WHERE tenant_id = $1`,
+      [tenantId, subscription.status, new Date(subscription.current_period_end * 1000)],
       { allowNoTenant: true }
     );
 
     await permissionService.invalidateTenantCache(tenantId);
     await cache.invalidateTenant(tenantId);
 
-    await eventBus.publish({
-      type:       'subscription.changed',
-      tenantId,
-      occurredAt: new Date(),
-      payload: {
-        newPlanSlug: planSlug,
-        changeType:  'new',
-        stripeSubId,
-      },
-    });
-
-    logger.info('billing.checkout.completed', { tenantId, planSlug, stripeSubId });
+    logger.info('billing.subscription.updated', { tenantId, status: subscription.status });
   }
 
-  private async onSubscriptionUpdated(sub: Stripe.Subscription): Promise<void> {
-    const tenantId = sub.metadata?.tenantId;
-    if (!tenantId) return;
-
-    await db.query(
-      `UPDATE tenant_subscriptions
-       SET status               = $1,
-           current_period_start = to_timestamp($2),
-           current_period_end   = to_timestamp($3),
-           updated_at           = now()
-       WHERE stripe_sub_id = $4`,
-      [sub.status, sub.current_period_start, sub.current_period_end, sub.id],
-      { allowNoTenant: true }
-    );
-
-    await permissionService.invalidateTenantCache(tenantId);
-    logger.info('billing.subscription.updated', { tenantId, status: sub.status });
-  }
-
-  private async onSubscriptionDeleted(sub: Stripe.Subscription): Promise<void> {
-    const tenantId = sub.metadata?.tenantId;
+  private async onSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
+    const tenantId = subscription.metadata?.tenantId;
     if (!tenantId) return;
 
     await db.query(
       `UPDATE tenant_subscriptions SET status = 'cancelled', updated_at = now()
-       WHERE stripe_sub_id = $1`,
-      [sub.id], { allowNoTenant: true }
+       WHERE tenant_id = $1`,
+      [tenantId], { allowNoTenant: true }
     );
 
-    // Terugvallen op gratis Starter plan
+    // Terugvallen op starter plan
     await db.query(
-      `INSERT INTO tenant_subscriptions (tenant_id, plan_id, status)
-       SELECT $1, p.id, 'active'
-       FROM plans p WHERE p.slug = 'starter'`,
+      `UPDATE tenant_subscriptions
+       SET plan_id = (SELECT id FROM plans WHERE slug = 'starter'), updated_at = now()
+       WHERE tenant_id = $1`,
       [tenantId], { allowNoTenant: true }
     );
 
     await permissionService.invalidateTenantCache(tenantId);
+    await cache.invalidateTenant(tenantId);
+
     logger.info('billing.subscription.deleted', { tenantId });
   }
 
   private async onPaymentFailed(invoice: Stripe.Invoice): Promise<void> {
-    const tenantId = (invoice as any).subscription_details?.metadata?.tenantId
-      ?? invoice.metadata?.tenantId;
-    if (!tenantId) return;
-
-    await db.query(
-      `UPDATE tenant_subscriptions SET status = 'past_due', updated_at = now()
-       WHERE stripe_sub_id = $1`,
-      [invoice.subscription as string], { allowNoTenant: true }
-    );
-
-    logger.warn('billing.payment.failed', { tenantId, invoiceId: invoice.id });
+    const customerId = invoice.customer as string;
+    logger.warn('billing.payment.failed', { stripeCustomerId: customerId });
   }
 
-  // ── Helper: Stripe Customer ophalen of aanmaken ──────────────
   private async getOrCreateStripeCustomer(tenantId: string): Promise<string> {
-    const result = await db.query<{ stripe_customer_id: string | null; email: string; name: string }>(
-      `SELECT stripe_customer_id, email, name FROM tenants WHERE id = $1`,
+    const cacheKey = cache.key(tenantId, 'stripe', 'customer_id');
+    const cached = await cache.get(cacheKey);
+    if (cached) return cached;
+
+    const result = await db.query<{ email: string; name: string; stripe_customer_id: string | null }>(
+      `SELECT t.email, t.name, t.stripe_customer_id FROM tenants t WHERE t.id = $1`,
       [tenantId], { allowNoTenant: true }
     );
 
     const tenant = result.rows[0];
-    if (!tenant) throw new Error(`Tenant niet gevonden: ${tenantId}`);
+    if (!tenant) throw new Error('Tenant niet gevonden.');
 
-    if (tenant.stripe_customer_id) return tenant.stripe_customer_id;
+    // Gebruik bestaande stripe customer ID als die er is
+    if (tenant.stripe_customer_id) {
+      await cache.set(cacheKey, tenant.stripe_customer_id, 86400);
+      return tenant.stripe_customer_id;
+    }
 
-    // Nieuw Stripe customer aanmaken
     const customer = await stripe.customers.create({
       email:    tenant.email,
       name:     tenant.name,
       metadata: { tenantId },
     });
 
+    // Sla stripe_customer_id op in tenants tabel
     await db.query(
-      `UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2`,
-      [customer.id, tenantId], { allowNoTenant: true }
+      `UPDATE tenants SET stripe_customer_id = $2 WHERE id = $1`,
+      [tenantId, customer.id], { allowNoTenant: true }
     );
 
-    logger.info('billing.customer.created', { tenantId, stripeCustomerId: customer.id });
+    await cache.set(cacheKey, customer.id, 86400);
     return customer.id;
   }
 }
