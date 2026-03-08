@@ -432,3 +432,17 @@ export class BolcomConnector implements IPlatformConnector {
     return res.json();
   }
 }
+async fetchOrders(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedOrder>> {
+  const token = await this.getAccessToken(creds);
+  const page  = options.page ?? 1;
+  
+  // Voeg datum filter toe als beschikbaar
+  const dateParam = options.updatedAfter 
+    ? `&latest-change-date=${options.updatedAfter.toISOString().split('T')[0]}`
+    : '';
+
+  const [fbrData, fbbData] = await Promise.allSettled([
+    this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBR&page=${page}${dateParam}`),
+    this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBB&page=${page}${dateParam}`),
+  ]);
+  // ... rest blijft hetzelfde
