@@ -7,64 +7,59 @@ import { billingRouter }    from './modules/billing/api/billing.routes';
 import { errorHandler }     from './shared/middleware/error-handler';
 import { logger }           from './shared/logging/logger';
 
-// ── DEBUG: env vars controleren bij opstarten ─────────────────
+// DEBUG: env vars
 console.log('=== ENV CHECK ===');
 console.log('NODE_ENV:    ', process.env.NODE_ENV    ?? 'NOT SET');
 console.log('PORT:        ', process.env.PORT        ?? 'NOT SET');
-console.log('FRONTEND_URL:', process.env.FRONTEND_URL ?? 'NOT SET ❌');
+console.log('FRONTEND_URL:', process.env.FRONTEND_URL ?? 'NOT SET');
 console.log('REDIS_URL:   ', process.env.REDIS_URL
   ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***@')
-  : 'NOT SET ❌'
+  : 'NOT SET'
 );
-console.log('DATABASE_URL set:', process.env.DATABASE_URL ? 'YES ✅' : 'NO ❌');
-console.log('JWT_SECRET set:  ', process.env.JWT_SECRET   ? 'YES ✅' : 'NO ❌');
+console.log('DATABASE_URL set:', process.env.DATABASE_URL ? 'YES' : 'NO');
+console.log('JWT_SECRET set:  ', process.env.JWT_SECRET   ? 'YES' : 'NO');
 console.log('=================');
 
 const app = express();
 
-// ── CORS ──────────────────────────────────────────────────────
-// Sta verzoeken toe van de frontend (Vercel) en lokaal
+// CORS
 const allowedOrigins = [
-  process.env.FRONTEND_URL,           // bijv. https://marketgrowth-frontend.vercel.app
+  process.env.FRONTEND_URL,
   'http://localhost:3000',
   'http://localhost:3001',
 ].filter(Boolean) as string[];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Sta requests zonder origin toe (Postman, health checks, Stripe webhooks)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
     logger.warn('cors.blocked', { origin });
-    callback(new Error(`CORS: origin niet toegestaan: ${origin}`));
+    callback(new Error('CORS: origin niet toegestaan: ' + origin));
   },
-  credentials: true,   // nodig voor cookies (refresh token)
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 
-// Stripe webhook heeft raw body nodig — vóór express.json()
+// Stripe webhook heeft raw body nodig
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
 
-// Standaard middleware
 app.use(express.json());
 app.use(cookieParser());
 
-// Health check
 app.get('/health', (_req, res) => {
-  res.json({
-    status:    'ok',
-    timestamp: new Date().toISOString(),
-    redis:     process.env.REDIS_URL ? 'configured' : 'missing',
-  });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Routes
+// Routes — log elke stap zodat we zien waar het fout gaat
+console.log('Registering routes...');
 app.use('/api/auth',       authRouter);
+console.log('  /api/auth OK');
 app.use('/api/onboarding', onboardingRouter);
+console.log('  /api/onboarding OK');
 app.use('/api/billing',    billingRouter);
+console.log('  /api/billing OK');
 
-// Error handler (altijd als laatste)
 app.use(errorHandler());
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
