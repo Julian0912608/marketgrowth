@@ -1,8 +1,7 @@
 // ============================================================
 // src/modules/analytics/api/analytics.routes.ts
 //
-// Fix: tenantMiddleware toegevoegd aan alle routes zodat
-// getTenantContext() werkt en geen "[TenantContext] No context" gooit.
+// Fix: top-products krijgt nu ook period parameter.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -12,10 +11,9 @@ import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 
 export const analyticsRouter = Router();
 
-// Alle analytics routes vereisen een ingelogde tenant
 analyticsRouter.use(tenantMiddleware());
 
-// ── GET /api/analytics/overview ──────────────────────────────
+// ── GET /api/analytics/overview ────────────────────────────────
 analyticsRouter.get('/overview', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -72,7 +70,7 @@ analyticsRouter.get('/overview', async (req: Request, res: Response, next: NextF
   } catch (err) { next(err); }
 });
 
-// ── GET /api/analytics/daily ──────────────────────────────────
+// ── GET /api/analytics/daily ────────────────────────────────────
 analyticsRouter.get('/daily', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -102,7 +100,7 @@ analyticsRouter.get('/daily', async (req: Request, res: Response, next: NextFunc
   } catch (err) { next(err); }
 });
 
-// ── GET /api/analytics/by-platform ───────────────────────────
+// ── GET /api/analytics/by-platform ─────────────────────────────
 analyticsRouter.get('/by-platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -129,37 +127,46 @@ analyticsRouter.get('/by-platform', async (req: Request, res: Response, next: Ne
   } catch (err) { next(err); }
 });
 
-// ── GET /api/analytics/top-products ──────────────────────────
+// ── GET /api/analytics/top-products ────────────────────────────
+// FIX: period parameter toegevoegd — top products filtert nu op geselecteerde periode
 analyticsRouter.get('/top-products', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
-    const { limit = '10', platform } = req.query as { limit?: string; platform?: string };
-    const params: any[] = [tenantId, parseInt(limit, 10)];
-    const platformFilter = platform ? ` AND oli.tenant_id = $1 AND platform_slug = $${params.push(platform)}` : '';
+    const { limit = '10', platform, period = '30d' } = req.query as {
+      limit?: string; platform?: string; period?: string;
+    };
+
+    const days  = period === '7d' ? 7 : period === '90d' ? 90 : 30;
+    const since = new Date(Date.now() - days * 86400000);
+
+    const params: any[] = [tenantId, since, parseInt(limit, 10)];
+    const platformFilter = platform ? ` AND o.platform_slug = $${params.push(platform)}` : '';
 
     const result = await db.query(
       `SELECT
          oli.title,
          oli.sku,
-         o.platform_slug AS platform,
-         SUM(oli.quantity)::int   AS total_sold,
-         SUM(oli.total_price)     AS total_revenue,
-         AVG(oli.unit_price)      AS avg_price
+         o.platform_slug                  AS platform,
+         SUM(oli.quantity)::int           AS total_sold,
+         SUM(oli.total_price)             AS total_revenue,
+         AVG(oli.unit_price)              AS avg_price
        FROM order_line_items oli
        JOIN orders o ON o.id = oli.order_id
        WHERE oli.tenant_id = $1
-         ${platform ? `AND o.platform_slug = $${params.push(platform)}` : ''}
+         AND o.ordered_at >= $2
+         AND o.status NOT IN ('cancelled', 'refunded')
+         ${platformFilter}
        GROUP BY oli.title, oli.sku, o.platform_slug
        ORDER BY total_revenue DESC
-       LIMIT $2`,
+       LIMIT $3`,
       params
     );
 
-    res.json({ products: result.rows });
+    res.json({ products: result.rows, period });
   } catch (err) { next(err); }
 });
 
-// ── GET /api/analytics/ads ────────────────────────────────────
+// ── GET /api/analytics/ads ──────────────────────────────────────
 analyticsRouter.get('/ads', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
