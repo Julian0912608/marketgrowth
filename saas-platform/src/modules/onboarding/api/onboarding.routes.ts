@@ -1,79 +1,50 @@
-// src/modules/onboarding/api/onboarding.routes.ts
-//
-// FIX: getTenantContext() heeft geen argumenten
-
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { db, getTenantContext } from '../../../infrastructure/database/connection';
-import { authenticate } from '../../../shared/middleware/auth.middleware';
+import { db } from '../../../infrastructure/database/connection';
+import { getTenantContext } from '../../../shared/middleware/tenant-context';
+import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { logger } from '../../../shared/logging/logger';
 
-export const onboardingRouter = Router();
+const router = Router();
 
-// Alle onboarding routes vereisen authenticatie
-onboardingRouter.use(authenticate);
+router.use(tenantMiddleware());
 
-// ── GET /api/onboarding/status ────────────────────────────────
-onboardingRouter.get('/status', async (req: Request, res: Response) => {
+router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const userId   = (req as any).user.userId;
-    const tenantId = (req as any).user.tenantId;
-
+    const { tenantId } = getTenantContext();
     const result = await db.query(
-      `SELECT onboarding_completed, onboarding_step
-       FROM tenants WHERE id = $1`,
-      [tenantId],
-      { allowNoTenant: true }
+      `SELECT onboarding_completed, onboarding_step FROM tenants WHERE id = $1`,
+      [tenantId]
     );
-
-    const tenant = result.rows[0];
     res.json({
-      completed: tenant?.onboarding_completed || false,
-      step:      tenant?.onboarding_step      || 'welcome',
+      completed: result.rows[0]?.onboarding_completed || false,
+      step:      result.rows[0]?.onboarding_step      || 'welcome',
     });
-  } catch (err: any) {
-    logger.error('onboarding.status.error', { error: err.message });
-    res.status(500).json({ error: 'Kon status niet ophalen' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ── POST /api/onboarding/complete ─────────────────────────────
-onboardingRouter.post('/complete', async (req: Request, res: Response) => {
+router.post('/complete', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const tenantId = (req as any).user.tenantId;
+    const { tenantId } = getTenantContext();
     const { step } = z.object({ step: z.string().optional() }).parse(req.body);
-
     await db.query(
-      `UPDATE tenants SET
-         onboarding_completed = true,
-         onboarding_step      = $2,
-         updated_at           = now()
-       WHERE id = $1`,
-      [tenantId, step || 'done'],
-      { allowNoTenant: true }
+      `UPDATE tenants SET onboarding_completed=true, onboarding_step=$2, updated_at=now() WHERE id=$1`,
+      [tenantId, step || 'done']
     );
-
     res.json({ message: 'Onboarding voltooid' });
-  } catch (err: any) {
-    logger.error('onboarding.complete.error', { error: err.message });
-    res.status(500).json({ error: 'Kon onboarding niet voltooien' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ── POST /api/onboarding/step ─────────────────────────────────
-onboardingRouter.post('/step', async (req: Request, res: Response) => {
+router.post('/step', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const tenantId = (req as any).user.tenantId;
+    const { tenantId } = getTenantContext();
     const { step } = z.object({ step: z.string() }).parse(req.body);
-
     await db.query(
-      `UPDATE tenants SET onboarding_step = $2, updated_at = now() WHERE id = $1`,
-      [tenantId, step],
-      { allowNoTenant: true }
+      `UPDATE tenants SET onboarding_step=$2, updated_at=now() WHERE id=$1`,
+      [tenantId, step]
     );
-
     res.json({ step });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { next(err); }
 });
+
+export { router as onboardingRouter };
