@@ -134,7 +134,7 @@ export interface IPlatformConnector {
   verifyWebhook?(payload: Buffer, signature: string, secret: string): boolean;
 }
 
-// ── Extra types die integration.service.ts nodig heeft ───────
+// ── Service types ─────────────────────────────────────────────
 
 export interface ConnectIntegrationRequest {
   platformSlug:  PlatformSlug;
@@ -142,14 +142,15 @@ export interface ConnectIntegrationRequest {
   apiKey?:       string;
   apiSecret?:    string;
   storeUrl?:     string;
-  code?:         string;   // OAuth code
+  code?:         string;
   state?:        string;
 }
 
 export interface ConnectIntegrationResponse {
   integrationId:  string;
-  redirectUrl?:   string;  // OAuth platforms sturen klant hierheen
-  status:         'connected' | 'oauth_required';
+  redirectUrl?:   string;
+  authUrl?:       string;   // OAuth platforms: stuur klant hierheen
+  status:         'connected' | 'oauth_required' | 'pending' | 'active' | string;
 }
 
 export interface IntegrationSummary {
@@ -158,11 +159,22 @@ export interface IntegrationSummary {
   platformName:   string;
   status:         string;
   shopDomain?:    string;
+  shopName?:      string;   // naam van de winkel
+  isPrimary?:     boolean;  // is dit de primaire integratie
   lastSyncAt?:    Date;
   nextSyncAt?:    Date;
   ordersCount?:   number;
   errorMessage?:  string;
   createdAt:      Date;
+}
+
+export interface SyncJobSummary {
+  id:           string;
+  jobType:      string;
+  status:       string;
+  orderssynced: number;
+  startedAt:    Date;
+  completedAt:  Date;
 }
 
 export interface SyncStatusResponse {
@@ -171,12 +183,6 @@ export interface SyncStatusResponse {
   lastSyncAt?:    Date;
   nextSyncAt?:    Date;
   errorMessage?:  string;
-  recentJobs:     Array<{
-    id:           string;
-    jobType:      string;
-    status:       string;
-    orderssynced: number;
-    startedAt:    Date;
-    completedAt:  Date;
-  }>;
+  currentJob?:    SyncJobSummary;   // actieve job indien aanwezig
+  recentJobs:     SyncJobSummary[];
 }
