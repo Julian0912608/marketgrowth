@@ -504,8 +504,11 @@ export class BolcomConnector implements IPlatformConnector {
 
     const lineItems: NormalizedLineItem[] = items.map(item => {
       // unitPrice is { amount: "12.99", currency: "EUR" } of getal
-      const unitPrice = parsePrice(item.unitPrice ?? item.offerPrice);
-      const quantity  = safeInt(item.quantity ?? 1, 1);
+      // offerPrice / sellingPrice / unitPriceInVat zijn alternatieven
+      const unitPrice = parsePrice(
+        item.unitPrice ?? item.offerPrice ?? item.unitPriceInVat ?? item.sellingPrice
+      );
+      const quantity  = safeInt(item.quantity ?? item.quantityShipped ?? 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
       return {
         externalId:    String(item.orderItemId ?? item.shipmentItemId ?? ''),
@@ -544,8 +547,11 @@ export class BolcomConnector implements IPlatformConnector {
     const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) ?? [];
 
     const lineItems: NormalizedLineItem[] = orderItems.map(item => {
-      const unitPrice = parsePrice(item.unitPrice ?? item.offerPrice);
-      const quantity  = safeInt(item.quantity ?? 1, 1);
+      // unitPrice kan object {amount, currency} zijn of getal of null
+      // offerPrice is altijd een getal (de verkoopprijs)
+      // latestHandlingTime/totalAmount zijn NIET op item niveau
+      const unitPrice = parsePrice(item.unitPrice ?? item.offerPrice ?? item.unitPriceInVat ?? item.sellingPrice);
+      const quantity  = safeInt(item.quantity ?? item.quantityOrdered ?? 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
       return {
         externalId:    String(item.orderItemId ?? ''),
@@ -558,7 +564,26 @@ export class BolcomConnector implements IPlatformConnector {
       };
     });
 
-    const totalAmount = Math.round(lineItems.reduce((acc, li) => acc + li.totalPrice, 0) * 100) / 100;
+    // Bereken totaal uit line items, maar gebruik order-niveau totalOrderAmount als fallback
+    let totalAmount = Math.round(lineItems.reduce((acc, li) => acc + li.totalPrice, 0) * 100) / 100;
+
+    // Fallback: als line items geen prijs hebben, gebruik totaal van het order object
+    if (totalAmount === 0 && orderItems.length > 0) {
+      const orderTotal = parsePrice(
+        (o as any).totalOrderAmount ??
+        (o as any).totalAmount ??
+        (o as any).total
+      );
+      if (orderTotal > 0) {
+        totalAmount = orderTotal;
+        // Verdeel prijs gelijkmatig over line items
+        const perItem = Math.round((orderTotal / orderItems.length) * 100) / 100;
+        lineItems.forEach(li => {
+          li.unitPrice  = perItem;
+          li.totalPrice = Math.round(perItem * li.quantity * 100) / 100;
+        });
+      }
+    }
 
     return {
       externalId:        String(o.orderId ?? ''),
