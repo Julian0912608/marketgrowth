@@ -41,8 +41,8 @@ const redisConnection = {
 };
 
 // ── Queues ────────────────────────────────────────────────────
-export const syncQueue    = new Queue<SyncJobPayload>('integration:sync',    { connection: redisConnection });
-export const webhookQueue = new Queue<WebhookJobPayload>('integration:webhook', { connection: redisConnection });
+export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',    { connection: redisConnection });
+export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: redisConnection });
 
 // ── Rate limiter (gebruikt raw redis client voor incr/expire) ─
 async function acquireRateLimit(platformSlug: string, integrationId: string): Promise<void> {
@@ -76,7 +76,7 @@ function getRateLimit(platform: string): number {
 
 // ── Sync worker ───────────────────────────────────────────────
 export const syncWorker = new Worker<SyncJobPayload>(
-  'integration:sync',
+  'integration-sync',
   async (job: Job<SyncJobPayload>) => {
     const { integrationId, tenantId, platformSlug, jobType, syncJobDbId } = job.data;
 
@@ -262,7 +262,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
 
 // ── Webhook worker ────────────────────────────────────────────
 export const webhookWorker = new Worker<WebhookJobPayload>(
-  'integration:webhook',
+  'integration-webhook',
   async (job: Job<WebhookJobPayload>) => {
     const { integrationId, tenantId, platformSlug, topic } = job.data;
 
