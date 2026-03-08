@@ -1,5 +1,9 @@
 // ============================================================
 // src/modules/integrations/workers/sync.worker.ts
+//
+// Fix: redisConnection pakt nu REDIS_URL correct via URL parsing.
+// Voorheen: host: process.env.REDIS_HOST ?? 'localhost' → crashte op Railway
+// Nu: URL wordt geparsed naar host/port/password zodat BullMQ werkt.
 // ============================================================
 
 import { Worker, Queue, Job } from 'bullmq';
@@ -34,25 +38,55 @@ export interface WebhookJobPayload {
   body:          Record<string, unknown>;
 }
 
-// ── Redis connection ──────────────────────────────────────────
-const redisConnection = {
-  host: process.env.REDIS_HOST ?? 'localhost',
-  port: parseInt(process.env.REDIS_PORT ?? '6379'),
-};
+// ── Redis connection — FIX: parseert REDIS_URL correct ───────
+//
+// Railway geeft één REDIS_URL zoals: redis://default:password@host:port
+// BullMQ verwacht een connection object met host/port/password.
+// De oude code pakte alleen REDIS_HOST env var → altijd 'localhost' op Railway.
+function buildRedisConnection() {
+  const url = process.env.REDIS_URL;
+
+  if (url) {
+    try {
+      const parsed   = new URL(url);
+      const isTLS    = parsed.protocol === 'rediss:';
+      const password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
+      return {
+        host:     parsed.hostname,
+        port:     parseInt(parsed.port || '6379', 10),
+        password: password || undefined,
+        username: parsed.username && parsed.username !== 'default' ? parsed.username : undefined,
+        tls:      isTLS ? { rejectUnauthorized: false } : undefined,
+        family:   4, // IPv4 — voorkomt ::1 verbindingsproblemen
+      };
+    } catch (e) {
+      logger.warn('redis.url_parse_failed', { error: (e as Error).message });
+    }
+  }
+
+  // Fallback: losse env vars of localhost
+  return {
+    host:   process.env.REDIS_HOST ?? 'localhost',
+    port:   parseInt(process.env.REDIS_PORT ?? '6379', 10),
+    family: 4,
+  };
+}
+
+const redisConnection = buildRedisConnection();
 
 // ── Queues ────────────────────────────────────────────────────
 export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',    { connection: redisConnection });
 export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: redisConnection });
 
-// ── Rate limiter (gebruikt raw redis client voor incr/expire) ─
+// ── Rate limiter ──────────────────────────────────────────────
 async function acquireRateLimit(platformSlug: string, integrationId: string): Promise<void> {
-  const key    = `ratelimit:sync:${platformSlug}:${integrationId}`;
-  const limit  = getRateLimit(platformSlug);
+  const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
+  const limit = getRateLimit(platformSlug);
 
   try {
     const current = await redis.incr(key);
     if (current === 1) {
-      await redis.expire(key, 1); // 1 seconde window
+      await redis.expire(key, 1);
     }
     if (current > limit) {
       await new Promise(r => setTimeout(r, 1000));
@@ -117,7 +151,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
       const connector = getConnector(platformSlug);
       if (connector.refreshAccessToken) {
         const refreshed = await connector.refreshAccessToken(credentials);
-        credentials.accessToken   = refreshed.accessToken;
+        credentials.accessToken    = refreshed.accessToken;
         credentials.tokenExpiresAt = refreshed.expiresAt;
         await db.query(
           `UPDATE integration_credentials
@@ -129,18 +163,18 @@ export const syncWorker = new Worker<SyncJobPayload>(
       }
     }
 
-    const connector    = getConnector(platformSlug);
-    const isFullSync   = jobType === 'full_sync';
-    let totalOrders    = 0;
-    let totalProducts  = 0;
+    const connector   = getConnector(platformSlug);
+    const isFullSync  = jobType === 'full_sync';
+    let totalOrders   = 0;
+    let totalProducts = 0;
 
     await runWithTenantContext(
       {
         tenantId,
-        tenantSlug: tenantId,
-        userId:     'system',
-        planSlug:   'growth',
-        traceId:    crypto.randomUUID(),
+        tenantSlug:       tenantId,
+        userId:           'system',
+        planSlug:         'growth',
+        traceId:          crypto.randomUUID(),
         requestStartedAt: new Date(),
       },
       async () => {
@@ -269,10 +303,10 @@ export const webhookWorker = new Worker<WebhookJobPayload>(
     await runWithTenantContext(
       {
         tenantId,
-        tenantSlug: tenantId,
-        userId:     'webhook',
-        planSlug:   'growth',
-        traceId:    crypto.randomUUID(),
+        tenantSlug:       tenantId,
+        userId:           'webhook',
+        planSlug:         'growth',
+        traceId:          crypto.randomUUID(),
         requestStartedAt: new Date(),
       },
       async () => {
@@ -375,13 +409,18 @@ async function upsertProducts(
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        ON CONFLICT (tenant_id, integration_id, external_id)
        DO UPDATE SET
-         title = EXCLUDED.title, status = EXCLUDED.status,
+         title           = EXCLUDED.title,
+         status          = EXCLUDED.status,
          total_inventory = EXCLUDED.total_inventory,
-         price_min = EXCLUDED.price_min, price_max = EXCLUDED.price_max,
-         updated_at = EXCLUDED.updated_at, synced_at = now()`,
-      [tenantId, integrationId, p.externalId, p.title, p.handle, p.status,
-       p.productType, p.tags, p.vendor, p.totalInventory, p.requiresShipping,
-       p.priceMin, p.priceMax, p.publishedAt, p.updatedAt]
+         price_min       = EXCLUDED.price_min,
+         price_max       = EXCLUDED.price_max,
+         updated_at      = EXCLUDED.updated_at,
+         synced_at       = now()`,
+      [
+        tenantId, integrationId, p.externalId, p.title, p.handle, p.status,
+        p.productType, p.tags, p.vendor, p.totalInventory, p.requiresShipping,
+        p.priceMin, p.priceMax, p.publishedAt, p.updatedAt,
+      ]
     );
   }
 }
