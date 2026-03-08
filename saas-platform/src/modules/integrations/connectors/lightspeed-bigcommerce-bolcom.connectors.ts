@@ -14,7 +14,7 @@ import {
   ConnectionTestResult,
   TokenRefreshResult,
   NormalizedLineItem,
-} from '../types/integration.types'
+} from '../types/integration.types';
 
 // ============================================================
 // LIGHTSPEED
@@ -218,7 +218,8 @@ export class BigCommerceConnector implements IPlatformConnector {
       emailHash:   crypto.createHash('sha256').update(email.toLowerCase()).digest('hex'),
       firstName:   c.first_name as string | undefined,
       lastName:    c.last_name  as string | undefined,
-      totalSpent:  0, orderCount: 0,
+      totalSpent:  0,
+      orderCount:  0,
       updatedAt:   new Date(String(c.date_modified ?? c.date_created)),
     };
   }
@@ -239,18 +240,16 @@ export class BigCommerceConnector implements IPlatformConnector {
 }
 
 // ============================================================
-// BOL.COM — volledige rewrite
+// BOL.COM
 //
-// FIXES tov vorige versie:
-//   1. fetchOrders full_sync → Shipments API (90 dagen history)
-//   2. fetchOrders incremental → Orders API met change-interval-minute
-//   3. parsePrice() verwerkt object {amount, currency} correct
-//   4. fetchProducts → Offers API (/retailer/offers) ipv inventory
-//      Offers hebben prijs, voorraad, EAN, conditie
-//   5. jobType doorgegeven via FetchOptions
+// Correcte API flow:
+//   Orders full sync   → Shipments API (FBR + FBB apart, geen ALL)
+//   Orders incremental → Orders API met change-interval-minute
+//   Prijzen            → altijd via /retailer/orders/{orderId} detail
+//   Producten          → async Offers export (POST → poll → CSV)
+//   429 op offers      → lege lijst, sync crasht NIET meer
 // ============================================================
 
-// Bol.com stuurt prijzen soms als object { amount: "12.99", currency: "EUR" }
 function parsePrice(raw: unknown): number {
   if (raw == null) return 0;
   if (typeof raw === 'number') return raw;
@@ -288,23 +287,18 @@ export class BolcomConnector implements IPlatformConnector {
     const isFullSync = options.jobType === 'full_sync' || !options.updatedAfter;
 
     if (isFullSync) {
-      // Shipments API: tot 90 dagen terug, bevat echte verkoopprijs incl. BTW
       return this.fetchViaShipments(token, page);
     } else {
-      // Incremental: orders die gewijzigd zijn na updatedAfter
       return this.fetchViaOrders(token, options.updatedAfter, page);
     }
   }
 
-  // Shipments API — historische data, bevat correcte prijzen
-  // BELANGRIJK: Shipments API accepteert GEEN fulfilment-method=ALL
-  // Moet twee aparte calls doen: FBR en FBB
-  // BELANGRIJK 2: Shipments LIST heeft geen unitPrice — ophalen via orderId detail
+  // Shipments API — FBR + FBB apart (ALL bestaat niet)
+  // Prijzen zitten NIET in shipment list → per orderId detail ophalen
   private async fetchViaShipments(
     token: string,
     page: number
   ): Promise<PaginatedResult<NormalizedOrder>> {
-    // Haal FBR en FBB shipments parallel op
     const [fbrData, fbbData] = await Promise.all([
       this.apiGet(token, `/retailer/shipments?fulfilment-method=FBR&page=${page}`)
         .catch(() => ({ shipments: [] })) as Promise<{ shipments?: Record<string, unknown>[] }>,
@@ -315,17 +309,13 @@ export class BolcomConnector implements IPlatformConnector {
     const fbrShipments = fbrData.shipments ?? [];
     const fbbShipments = fbbData.shipments ?? [];
     const allShipments = [...fbrShipments, ...fbbShipments];
+    const hasNextPage  = fbrShipments.length === 50 || fbbShipments.length === 50;
 
-    // hasNextPage als ofwel FBR ofwel FBB nog een volgende pagina heeft (50 items)
-    const hasNextPage = fbrShipments.length === 50 || fbbShipments.length === 50;
-
-    // Haal per unieke orderId de order detail op voor prijzen + producttitels
-    // Shipment list heeft GEEN unitPrice — dat zit alleen in de order detail
     const seenOrderIds = new Set<string>();
     const orders: NormalizedOrder[] = [];
 
     for (const s of allShipments) {
-      const order = s.order as Record<string, unknown> | undefined;
+      const order   = s.order as Record<string, unknown> | undefined;
       const orderId = String(order?.orderId ?? s.orderId ?? '');
 
       if (!orderId || seenOrderIds.has(orderId)) continue;
@@ -335,20 +325,15 @@ export class BolcomConnector implements IPlatformConnector {
         const detail = await this.apiGet(token, `/retailer/orders/${orderId}`) as Record<string, unknown>;
         orders.push(this.normalizeOrderDetail(detail));
       } catch {
-        // Fallback: gebruik shipment maar met orderId als externalId (NIET shipmentId/UUID)
+        // Fallback met orderId als externalId — nooit shipmentId/UUID gebruiken
         orders.push(this.normalizeShipment({ ...s, _overrideExternalId: orderId }));
       }
     }
 
-    return {
-      items: orders,
-      hasNextPage,
-      nextPage: hasNextPage ? page + 1 : undefined,
-    };
+    return { items: orders, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
-  // Orders API — recente orders met change-interval-minute
-  // fulfilment-method=ALL bestaat ook niet op Orders API — gebruik FBR (eigen verzending)
+  // Orders API — incrementele sync via change-interval-minute
   private async fetchViaOrders(
     token: string,
     updatedAfter: Date | undefined,
@@ -359,34 +344,27 @@ export class BolcomConnector implements IPlatformConnector {
       : 120;
     const cappedMinutes = Math.min(minutesAgo, 2880); // max 48u
 
-    // status=ALL + fulfilment-method=FBR: alle FBR orders van afgelopen X minuten
     const data = await this.apiGet(
       token,
       `/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=${cappedMinutes}&page=${page}`
     ) as { orders?: Record<string, unknown>[] };
 
     const rawOrders = data.orders ?? [];
-
-    // Haal detail op per order voor correcte prijzen
     const orders: NormalizedOrder[] = [];
+
     for (const o of rawOrders) {
-      // orderId kan op meerdere niveaus zitten in de bol.com API response
       const orderId = String(
         o.orderId ??
         (o.order as Record<string, unknown> | undefined)?.orderId ??
         ''
       );
 
-      if (!orderId || orderId === 'undefined') {
-        // Geen orderId → sla over, niet opslaan met UUID als externalId
-        continue;
-      }
+      if (!orderId || orderId === 'undefined') continue;
 
       try {
         const detail = await this.apiGet(token, `/retailer/orders/${orderId}`) as Record<string, unknown>;
         orders.push(this.normalizeOrderDetail(detail));
       } catch {
-        // Fallback: gebruik summary data — maar ALLEEN als er een echte orderId is
         orders.push(this.normalizeOrderSummary({ ...o, orderId }));
       }
     }
@@ -398,28 +376,41 @@ export class BolcomConnector implements IPlatformConnector {
     };
   }
 
-  // ── Producten ophalen via Offers Export (async CSV flow) ─────
-  // GET /retailer/offers geeft 400 "HTTP method not supported"
-  // Juiste flow: POST /retailer/offers/export → poll processStatus → GET CSV
+  // ── Producten via async Offers export ─────────────────────
+  // POST /retailer/offers/export → poll processStatus → GET CSV
+  // Bij 429: lege lijst — orders sync crasht NIET
   async fetchProducts(
     creds: IntegrationCredentials,
     _options: FetchOptions
   ): Promise<PaginatedResult<NormalizedProduct>> {
     const token = await this.getAccessToken(creds);
 
-    // Stap 1: vraag export aan
-    const exportReq = await this.apiPost(token, '/retailer/offers/export', { filterType: 'ALL' }) as {
-      processStatusId?: string;
-    };
+    // Stap 1: exportverzoek indienen — bij 429 overslaan
+    let exportReq: { processStatusId?: string } | null = null;
+    try {
+      exportReq = await this.apiPost(
+        token,
+        '/retailer/offers/export',
+        { filterType: 'ALL' }
+      ) as { processStatusId?: string };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('429')) {
+        console.warn('Bol.com offers/export 429 rate limit — producten overgeslagen deze sync');
+        return { items: [], hasNextPage: false };
+      }
+      throw err;
+    }
+
     const processStatusId = exportReq?.processStatusId;
     if (!processStatusId) {
       throw new Error('Bol.com offers export: geen processStatusId ontvangen');
     }
 
-    // Stap 2: poll processStatus tot SUCCESS (max 30s)
+    // Stap 2: poll tot SUCCESS (max 30s — 10 × 3s)
     let reportId: string | undefined;
     for (let attempt = 0; attempt < 10; attempt++) {
-      await new Promise(r => setTimeout(r, 3000)); // 3s wachten
+      await new Promise(r => setTimeout(r, 3000));
       const status = await this.apiGet(
         token,
         `/shared/process-status/${processStatusId}`
@@ -432,21 +423,16 @@ export class BolcomConnector implements IPlatformConnector {
       if (status.status === 'FAILURE' || status.status === 'TIMEOUT') {
         throw new Error(`Bol.com offers export mislukt: ${status.status}`);
       }
-      // PENDING of PROCESSING → ga door
     }
 
     if (!reportId) {
-      // Export duurt te lang — geen error, gewoon lege lijst teruggeven
       console.warn('Bol.com offers export timeout — producten overgeslagen');
       return { items: [], hasNextPage: false };
     }
 
     // Stap 3: download CSV
     const csv = await this.apiGetCsv(token, `/retailer/offers/export/${reportId}`);
-    const products = this.parseOffersCsv(csv);
-
-    // Alles in 1x — geen paginering nodig voor exports
-    return { items: products, hasNextPage: false };
+    return { items: this.parseOffersCsv(csv), hasNextPage: false };
   }
 
   // ── CSV parser voor Offers export ─────────────────────────
@@ -454,51 +440,41 @@ export class BolcomConnector implements IPlatformConnector {
     const lines = csv.trim().split('\n');
     if (lines.length < 2) return [];
 
-    // Header-driven parsing (bol kan nieuwe kolommen toevoegen)
     const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, '').toLowerCase());
 
     const col = (row: string[], name: string): string => {
       const idx = headers.indexOf(name);
       if (idx < 0) return '';
-      const val = row[idx] ?? '';
-      return val.replace(/^"|"$/g, '').trim();
+      return (row[idx] ?? '').replace(/^"|"$/g, '').trim();
     };
 
     return lines.slice(1).map(line => {
-      // Simpele CSV split (bol gebruikt geen quoted commas in offers export)
-      const row = line.split(',');
-
-      const offerId   = col(row, 'offerid') || col(row, 'offer-id') || col(row, 'offer_id');
-      const ean       = col(row, 'ean');
-      const reference = col(row, 'reference') || col(row, 'referencecode');
-      const condition = col(row, 'condition') || 'NEW';
-      const priceStr  = col(row, 'price') || col(row, 'bundleprice') || col(row, 'regularprice');
-      const stockStr  = col(row, 'stock') || col(row, 'correctedstock') || col(row, 'quantity');
+      const row        = line.split(',');
+      const offerId    = col(row, 'offerid') || col(row, 'offer-id') || col(row, 'offer_id');
+      const ean        = col(row, 'ean');
+      const reference  = col(row, 'reference') || col(row, 'referencecode');
+      const condition  = col(row, 'condition') || 'NEW';
+      const priceStr   = col(row, 'price') || col(row, 'bundleprice') || col(row, 'regularprice');
+      const stockStr   = col(row, 'stock') || col(row, 'correctedstock') || col(row, 'quantity');
       const fulfilment = col(row, 'fulfilmentmethod') || col(row, 'fulfilment-method') || 'FBR';
-      const onHold    = col(row, 'onholdbyretailer') === 'true';
-
-      const price = parseFloat(priceStr.replace(',', '.')) || 0;
-
-      // Title: gebruik reference als die beschrijvend is, anders EAN
-      // Bol stuurt geen productnaam in offers export — EAN is de beste identifier
-      const title = reference && reference !== ean && reference.length > 5
-        ? reference
-        : ean;
+      const onHold     = col(row, 'onholdbyretailer') === 'true';
+      const price      = parseFloat(priceStr.replace(',', '.')) || 0;
+      const title      = reference && reference !== ean && reference.length > 5 ? reference : ean;
 
       return {
-        externalId:     offerId || ean,
+        externalId:       offerId || ean,
         title,
         ean,
-        status:         onHold ? 'draft' : 'active',
+        status:           onHold ? 'draft' : 'active',
         condition,
-        fulfillmentBy:  fulfilment,
-        totalInventory: parseInt(stockStr, 10) || 0,
-        priceMin:       price || undefined,
-        priceMax:       price || undefined,
+        fulfillmentBy:    fulfilment,
+        totalInventory:   parseInt(stockStr, 10) || 0,
+        priceMin:         price || undefined,
+        priceMax:         price || undefined,
         requiresShipping: true,
-        updatedAt:      new Date(),
+        updatedAt:        new Date(),
       } as NormalizedProduct;
-    }).filter(p => p.ean || p.externalId); // filter lege regels
+    }).filter(p => p.ean || p.externalId);
   }
 
   async fetchCustomers(): Promise<PaginatedResult<NormalizedCustomer>> {
@@ -516,20 +492,18 @@ export class BolcomConnector implements IPlatformConnector {
     const items = (s.shipmentItems as Record<string, unknown>[] | undefined) ?? [];
 
     const lineItems: NormalizedLineItem[] = items.map(item => {
-      // unitPrice is { amount: "12.99", currency: "EUR" } of getal
-      // offerPrice / sellingPrice / unitPriceInVat zijn alternatieven
       const unitPrice = parsePrice(
         item.unitPrice ?? item.offerPrice ?? item.unitPriceInVat ?? item.sellingPrice
       );
       const quantity  = safeInt(item.quantity ?? item.quantityShipped ?? 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
       return {
-        externalId:    String(item.orderItemId ?? item.shipmentItemId ?? ''),
-        sku:           String(item.ean ?? ''),
-        title:         String(product?.title ?? item.title ?? item.ean ?? ''),
+        externalId:     String(item.orderItemId ?? item.shipmentItemId ?? ''),
+        sku:            String(item.ean ?? ''),
+        title:          String(product?.title ?? item.title ?? item.ean ?? ''),
         quantity,
         unitPrice,
-        totalPrice:    Math.round(unitPrice * quantity * 100) / 100,
+        totalPrice:     Math.round(unitPrice * quantity * 100) / 100,
         discountAmount: 0,
       };
     });
@@ -538,7 +512,6 @@ export class BolcomConnector implements IPlatformConnector {
     const shipDate    = s.shipmentDate ?? s.orderPlacedDateTime;
 
     return {
-      // _overrideExternalId: gebruik orderId als externalId, NIET shipmentId (UUID)
       externalId:        s._overrideExternalId
         ? String(s._overrideExternalId)
         : (s.orderId ? String(s.orderId) : String(s.shipmentId ?? '')),
@@ -563,27 +536,25 @@ export class BolcomConnector implements IPlatformConnector {
     const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) ?? [];
 
     const lineItems: NormalizedLineItem[] = orderItems.map(item => {
-      // unitPrice kan object {amount, currency} zijn of getal of null
-      // offerPrice is altijd een getal (de verkoopprijs)
-      // latestHandlingTime/totalAmount zijn NIET op item niveau
-      const unitPrice = parsePrice(item.unitPrice ?? item.offerPrice ?? item.unitPriceInVat ?? item.sellingPrice);
+      const unitPrice = parsePrice(
+        item.unitPrice ?? item.offerPrice ?? item.unitPriceInVat ?? item.sellingPrice
+      );
       const quantity  = safeInt(item.quantity ?? item.quantityOrdered ?? 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
       return {
-        externalId:    String(item.orderItemId ?? ''),
-        sku:           String(item.ean ?? ''),
-        title:         String(product?.title ?? item.title ?? item.ean ?? ''),
+        externalId:     String(item.orderItemId ?? ''),
+        sku:            String(item.ean ?? ''),
+        title:          String(product?.title ?? item.title ?? item.ean ?? ''),
         quantity,
         unitPrice,
-        totalPrice:    Math.round(unitPrice * quantity * 100) / 100,
+        totalPrice:     Math.round(unitPrice * quantity * 100) / 100,
         discountAmount: 0,
       };
     });
 
-    // Bereken totaal uit line items, maar gebruik order-niveau totalOrderAmount als fallback
     let totalAmount = Math.round(lineItems.reduce((acc, li) => acc + li.totalPrice, 0) * 100) / 100;
 
-    // Fallback: als line items geen prijs hebben, gebruik totaal van het order object
+    // Fallback: als line items €0 hebben, gebruik order-niveau totaal
     if (totalAmount === 0 && orderItems.length > 0) {
       const orderTotal = parsePrice(
         (o as any).totalOrderAmount ??
@@ -592,7 +563,6 @@ export class BolcomConnector implements IPlatformConnector {
       );
       if (orderTotal > 0) {
         totalAmount = orderTotal;
-        // Verdeel prijs gelijkmatig over line items
         const perItem = Math.round((orderTotal / orderItems.length) * 100) / 100;
         lineItems.forEach(li => {
           li.unitPrice  = perItem;
@@ -628,12 +598,12 @@ export class BolcomConnector implements IPlatformConnector {
       const unitPrice = parsePrice(item.unitPrice);
       const quantity  = safeInt(item.quantity ?? 1, 1);
       return {
-        externalId:    String(item.orderItemId ?? ''),
-        sku:           String(item.ean ?? ''),
-        title:         String((item.product as Record<string, unknown> | undefined)?.title ?? item.ean ?? ''),
+        externalId:     String(item.orderItemId ?? ''),
+        sku:            String(item.ean ?? ''),
+        title:          String((item.product as Record<string, unknown> | undefined)?.title ?? item.ean ?? ''),
         quantity,
         unitPrice,
-        totalPrice:    Math.round(unitPrice * quantity * 100) / 100,
+        totalPrice:     Math.round(unitPrice * quantity * 100) / 100,
         discountAmount: 0,
       };
     });
@@ -667,10 +637,9 @@ export class BolcomConnector implements IPlatformConnector {
       },
     });
 
-    // 429 Too Many Requests — respecteer Retry-After header
     if (res.status === 429 && retries > 0) {
       const retryAfter = parseInt(res.headers.get('Retry-After') ?? '60', 10);
-      const waitMs = Math.min(retryAfter * 1000, 120_000); // max 2 minuten wachten
+      const waitMs     = Math.min(retryAfter * 1000, 120_000); // max 2 min wachten
       await new Promise(r => setTimeout(r, waitMs));
       return this.apiGet(token, path, retries - 1);
     }
@@ -683,7 +652,8 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // ── HTTP POST helper ───────────────────────────────────────
-  private async apiPost(token: string, path: string, body: unknown, retries = 3): Promise<unknown> {
+  // 429 wordt direct gegooid — fetchProducts vangt hem op en slaat producten over
+  private async apiPost(token: string, path: string, body: unknown): Promise<unknown> {
     const res = await fetch(`https://api.bol.com${path}`, {
       method: 'POST',
       headers: {
@@ -694,12 +664,9 @@ export class BolcomConnector implements IPlatformConnector {
       body: JSON.stringify(body),
     });
 
-    // 429 Too Many Requests — respecteer Retry-After header
-    if (res.status === 429 && retries > 0) {
-      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '60', 10);
-      const waitMs = Math.min(retryAfter * 1000, 120_000); // max 2 minuten wachten
-      await new Promise(r => setTimeout(r, waitMs));
-      return this.apiPost(token, path, body, retries - 1);
+    if (res.status === 429) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`Bol.com POST ${path} mislukt (429): ${errBody.slice(0, 300)}`);
     }
 
     if (!res.ok) {
