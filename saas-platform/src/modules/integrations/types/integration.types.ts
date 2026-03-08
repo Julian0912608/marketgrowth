@@ -1,5 +1,7 @@
 // ============================================================
 // src/modules/integrations/types/integration.types.ts
+// Fix: jobType toegevoegd aan FetchOptions zodat connectors
+// kunnen onderscheiden tussen full_sync en incremental
 // ============================================================
 
 export type PlatformSlug =
@@ -29,6 +31,7 @@ export interface FetchOptions {
   limit?:        number;
   cursor?:       string;
   page?:         number;
+  jobType?:      'full_sync' | 'incremental'; // ← nieuw: voor connectors die anders moeten werken
 }
 
 export interface NormalizedLineItem {
@@ -149,7 +152,7 @@ export interface ConnectIntegrationRequest {
 export interface ConnectIntegrationResponse {
   integrationId:  string;
   redirectUrl?:   string;
-  authUrl?:       string;   // OAuth platforms: stuur klant hierheen
+  authUrl?:       string;
   status:         'connected' | 'oauth_required' | 'pending' | 'active' | string;
 }
 
@@ -159,8 +162,8 @@ export interface IntegrationSummary {
   platformName:   string;
   status:         string;
   shopDomain?:    string;
-  shopName?:      string;   // naam van de winkel
-  isPrimary?:     boolean;  // is dit de primaire integratie
+  shopName?:      string;
+  isPrimary?:     boolean;
   lastSyncAt?:    Date;
   nextSyncAt?:    Date;
   ordersCount?:   number;
@@ -183,6 +186,6 @@ export interface SyncStatusResponse {
   lastSyncAt?:    Date;
   nextSyncAt?:    Date;
   errorMessage?:  string;
-  currentJob?:    SyncJobSummary;   // actieve job indien aanwezig
+  currentJob?:    SyncJobSummary;
   recentJobs:     SyncJobSummary[];
 }
