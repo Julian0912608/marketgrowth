@@ -299,6 +299,7 @@ export class BolcomConnector implements IPlatformConnector {
   // Shipments API — historische data, bevat correcte prijzen
   // BELANGRIJK: Shipments API accepteert GEEN fulfilment-method=ALL
   // Moet twee aparte calls doen: FBR en FBB
+  // BELANGRIJK 2: Shipments LIST heeft geen unitPrice — ophalen via orderId detail
   private async fetchViaShipments(
     token: string,
     page: number
@@ -318,10 +319,31 @@ export class BolcomConnector implements IPlatformConnector {
     // hasNextPage als ofwel FBR ofwel FBB nog een volgende pagina heeft (50 items)
     const hasNextPage = fbrShipments.length === 50 || fbbShipments.length === 50;
 
+    // Haal per unieke orderId de order detail op voor prijzen + producttitels
+    // Shipment list heeft GEEN unitPrice — dat zit alleen in de order detail
+    const seenOrderIds = new Set<string>();
+    const orders: NormalizedOrder[] = [];
+
+    for (const s of allShipments) {
+      const order = s.order as Record<string, unknown> | undefined;
+      const orderId = String(order?.orderId ?? s.orderId ?? '');
+
+      if (!orderId || seenOrderIds.has(orderId)) continue;
+      seenOrderIds.add(orderId);
+
+      try {
+        const detail = await this.apiGet(token, `/retailer/orders/${orderId}`) as Record<string, unknown>;
+        orders.push(this.normalizeOrderDetail(detail));
+      } catch {
+        // Fallback: gebruik shipment data zonder prijs (beter dan niets)
+        orders.push(this.normalizeShipment(s));
+      }
+    }
+
     return {
-      items:       allShipments.map(s => this.normalizeShipment(s)),
+      items: orders,
       hasNextPage,
-      nextPage:    hasNextPage ? page + 1 : undefined,
+      nextPage: hasNextPage ? page + 1 : undefined,
     };
   }
 
@@ -363,57 +385,107 @@ export class BolcomConnector implements IPlatformConnector {
     };
   }
 
-  // ── Producten ophalen via Offers API ──────────────────────
-  // /retailer/offers geeft alle actieve aanbiedingen incl. prijs + voorraad
+  // ── Producten ophalen via Offers Export (async CSV flow) ─────
+  // GET /retailer/offers geeft 400 "HTTP method not supported"
+  // Juiste flow: POST /retailer/offers/export → poll processStatus → GET CSV
   async fetchProducts(
     creds: IntegrationCredentials,
-    options: FetchOptions
+    _options: FetchOptions
   ): Promise<PaginatedResult<NormalizedProduct>> {
     const token = await this.getAccessToken(creds);
-    const page  = options.page ?? 1;
 
-    const data = await this.apiGet(
-      token,
-      `/retailer/offers?page=${page}`
-    ) as { offers?: Record<string, unknown>[] };
+    // Stap 1: vraag export aan
+    const exportReq = await this.apiPost(token, '/retailer/offers/export', {}) as {
+      processStatusId?: string;
+    };
+    const processStatusId = exportReq?.processStatusId;
+    if (!processStatusId) {
+      throw new Error('Bol.com offers export: geen processStatusId ontvangen');
+    }
 
-    const offers = data.offers ?? [];
+    // Stap 2: poll processStatus tot SUCCESS (max 30s)
+    let reportId: string | undefined;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise(r => setTimeout(r, 3000)); // 3s wachten
+      const status = await this.apiGet(
+        token,
+        `/shared/process-status/${processStatusId}`
+      ) as { status?: string; entityId?: string };
 
-    const products: NormalizedProduct[] = offers.map(offer => {
-      const pricing   = offer.pricing  as Record<string, unknown> | undefined;
-      const stock     = offer.stock    as Record<string, unknown> | undefined;
-      const fulfilment = offer.fulfilment as Record<string, unknown> | undefined;
+      if (status.status === 'SUCCESS') {
+        reportId = status.entityId;
+        break;
+      }
+      if (status.status === 'FAILURE' || status.status === 'TIMEOUT') {
+        throw new Error(`Bol.com offers export mislukt: ${status.status}`);
+      }
+      // PENDING of PROCESSING → ga door
+    }
 
-      // Prijs: probeer verschillende velden
-      const bundlePrices = pricing?.bundlePrices as Record<string, unknown>[] | undefined;
-      const price = bundlePrices?.length
-        ? parsePrice(bundlePrices[0]?.unitPrice)
-        : parsePrice(pricing?.regularPrice ?? pricing?.mentionedPrice);
+    if (!reportId) {
+      // Export duurt te lang — geen error, gewoon lege lijst teruggeven
+      console.warn('Bol.com offers export timeout — producten overgeslagen');
+      return { items: [], hasNextPage: false };
+    }
 
-      const ean       = String(offer.ean ?? offer.offerReference ?? '');
-      const offerId   = String(offer.offerId ?? offer.id ?? ean);
-      const stockAmt  = safeInt(stock?.amount ?? 0);
+    // Stap 3: download CSV
+    const csv = await this.apiGetCsv(token, `/retailer/offers/export/${reportId}`);
+    const products = this.parseOffersCsv(csv);
+
+    // Alles in 1x — geen paginering nodig voor exports
+    return { items: products, hasNextPage: false };
+  }
+
+  // ── CSV parser voor Offers export ─────────────────────────
+  private parseOffersCsv(csv: string): NormalizedProduct[] {
+    const lines = csv.trim().split('\n');
+    if (lines.length < 2) return [];
+
+    // Header-driven parsing (bol kan nieuwe kolommen toevoegen)
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, '').toLowerCase());
+
+    const col = (row: string[], name: string): string => {
+      const idx = headers.indexOf(name);
+      if (idx < 0) return '';
+      const val = row[idx] ?? '';
+      return val.replace(/^"|"$/g, '').trim();
+    };
+
+    return lines.slice(1).map(line => {
+      // Simpele CSV split (bol gebruikt geen quoted commas in offers export)
+      const row = line.split(',');
+
+      const offerId   = col(row, 'offerid') || col(row, 'offer-id') || col(row, 'offer_id');
+      const ean       = col(row, 'ean');
+      const reference = col(row, 'reference') || col(row, 'referencecode');
+      const condition = col(row, 'condition') || 'NEW';
+      const priceStr  = col(row, 'price') || col(row, 'bundleprice') || col(row, 'regularprice');
+      const stockStr  = col(row, 'stock') || col(row, 'correctedstock') || col(row, 'quantity');
+      const fulfilment = col(row, 'fulfilmentmethod') || col(row, 'fulfilment-method') || 'FBR';
+      const onHold    = col(row, 'onholdbyretailer') === 'true';
+
+      const price = parseFloat(priceStr.replace(',', '.')) || 0;
+
+      // Title: gebruik reference als die beschrijvend is, anders EAN
+      // Bol stuurt geen productnaam in offers export — EAN is de beste identifier
+      const title = reference && reference !== ean && reference.length > 5
+        ? reference
+        : ean;
 
       return {
-        externalId:     offerId,
-        title:          String(offer.reference ?? ean), // title komt via catalog API, reference is fallback
+        externalId:     offerId || ean,
+        title,
         ean,
-        status:         offer.onHoldByRetailer ? 'draft' : 'active',
-        condition:      String(offer.condition ?? 'NEW'),
-        fulfillmentBy:  String(fulfilment?.method ?? 'FBR'),
-        totalInventory: stockAmt,
+        status:         onHold ? 'draft' : 'active',
+        condition,
+        fulfillmentBy:  fulfilment,
+        totalInventory: parseInt(stockStr, 10) || 0,
         priceMin:       price || undefined,
         priceMax:       price || undefined,
         requiresShipping: true,
         updatedAt:      new Date(),
       } as NormalizedProduct;
-    });
-
-    return {
-      items:       products,
-      hasNextPage: offers.length === 50,
-      nextPage:    offers.length === 50 ? page + 1 : undefined,
-    };
+    }).filter(p => p.ean || p.externalId); // filter lege regels
   }
 
   async fetchCustomers(): Promise<PaginatedResult<NormalizedCustomer>> {
@@ -558,6 +630,39 @@ export class BolcomConnector implements IPlatformConnector {
       throw new Error(`Bol.com API ${res.status} op ${path}: ${body.slice(0, 300)}`);
     }
     return res.json();
+  }
+
+  // ── HTTP POST helper ───────────────────────────────────────
+  private async apiPost(token: string, path: string, body: unknown): Promise<unknown> {
+    const res = await fetch(`https://api.bol.com${path}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/vnd.retailer.v10+json',
+        'Content-Type':  'application/vnd.retailer.v10+json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`Bol.com POST ${path} mislukt (${res.status}): ${errBody.slice(0, 300)}`);
+    }
+    return res.json();
+  }
+
+  // ── HTTP GET CSV helper ────────────────────────────────────
+  private async apiGetCsv(token: string, path: string): Promise<string> {
+    const res = await fetch(`https://api.bol.com${path}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/vnd.retailer.v10+csv',
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Bol.com CSV GET ${path} mislukt (${res.status}): ${body.slice(0, 300)}`);
+    }
+    return res.text();
   }
 
   // ── Token ophalen via Client Credentials ───────────────────
