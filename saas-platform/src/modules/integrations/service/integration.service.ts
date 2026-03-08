@@ -3,7 +3,6 @@
 // ============================================================
 
 import crypto           from 'crypto';
-import { PoolClient }   from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import { db }           from '../../../infrastructure/database/connection';
 import { cache }        from '../../../infrastructure/cache/redis';
@@ -169,22 +168,23 @@ export class IntegrationService {
     const testResult = await connector.testConnection(tempCreds);
     if (!testResult.success) throw new Error(`Verbindingstest mislukt: ${testResult.error}`);
 
-    await db.transaction(async (client: PoolClient) => {
-      await client.query(
-        `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'active', now(), now())
-         ON CONFLICT (tenant_id, platform_slug, shop_domain) DO UPDATE
-         SET status = 'active', shop_name = EXCLUDED.shop_name, updated_at = now()`,
-        [integrationId, tenantId, platformSlug, shopDomain, testResult.shopName]
-      );
-      await client.query(
-        `INSERT INTO integration_credentials (integration_id, access_token, refresh_token, updated_at)
-         VALUES ($1, $2, $3, now())
-         ON CONFLICT (integration_id) DO UPDATE
-         SET access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token, updated_at = now()`,
-        [integrationId, accessToken, refreshToken ?? null]
-      );
-    });
+    // Sla op zonder transaction (db class heeft geen transaction methode)
+    await db.query(
+      `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', now(), now())
+       ON CONFLICT (tenant_id, platform_slug, shop_domain) DO UPDATE
+       SET status = 'active', shop_name = EXCLUDED.shop_name, updated_at = now()`,
+      [integrationId, tenantId, platformSlug, shopDomain, testResult.shopName],
+      { allowNoTenant: true }
+    );
+    await db.query(
+      `INSERT INTO integration_credentials (integration_id, access_token, refresh_token, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (integration_id) DO UPDATE
+       SET access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token, updated_at = now()`,
+      [integrationId, accessToken, refreshToken ?? null],
+      { allowNoTenant: true }
+    );
 
     await syncQueue.add(`sync:${platformSlug}:${integrationId}:initial`, {
       integrationId, tenantId, platformSlug, jobType: 'full_sync', syncJobDbId: uuidv4(),
@@ -207,18 +207,18 @@ export class IntegrationService {
     const testResult = await connector.testConnection(creds);
     if (!testResult.success) throw Object.assign(new Error(`Verbinding mislukt: ${testResult.error}`), { httpStatus: 400 });
 
-    await db.transaction(async (client: PoolClient) => {
-      await client.query(
-        `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, store_url, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'active', now(), now())`,
-        [integrationId, tenantId, input.platformSlug, input.shopDomain, testResult.shopName, input.storeUrl]
-      );
-      await client.query(
-        `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at)
-         VALUES ($1, $2, $3, $4, now())`,
-        [integrationId, input.apiKey, input.apiSecret, input.storeUrl]
-      );
-    });
+    await db.query(
+      `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, store_url, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'active', now(), now())`,
+      [integrationId, tenantId, input.platformSlug, input.shopDomain, testResult.shopName, input.storeUrl],
+      { allowNoTenant: true }
+    );
+    await db.query(
+      `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at)
+       VALUES ($1, $2, $3, $4, now())`,
+      [integrationId, input.apiKey, input.apiSecret, input.storeUrl],
+      { allowNoTenant: true }
+    );
 
     await syncQueue.add(`sync:${input.platformSlug}:${integrationId}:initial`, {
       integrationId, tenantId, platformSlug: input.platformSlug, jobType: 'full_sync', syncJobDbId: uuidv4(),
