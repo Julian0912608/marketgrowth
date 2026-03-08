@@ -1,28 +1,20 @@
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import { authRouter }       from './modules/auth/api/auth.routes';
-import { onboardingRouter } from './modules/onboarding/api/onboarding.routes';
-import { billingRouter }    from './modules/billing/api/billing.routes';
-import { errorHandler }     from './shared/middleware/error-handler';
-import { logger }           from './shared/logging/logger';
+import { errorHandler } from './shared/middleware/error-handler';
+import { logger } from './shared/logging/logger';
 
-// DEBUG: env vars
 console.log('=== ENV CHECK ===');
 console.log('NODE_ENV:    ', process.env.NODE_ENV    ?? 'NOT SET');
 console.log('PORT:        ', process.env.PORT        ?? 'NOT SET');
 console.log('FRONTEND_URL:', process.env.FRONTEND_URL ?? 'NOT SET');
-console.log('REDIS_URL:   ', process.env.REDIS_URL
-  ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***@')
-  : 'NOT SET'
-);
+console.log('REDIS_URL:   ', process.env.REDIS_URL ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***@') : 'NOT SET');
 console.log('DATABASE_URL set:', process.env.DATABASE_URL ? 'YES' : 'NO');
-console.log('JWT_SECRET set:  ', process.env.JWT_SECRET   ? 'YES' : 'NO');
+console.log('JWT_SECRET set:  ', process.env.JWT_SECRET ? 'YES' : 'NO');
 console.log('=================');
 
 const app = express();
 
-// CORS
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   'http://localhost:3000',
@@ -33,17 +25,14 @@ app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    logger.warn('cors.blocked', { origin });
-    callback(new Error('CORS: origin niet toegestaan: ' + origin));
+    callback(new Error('CORS blocked: ' + origin));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }));
 
-// Stripe webhook heeft raw body nodig
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
-
 app.use(express.json());
 app.use(cookieParser());
 
@@ -51,14 +40,34 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Routes — log elke stap zodat we zien waar het fout gaat
-console.log('Registering routes...');
-app.use('/api/auth',       authRouter);
-console.log('  /api/auth OK');
-app.use('/api/onboarding', onboardingRouter);
-console.log('  /api/onboarding OK');
-app.use('/api/billing',    billingRouter);
-console.log('  /api/billing OK');
+// Laad elke router apart met try/catch zodat we zien welke crasht
+console.log('Loading routers...');
+
+try {
+  const { authRouter } = require('./modules/auth/api/auth.routes');
+  app.use('/api/auth', authRouter);
+  console.log('  authRouter OK');
+} catch (e: any) {
+  console.error('  authRouter FAILED:', e.message);
+}
+
+try {
+  const { onboardingRouter } = require('./modules/onboarding/api/onboarding.routes');
+  app.use('/api/onboarding', onboardingRouter);
+  console.log('  onboardingRouter OK');
+} catch (e: any) {
+  console.error('  onboardingRouter FAILED:', e.message);
+}
+
+try {
+  const { billingRouter } = require('./modules/billing/api/billing.routes');
+  app.use('/api/billing', billingRouter);
+  console.log('  billingRouter OK');
+} catch (e: any) {
+  console.error('  billingRouter FAILED:', e.message);
+}
+
+console.log('All routers loaded.');
 
 app.use(errorHandler());
 
