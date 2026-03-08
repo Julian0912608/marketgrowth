@@ -1,16 +1,10 @@
 // ============================================================
 // src/modules/integrations/workers/sync.worker.ts
-//
-// FIXES:
-//   1. jobType doorgegeven aan connector via FetchOptions
-//   2. Producten altijd ophalen (ook bij incremental)
-//   3. order_line_items upsert met ON CONFLICT DO UPDATE
-//   4. products upsert met ean/condition/fulfillmentBy kolommen
 // ============================================================
 
 import { Worker, Queue, Job } from 'bullmq';
 import { db }          from '../../../infrastructure/database/connection';
-import { cache, redis } from '../../../infrastructure/cache/redis';
+import { redis }       from '../../../infrastructure/cache/redis';
 import { eventBus }    from '../../../shared/events/event-bus';
 import { logger }      from '../../../shared/logging/logger';
 import { runWithTenantContext } from '../../../shared/middleware/tenant-context';
@@ -39,14 +33,49 @@ export interface WebhookJobPayload {
   body:          Record<string, unknown>;
 }
 
-const redisConnection = {
-  host: process.env.REDIS_HOST ?? 'localhost',
-  port: parseInt(process.env.REDIS_PORT ?? '6379'),
-};
+// ── BullMQ connection: gebruik REDIS_URL (Upstash TLS) ────────
+// BullMQ heeft een IORedis-instantie nodig, GEEN host/port object
+// want dat ondersteunt geen rediss:// TLS (Upstash vereist TLS)
+function buildBullMQConnection() {
+  const url = process.env.REDIS_URL;
 
-export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',    { connection: redisConnection });
-export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: redisConnection });
+  if (!url) {
+    // Lokale dev fallback
+    const IORedis = require('ioredis');
+    return new IORedis({
+      host:                 'localhost',
+      port:                 6379,
+      maxRetriesPerRequest: null,
+      enableOfflineQueue:   true,
+    });
+  }
 
+  const IORedis  = require('ioredis');
+  const isTLS    = url.startsWith('rediss://');
+  let hostname   = 'localhost';
+  try { hostname = new URL(url).hostname; } catch {}
+
+  return new IORedis(url, {
+    tls: isTLS ? { rejectUnauthorized: false, servername: hostname } : undefined,
+    maxRetriesPerRequest: null,
+    enableOfflineQueue:   true,
+    lazyConnect:          false,
+    family:               4,
+    retryStrategy: (times: number) => {
+      if (times > 10) return null;
+      return Math.min(times * 500, 5000);
+    },
+  });
+}
+
+// Één gedeelde connectie voor alle queues/workers
+const bullConnection = buildBullMQConnection();
+
+// ── Queues ────────────────────────────────────────────────────
+export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',     { connection: bullConnection });
+export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: bullConnection });
+
+// ── Rate limiter ──────────────────────────────────────────────
 async function acquireRateLimit(platformSlug: string, integrationId: string): Promise<void> {
   const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
   const limit = getRateLimit(platformSlug);
@@ -88,9 +117,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
       { allowNoTenant: true }
     );
 
-    if (!credRow.rows[0]) {
-      throw new Error(`Geen credentials gevonden voor integratie ${integrationId}`);
-    }
+    if (!credRow.rows[0]) throw new Error(`Geen credentials voor integratie ${integrationId}`);
 
     const row = credRow.rows[0];
     const credentials: IntegrationCredentials = {
@@ -144,92 +171,58 @@ export const syncWorker = new Worker<SyncJobPayload>(
             );
         const updatedAfter = isFullSync ? undefined : lastSyncRow?.rows[0]?.last_sync_at;
 
-        // ── Orders sync ──────────────────────────────────────
+        // ── Orders ──────────────────────────────────────────
         let cursor: string | undefined;
         let page    = 1;
         let hasMore = true;
 
         while (hasMore) {
           await acquireRateLimit(platformSlug, integrationId);
-
           const result = await connector.fetchOrders(credentials, {
-            updatedAfter,
-            limit:   250,
-            cursor,
-            page,
-            jobType, // ← KRITIEK: connector moet weten of het full_sync is
+            updatedAfter, limit: 250, cursor, page, jobType,
           });
 
           if (result.items.length > 0) {
             await upsertOrders(result.items, integrationId, tenantId, platformSlug);
             totalOrders += result.items.length;
-
             await db.query(
               `UPDATE integration_sync_jobs SET orders_synced = $1 WHERE id = $2`,
               [totalOrders, syncJobDbId],
               { allowNoTenant: true }
             );
-
-            for (const order of result.items) {
-              if (order.status === 'completed' || order.status === 'processing') {
-                await eventBus.publish({
-                  type:       'order.created',
-                  tenantId,
-                  occurredAt: new Date(),
-                  payload: {
-                    orderId:     order.externalId,
-                    totalAmount: order.totalAmount,
-                    currency:    order.currency,
-                  },
-                });
-              }
-            }
           }
 
           hasMore = result.hasNextPage;
           cursor  = result.nextCursor;
           page    = result.nextPage ?? page + 1;
-
           if (!isFullSync && totalOrders >= 10_000) break;
         }
 
-        // ── Producten sync (altijd ophalen, ook bij incremental) ──
+        // ── Producten (altijd, ook incremental) ─────────────
         {
           let productPage     = 1;
           let hasMoreProducts = true;
-
           while (hasMoreProducts) {
             await acquireRateLimit(platformSlug, integrationId);
-
             const result = await connector.fetchProducts(credentials, {
-              limit:   250,
-              page:    productPage,
-              jobType,
+              limit: 250, page: productPage, jobType,
             });
-
             if (result.items.length > 0) {
               await upsertProducts(result.items, integrationId, tenantId, platformSlug);
               totalProducts += result.items.length;
             }
-
             hasMoreProducts = result.hasNextPage;
             productPage     = result.nextPage ?? productPage + 1;
-
-            // Bij incremental: max 1 pagina producten (snel)
-            if (!isFullSync) break;
+            if (!isFullSync) break; // incremental: 1 pagina
           }
         }
       }
     );
 
-    // ── Afronden ──────────────────────────────────────────────
     await db.query(
       `UPDATE tenant_integrations
        SET status = 'active', last_sync_at = now(), error_message = null,
-           orders_count = (
-             SELECT COUNT(*) FROM orders
-             WHERE tenant_id = $1 AND integration_id = $2
-           ),
+           orders_count = (SELECT COUNT(*) FROM orders WHERE tenant_id = $1 AND integration_id = $2),
            updated_at = now()
        WHERE id = $2`,
       [tenantId, integrationId],
@@ -245,24 +238,18 @@ export const syncWorker = new Worker<SyncJobPayload>(
       { allowNoTenant: true }
     );
 
-    logger.info('sync.job.done', {
-      integrationId, tenantId, platformSlug, jobType,
-      totalOrders, totalProducts,
-    });
+    logger.info('sync.job.done', { integrationId, tenantId, platformSlug, jobType, totalOrders, totalProducts });
   },
-  { connection: redisConnection, concurrency: 5 }
+  { connection: bullConnection, concurrency: 5 }
 );
 
 syncWorker.on('failed', async (job: Job<SyncJobPayload> | undefined, err: Error) => {
   if (!job) return;
-  const { integrationId, tenantId, syncJobDbId } = job.data;
-  logger.error('sync.job.failed', { integrationId, tenantId, error: err.message });
-
+  const { integrationId, syncJobDbId } = job.data;
+  logger.error('sync.job.failed', { integrationId, error: err.message });
   if (job.attemptsMade >= 3) {
     await db.query(
-      `UPDATE tenant_integrations
-       SET status = 'error', error_message = $1, updated_at = now()
-       WHERE id = $2`,
+      `UPDATE tenant_integrations SET status = 'error', error_message = $1 WHERE id = $2`,
       [err.message.slice(0, 500), integrationId],
       { allowNoTenant: true }
     );
@@ -320,10 +307,10 @@ async function upsertOrders(
            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
            ON CONFLICT (order_id, external_id)
            DO UPDATE SET
-             quantity      = EXCLUDED.quantity,
-             unit_price    = EXCLUDED.unit_price,
-             total_price   = EXCLUDED.total_price,
-             title         = EXCLUDED.title`,
+             quantity    = EXCLUDED.quantity,
+             unit_price  = EXCLUDED.unit_price,
+             total_price = EXCLUDED.total_price,
+             title       = EXCLUDED.title`,
           [
             orderId, tenantId, li.externalId, li.productId, li.variantId,
             li.sku, li.title, li.quantity, li.unitPrice, li.totalPrice,
@@ -340,7 +327,7 @@ async function upsertProducts(
   products: NormalizedProduct[],
   integrationId: string,
   tenantId: string,
-  platformSlug: string
+  _platformSlug: string
 ): Promise<void> {
   for (const p of products) {
     await db.query(
@@ -367,8 +354,7 @@ async function upsertProducts(
         p.status ?? 'active', p.productType, p.tags, p.vendor,
         p.totalInventory ?? 0, p.requiresShipping ?? true,
         p.priceMin, p.priceMax, p.publishedAt, p.updatedAt,
-        (p as any).ean, (p as any).condition ?? 'NEW',
-        (p as any).fulfillmentBy ?? 'FBR',
+        (p as any).ean, (p as any).condition ?? 'NEW', (p as any).fulfillmentBy ?? 'FBR',
       ]
     );
   }
