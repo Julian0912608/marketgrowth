@@ -1,12 +1,3 @@
-// ============================================================
-// src/infrastructure/cache/redis.ts  (FIXED)
-//
-// FIX: Redis client wordt nu lazy aangemaakt — pas bij het eerste
-// gebruik wordt de connectie opgezet. Hierdoor wordt REDIS_URL
-// gelezen op het moment dat de server al draait en env vars
-// beschikbaar zijn, niet tijdens module-load.
-// ============================================================
-
 import Redis from 'ioredis';
 import { logger } from '../../shared/logging/logger';
 
@@ -15,40 +6,43 @@ let _redis: Redis | null = null;
 function getRedis(): Redis {
   if (_redis) return _redis;
 
-  const url = process.env.REDIS_URL;
+  const url = process.env.REDIS_URL ?? 'redis://localhost:6379';
 
-  if (!url) {
-    logger.warn('redis.no_url', { message: 'REDIS_URL niet ingesteld, Redis wordt overgeslagen' });
-  }
-
-  _redis = new Redis(url ?? 'redis://localhost:6379', {
-    maxRetriesPerRequest: 3,
-    lazyConnect:          false,
-    retryStrategy:        (times) => Math.min(times * 100, 3000),
-    // Upstash vereist TLS — wordt automatisch afgehandeld via rediss://
-    enableOfflineQueue:   false,
+  _redis = new Redis(url, {
+    maxRetriesPerRequest: null,
+    lazyConnect:          true,
+    retryStrategy:        (times) => {
+      if (times > 10) return null; // stop retrying na 10x
+      return Math.min(times * 200, 5000);
+    },
+    enableOfflineQueue: true,
   });
 
   _redis.on('error', (err) => {
-    logger.error('redis.error', { error: err.message, url: url ? url.replace(/:\/\/[^@]+@/, '://***@') : 'none' });
+    // Log maar gooi NOOIT een uncaught exception — anders crasht het proces
+    logger.error('redis.error', { error: err.message });
   });
 
   _redis.on('connect', () => {
-    logger.info('redis.connected', { url: url ? url.replace(/:\/\/[^@]+@/, '://***@') : 'none' });
+    logger.info('redis.connected', {
+      url: url.replace(/:\/\/[^@]+@/, '://***@'),
+    });
+  });
+
+  // Verbinding initiëren (niet-blokkerend)
+  _redis.connect().catch((err) => {
+    logger.warn('redis.connect.failed', { error: err.message });
   });
 
   return _redis;
 }
 
-// Exporteer als proxy zodat alle imports gewoon `redis.get(...)` kunnen doen
-// maar de client pas aangemaakt wordt bij eerste gebruik
+// Proxy zodat imports gewoon `redis.get(...)` kunnen doen
 export const redis = new Proxy({} as Redis, {
   get(_target, prop) {
     return (getRedis() as any)[prop];
   },
 });
-
-// ─── Tenant-scoped cache helpers ─────────────────────────────
 
 const cache = {
   async get(key: string): Promise<string | null> {
