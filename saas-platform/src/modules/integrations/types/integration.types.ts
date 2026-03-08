@@ -133,3 +133,50 @@ export interface IPlatformConnector {
   registerWebhook?(creds: IntegrationCredentials, topic: string, callbackUrl: string): Promise<WebhookRegistration>;
   verifyWebhook?(payload: Buffer, signature: string, secret: string): boolean;
 }
+
+// ── Extra types die integration.service.ts nodig heeft ───────
+
+export interface ConnectIntegrationRequest {
+  platformSlug:  PlatformSlug;
+  shopDomain?:   string;
+  apiKey?:       string;
+  apiSecret?:    string;
+  storeUrl?:     string;
+  code?:         string;   // OAuth code
+  state?:        string;
+}
+
+export interface ConnectIntegrationResponse {
+  integrationId:  string;
+  redirectUrl?:   string;  // OAuth platforms sturen klant hierheen
+  status:         'connected' | 'oauth_required';
+}
+
+export interface IntegrationSummary {
+  id:             string;
+  platformSlug:   PlatformSlug;
+  platformName:   string;
+  status:         string;
+  shopDomain?:    string;
+  lastSyncAt?:    Date;
+  nextSyncAt?:    Date;
+  ordersCount?:   number;
+  errorMessage?:  string;
+  createdAt:      Date;
+}
+
+export interface SyncStatusResponse {
+  integrationId:  string;
+  status:         string;
+  lastSyncAt?:    Date;
+  nextSyncAt?:    Date;
+  errorMessage?:  string;
+  recentJobs:     Array<{
+    id:           string;
+    jobType:      string;
+    status:       string;
+    orderssynced: number;
+    startedAt:    Date;
+    completedAt:  Date;
+  }>;
+}
