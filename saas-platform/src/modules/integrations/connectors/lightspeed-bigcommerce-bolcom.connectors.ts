@@ -257,26 +257,26 @@ export class BigCommerceConnector implements IPlatformConnector {
   }
 }
 // ============================================================
-// VERVANG alleen de BolcomConnector klasse onderaan
+// VERVANG de volledige BolcomConnector klasse in:
 // saas-platform/src/modules/integrations/connectors/lightspeed-bigcommerce-bolcom.connectors.ts
 //
-// Fixes:
-// 1. unitPrice is een object {amount, currency} — niet een getal
-// 2. FBR + FBB orders ophalen
-// 3. Redis token caching
-// 4. Echte shopName via /retailer/account
+// Gebaseerd op officiële bol.com Retailer API v10 documentatie:
+// - Orders API: status=ALL geeft alleen laatste 48 uur
+// - Shipments API: geeft verzonden orders tot 3 maanden terug
+// - latest-change-date: haal per dag historische orders op
+// - unitPrice in order detail is een object {amount, currency}
 // ============================================================
 
 export class BolcomConnector implements IPlatformConnector {
   readonly platform = 'bolcom' as const;
 
+  // ── Verbinding testen ─────────────────────────────────────
   async testConnection(creds: IntegrationCredentials): Promise<ConnectionTestResult> {
     try {
       const token = await this.getAccessToken(creds);
-      // Haal echte accountnaam op
       try {
-        const account = await this.apiGet(token, '/retailer/account') as Record<string, unknown>;
-        const shopName = String(account.accountName ?? account.name ?? 'Bol.com Retailer');
+        const account = await this.apiGet(token, '/retailer/retailers/me') as Record<string, unknown>;
+        const shopName = String(account.displayName ?? account.accountName ?? 'Bol.com Retailer');
         return { success: true, shopName, shopCurrency: 'EUR', shopCountry: 'NL' };
       } catch {
         return { success: true, shopName: 'Bol.com Retailer', shopCurrency: 'EUR', shopCountry: 'NL' };
@@ -286,110 +286,186 @@ export class BolcomConnector implements IPlatformConnector {
     }
   }
 
+  // ── Orders ophalen ────────────────────────────────────────
+  // Strategie:
+  // - full_sync: gebruik Shipments API (3 mnd geschiedenis) + orders van vandaag/gisteren
+  // - incremental: gebruik Orders API met change-interval-minute
   async fetchOrders(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedOrder>> {
     const token = await this.getAccessToken(creds);
     const page  = options.page ?? 1;
 
-    // Haal FBR en FBB orders parallel op
+    // Bij full sync of geen updatedAfter: gebruik Shipments API voor historische data
+    if (!options.updatedAfter || options.jobType === 'full_sync') {
+      return this.fetchOrdersViaShipments(token, page);
+    }
+
+    // Incremental: haal recente orders op via Orders API
+    return this.fetchRecentOrders(token, page, options.updatedAfter);
+  }
+
+  // Shipments API — geeft orders tot 3 maanden terug MET correcte prijzen
+  private async fetchOrdersViaShipments(token: string, page: number): Promise<PaginatedResult<NormalizedOrder>> {
+    const data = await this.apiGet(
+      token,
+      `/retailer/shipments?fulfilment-method=ALL&page=${page}`
+    ) as { shipments?: Record<string, unknown>[] };
+
+    const shipments = data.shipments ?? [];
+    const orders    = shipments.map(s => this.normalizeShipment(s));
+
+    return {
+      items:       orders,
+      hasNextPage: shipments.length === 50,
+      nextPage:    shipments.length === 50 ? page + 1 : undefined,
+    };
+  }
+
+  // Orders API — recente open + afgehandelde orders (laatste 48 uur)
+  private async fetchRecentOrders(token: string, page: number, since: Date): Promise<PaginatedResult<NormalizedOrder>> {
+    // Bereken minuten geleden voor change-interval-minute
+    const minutesAgo = Math.ceil((Date.now() - since.getTime()) / 60000);
+    // Max 2880 minuten (48 uur) — dat is de limiet van de API
+    const interval   = Math.min(minutesAgo + 5, 2880);
+
     const [fbrData, fbbData] = await Promise.allSettled([
-      this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBR&page=${page}`) as Promise<{ orders?: Record<string, unknown>[] }>,
-      this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBB&page=${page}`) as Promise<{ orders?: Record<string, unknown>[] }>,
+      this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=${interval}&page=${page}`) as Promise<{ orders?: Record<string, unknown>[] }>,
+      this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBB&change-interval-minute=${interval}&page=${page}`) as Promise<{ orders?: Record<string, unknown>[] }>,
     ]);
 
     const fbrOrders = fbrData.status === 'fulfilled' ? (fbrData.value.orders ?? []) : [];
     const fbbOrders = fbbData.status === 'fulfilled' ? (fbbData.value.orders ?? []) : [];
 
     // Dedupliceer op orderId
-    const seen  = new Set<string>();
+    const seen = new Set<string>();
     const all: Record<string, unknown>[] = [];
     for (const o of [...fbrOrders, ...fbbOrders]) {
       const id = String(o.orderId);
       if (!seen.has(id)) { seen.add(id); all.push(o); }
     }
 
+    // Haal detail op per order voor correcte prijzen
+    const detailed = await Promise.allSettled(
+      all.map(o => this.apiGet(token, `/retailer/orders/${o.orderId}`) as Promise<Record<string, unknown>>)
+    );
+
+    const items = detailed
+      .filter((r): r is PromiseFulfilledResult<Record<string, unknown>> => r.status === 'fulfilled')
+      .map(r => this.normalizeOrderDetail(r.value));
+
     const hasNextPage = fbrOrders.length === 50 || fbbOrders.length === 50;
-    return {
-      items:       all.map(o => this.normalizeOrder(o)),
-      hasNextPage,
-      nextPage:    hasNextPage ? page + 1 : undefined,
-    };
+    return { items, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
+  // ── Producten / aanbod ophalen ────────────────────────────
   async fetchProducts(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedProduct>> {
     const token = await this.getAccessToken(creds);
     const page  = options.page ?? 1;
-    const data  = await this.apiGet(token, `/retailer/inventory?page=${page}`) as { inventory?: Record<string, unknown>[] };
+    const data  = await this.apiGet(token, `/retailer/inventory?page=${page}`) as {
+      inventory?: Record<string, unknown>[];
+    };
     const items = (data.inventory ?? []).map(p => this.normalizeProduct(p));
-    return { items, hasNextPage: items.length === 50, nextPage: items.length === 50 ? page + 1 : undefined };
+    return {
+      items,
+      hasNextPage: items.length === 50,
+      nextPage:    items.length === 50 ? page + 1 : undefined,
+    };
   }
 
   async fetchCustomers(): Promise<PaginatedResult<NormalizedCustomer>> {
-    // Bol.com stelt geen klantgegevens beschikbaar
+    // Bol.com stelt geen klantgegevens beschikbaar via API
     return { items: [], hasNextPage: false };
   }
 
   async refreshAccessToken(creds: IntegrationCredentials): Promise<TokenRefreshResult> {
     const token = await this.getAccessToken(creds);
-    return { accessToken: token, expiresAt: new Date(Date.now() + 290_000) };
+    return { accessToken: token, expiresAt: new Date(Date.now() + 270_000) };
   }
 
   // ── Token ophalen met Redis caching ───────────────────────
   private async getAccessToken(creds: IntegrationCredentials): Promise<string> {
     const cacheKey = `bolcom:token:${creds.integrationId}`;
-
-    // Probeer uit cache
     try {
       const { cache } = await import('../../../infrastructure/cache/redis');
       const cached = await cache.get(cacheKey);
       if (cached) return cached;
-    } catch { /* cache miss — gewoon doorgaan */ }
+    } catch { /* cache miss */ }
 
     const encoded = Buffer.from(`${creds.apiKey}:${creds.apiSecret}`).toString('base64');
     const res = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method:  'POST',
       headers: { 'Authorization': `Basic ${encoded}`, 'Accept': 'application/json' },
     });
-    if (!res.ok) throw new Error(`Bol.com token ophalen mislukt: ${res.status}`);
-    const d = await res.json() as { access_token: string; expires_in?: number };
+    if (!res.ok) throw new Error(`Bol.com token mislukt: ${res.status}`);
+    const d = await res.json() as { access_token: string };
 
-    // Cache met 270 sec TTL (token geldig ~290 sec)
     try {
       const { cache } = await import('../../../infrastructure/cache/redis');
       await cache.set(cacheKey, d.access_token, 270);
-    } catch { /* cache write mislukt — geen probleem */ }
+    } catch { /* cache write mislukt */ }
 
     return d.access_token;
   }
 
-  // ── Order normalisatie ────────────────────────────────────
-  private normalizeOrder(o: Record<string, unknown>): NormalizedOrder {
-    const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) ?? [];
+  // ── Shipment normalisatie (historische data) ──────────────
+  // Shipment response bevat: shipmentId, orderId, shipmentDate, shipmentItems[]
+  // shipmentItem bevat: orderItemId, ean, title, quantity, unitPrice {amount, currency}
+  private normalizeShipment(s: Record<string, unknown>): NormalizedOrder {
+    const items = (s.shipmentItems as Record<string, unknown>[] | undefined) ?? [];
 
-    // Helper: bol.com geeft prijzen als {amount: "12.99", currency: "EUR"}
-    const parsePrice = (val: unknown): number => {
-      if (val === null || val === undefined) return 0;
-      if (typeof val === 'number') return val;
-      if (typeof val === 'string') return parseFloat(val) || 0;
-      if (typeof val === 'object') {
-        const obj = val as Record<string, unknown>;
-        return parseFloat(String(obj.amount ?? obj.value ?? '0')) || 0;
-      }
-      return 0;
-    };
-
-    const lineItems: NormalizedLineItem[] = orderItems.map((i): NormalizedLineItem => {
-      const item     = i as Record<string, unknown>;
-      const product  = item.product as Record<string, unknown> | undefined;
-      const qty      = Number(item.quantity ?? 1);
-      const unitP    = parsePrice(item.unitPrice);
+    const lineItems: NormalizedLineItem[] = items.map((item): NormalizedLineItem => {
+      const qty     = Number(item.quantity ?? 1);
+      const unitP   = this.parsePrice(item.unitPrice);
       return {
-        externalId:    String(item.orderItemId ?? item.id ?? Math.random()),
+        externalId:    String(item.orderItemId ?? item.shipmentItemId ?? Math.random()),
         productId:     item.ean ? String(item.ean) : undefined,
         sku:           item.ean ? String(item.ean) : undefined,
-        title:         String(product?.title ?? item.title ?? ''),
+        title:         String((item.product as Record<string, unknown> | undefined)?.title ?? item.title ?? ''),
         quantity:      qty,
         unitPrice:     unitP,
         totalPrice:    unitP * qty,
+        discountAmount: 0,
+      };
+    });
+
+    const totalAmount = lineItems.reduce((s, li) => s + li.totalPrice, 0);
+    const shipDate    = s.shipmentDate ? new Date(String(s.shipmentDate)) : new Date();
+
+    return {
+      externalId:     String(s.orderId ?? s.shipmentId),
+      externalNumber: String(s.orderId ?? s.shipmentId),
+      totalAmount,
+      subtotalAmount: totalAmount,
+      taxAmount:      0,
+      shippingAmount: 0,
+      discountAmount: 0,
+      currency:       'EUR',
+      status:         'completed',
+      lineItems,
+      orderedAt:      shipDate,
+      updatedAt:      shipDate,
+    };
+  }
+
+  // ── Order detail normalisatie (recente orders) ────────────
+  // Get order by id response: orderId, orderPlacedDateTime, orderItems[]
+  // orderItem bevat: unitPrice {amount, currency}, quantity, totalPrice {amount, currency}
+  private normalizeOrderDetail(o: Record<string, unknown>): NormalizedOrder {
+    const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) ?? [];
+
+    const lineItems: NormalizedLineItem[] = orderItems.map((item): NormalizedLineItem => {
+      const qty       = Number(item.quantity ?? item.quantityOrdered ?? 1);
+      const unitP     = this.parsePrice(item.unitPrice);
+      const totalP    = this.parsePrice(item.totalPrice) || (unitP * qty);
+      const product   = item.product as Record<string, unknown> | undefined;
+      const offer     = item.offer as Record<string, unknown> | undefined;
+      return {
+        externalId:    String(item.orderItemId),
+        productId:     item.ean ? String(item.ean) : undefined,
+        sku:           item.ean ? String(item.ean) : undefined,
+        title:         String(product?.title ?? offer?.title ?? ''),
+        quantity:      qty,
+        unitPrice:     unitP,
+        totalPrice:    totalP,
         discountAmount: 0,
       };
     });
@@ -412,15 +488,31 @@ export class BolcomConnector implements IPlatformConnector {
     };
   }
 
+  // ── Product normalisatie ──────────────────────────────────
   private normalizeProduct(p: Record<string, unknown>): NormalizedProduct {
     return {
       externalId:     String(p.ean ?? p.id),
       title:          String(p.title ?? ''),
-      totalInventory: parseInt(String((p.stock as Record<string, unknown> | undefined)?.correctedStock ?? '0')),
-      updatedAt:      new Date(),
+      totalInventory: parseInt(String(
+        (p.stock as Record<string, unknown> | undefined)?.correctedStock ?? '0'
+      )),
+      updatedAt: new Date(),
     };
   }
 
+  // ── Prijs parser (bol geeft {amount, currency} OF getal) ─
+  private parsePrice(val: unknown): number {
+    if (val === null || val === undefined) return 0;
+    if (typeof val === 'number') return val;
+    if (typeof val === 'string') return parseFloat(val) || 0;
+    if (typeof val === 'object') {
+      const obj = val as Record<string, unknown>;
+      return parseFloat(String(obj.amount ?? obj.value ?? '0')) || 0;
+    }
+    return 0;
+  }
+
+  // ── API helper ────────────────────────────────────────────
   private async apiGet(token: string, path: string): Promise<unknown> {
     const res = await fetch(`https://api.bol.com${path}`, {
       headers: {
@@ -432,17 +524,3 @@ export class BolcomConnector implements IPlatformConnector {
     return res.json();
   }
 }
-async fetchOrders(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedOrder>> {
-  const token = await this.getAccessToken(creds);
-  const page  = options.page ?? 1;
-  
-  // Voeg datum filter toe als beschikbaar
-  const dateParam = options.updatedAfter 
-    ? `&latest-change-date=${options.updatedAfter.toISOString().split('T')[0]}`
-    : '';
-
-  const [fbrData, fbbData] = await Promise.allSettled([
-    this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBR&page=${page}${dateParam}`),
-    this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBB&page=${page}${dateParam}`),
-  ]);
-  // ... rest blijft hetzelfde
