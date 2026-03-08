@@ -297,24 +297,36 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // Shipments API — historische data, bevat correcte prijzen
+  // BELANGRIJK: Shipments API accepteert GEEN fulfilment-method=ALL
+  // Moet twee aparte calls doen: FBR en FBB
   private async fetchViaShipments(
     token: string,
     page: number
   ): Promise<PaginatedResult<NormalizedOrder>> {
-    const data = await this.apiGet(
-      token,
-      `/retailer/shipments?fulfilment-method=ALL&page=${page}`
-    ) as { shipments?: Record<string, unknown>[] };
+    // Haal FBR en FBB shipments parallel op
+    const [fbrData, fbbData] = await Promise.all([
+      this.apiGet(token, `/retailer/shipments?fulfilment-method=FBR&page=${page}`)
+        .catch(() => ({ shipments: [] })) as Promise<{ shipments?: Record<string, unknown>[] }>,
+      this.apiGet(token, `/retailer/shipments?fulfilment-method=FBB&page=${page}`)
+        .catch(() => ({ shipments: [] })) as Promise<{ shipments?: Record<string, unknown>[] }>,
+    ]);
 
-    const shipments = data.shipments ?? [];
+    const fbrShipments = fbrData.shipments ?? [];
+    const fbbShipments = fbbData.shipments ?? [];
+    const allShipments = [...fbrShipments, ...fbbShipments];
+
+    // hasNextPage als ofwel FBR ofwel FBB nog een volgende pagina heeft (50 items)
+    const hasNextPage = fbrShipments.length === 50 || fbbShipments.length === 50;
+
     return {
-      items:       shipments.map(s => this.normalizeShipment(s)),
-      hasNextPage: shipments.length === 50,
-      nextPage:    shipments.length === 50 ? page + 1 : undefined,
+      items:       allShipments.map(s => this.normalizeShipment(s)),
+      hasNextPage,
+      nextPage:    hasNextPage ? page + 1 : undefined,
     };
   }
 
   // Orders API — recente orders met change-interval-minute
+  // fulfilment-method=ALL bestaat ook niet op Orders API — gebruik FBR (eigen verzending)
   private async fetchViaOrders(
     token: string,
     updatedAfter: Date | undefined,
@@ -325,9 +337,10 @@ export class BolcomConnector implements IPlatformConnector {
       : 120;
     const cappedMinutes = Math.min(minutesAgo, 2880); // max 48u
 
+    // status=ALL + fulfilment-method=FBR: alle FBR orders van afgelopen X minuten
     const data = await this.apiGet(
       token,
-      `/retailer/orders?status=ALL&fulfilment-method=ALL&change-interval-minute=${cappedMinutes}&page=${page}`
+      `/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=${cappedMinutes}&page=${page}`
     ) as { orders?: Record<string, unknown>[] };
 
     const rawOrders = data.orders ?? [];
