@@ -2,14 +2,14 @@
 // src/modules/integrations/service/integration.service.ts
 // ============================================================
 
-import crypto          from 'crypto';
+import crypto           from 'crypto';
+import { PoolClient }   from 'pg';
 import { v4 as uuidv4 } from 'uuid';
-import { db }          from '../../../infrastructure/database/connection';
-import { cache }       from '../../../infrastructure/cache/redis';
-import { logger }      from '../../../shared/logging/logger';
+import { db }           from '../../../infrastructure/database/connection';
+import { cache }        from '../../../infrastructure/cache/redis';
+import { logger }       from '../../../shared/logging/logger';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
-import { permissionService } from '../../../shared/permissions/permission.service';
-import { syncQueue }   from '../workers/sync.worker';
+import { syncQueue }    from '../workers/sync.worker';
 import { getConnector } from '../connectors/connector.factory';
 import {
   PlatformSlug,
@@ -17,17 +17,16 @@ import {
   ConnectIntegrationResponse,
   IntegrationSummary,
   SyncStatusResponse,
+  SyncJobSummary,
   IntegrationCredentials,
 } from '../types/integration.types';
 
-// Plan limieten: hoeveel winkels per plan
 const PLAN_STORE_LIMITS: Record<string, number> = {
   starter: 1,
   growth:  3,
   scale:   999,
 };
 
-// Platform namen voor weergave
 const PLATFORM_NAMES: Record<PlatformSlug, string> = {
   shopify:     'Shopify',
   woocommerce: 'WooCommerce',
@@ -39,7 +38,6 @@ const PLATFORM_NAMES: Record<PlatformSlug, string> = {
   etsy:        'Etsy',
 };
 
-// OAuth platforms die een redirect vereisen
 const OAUTH_PLATFORMS: PlatformSlug[] = ['shopify', 'amazon', 'etsy'];
 
 export class IntegrationService {
@@ -48,7 +46,6 @@ export class IntegrationService {
   async connect(input: ConnectIntegrationRequest): Promise<ConnectIntegrationResponse> {
     const { tenantId, planSlug } = getTenantContext();
 
-    // Check plan limiet
     const countResult = await db.query(
       `SELECT COUNT(*) FROM tenant_integrations WHERE tenant_id = $1 AND status != 'disconnected'`,
       [tenantId]
@@ -58,31 +55,25 @@ export class IntegrationService {
 
     if (currentCount >= limit) {
       throw Object.assign(
-        new Error(`Je ${planSlug} abonnement staat maximaal ${limit} winkel(s) toe. Upgrade om meer winkels te koppelen.`),
+        new Error(`Je ${planSlug} abonnement staat maximaal ${limit} winkel(s) toe.`),
         { code: 'PLAN_LIMIT_EXCEEDED', httpStatus: 403 }
       );
     }
 
-    // OAuth platforms: genereer redirect URL
     if (OAUTH_PLATFORMS.includes(input.platformSlug)) {
       return this.startOAuthFlow(input, tenantId);
     }
 
-    // API key platforms (WooCommerce, Lightspeed, Magento, BigCommerce, Bol.com)
     return this.connectWithApiKey(input, tenantId);
   }
 
   // ── OAuth flow starten ────────────────────────────────────
-  private async startOAuthFlow(
-    input: ConnectIntegrationRequest,
-    tenantId: string
-  ): Promise<ConnectIntegrationResponse> {
-    const state          = crypto.randomBytes(16).toString('hex');
-    const integrationId  = uuidv4();
-    const appUrl         = process.env.APP_URL!;
-    const redirectUri    = `${appUrl}/api/integrations/callback/${input.platformSlug}`;
+  private async startOAuthFlow(input: ConnectIntegrationRequest, tenantId: string): Promise<ConnectIntegrationResponse> {
+    const state         = crypto.randomBytes(16).toString('hex');
+    const integrationId = uuidv4();
+    const appUrl        = process.env.APP_URL!;
+    const redirectUri   = `${appUrl}/api/integrations/callback/${input.platformSlug}`;
 
-    // Bewaar state tijdelijk in cache (10 minuten)
     await cache.set(
       `oauth:state:${state}`,
       JSON.stringify({ tenantId, integrationId, platformSlug: input.platformSlug, shopDomain: input.shopDomain }),
@@ -127,24 +118,17 @@ export class IntegrationService {
     }
 
     logger.info('integration.oauth.started', { tenantId, platform: input.platformSlug });
-
-    return { integrationId, authUrl, redirectUrl: authUrl, status: 'oauth_required' };
+    return { integrationId, authUrl, status: 'oauth_required' };
   }
 
   // ── OAuth callback afhandelen ─────────────────────────────
-  async handleOAuthCallback(
-    platformSlug: PlatformSlug,
-    code: string,
-    state: string
-  ): Promise<{ integrationId: string; tenantId: string }> {
-    // State ophalen en valideren
+  async handleOAuthCallback(platformSlug: PlatformSlug, code: string, state: string): Promise<{ integrationId: string; tenantId: string }> {
     const cached = await cache.get(`oauth:state:${state}`);
     if (!cached) throw Object.assign(new Error('Ongeldige of verlopen OAuth state'), { httpStatus: 400 });
 
     const { tenantId, integrationId, shopDomain } = JSON.parse(cached) as {
       tenantId: string; integrationId: string; platformSlug: PlatformSlug; shopDomain?: string;
     };
-
     await cache.del(`oauth:state:${state}`);
 
     let accessToken: string;
@@ -152,65 +136,40 @@ export class IntegrationService {
 
     if (platformSlug === 'shopify') {
       const res = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          client_id:     process.env.SHOPIFY_CLIENT_ID,
-          client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-          code,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: process.env.SHOPIFY_CLIENT_ID, client_secret: process.env.SHOPIFY_CLIENT_SECRET, code }),
       });
       if (!res.ok) throw new Error('Shopify token exchange mislukt');
       const d = await res.json() as { access_token: string };
       accessToken = d.access_token;
     } else if (platformSlug === 'amazon') {
       const res = await fetch('https://api.amazon.com/auth/o2/token', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type:    'authorization_code',
-          code,
-          client_id:     process.env.AMAZON_CLIENT_ID!,
-          client_secret: process.env.AMAZON_CLIENT_SECRET!,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ grant_type: 'authorization_code', code, client_id: process.env.AMAZON_CLIENT_ID!, client_secret: process.env.AMAZON_CLIENT_SECRET! }),
       });
       if (!res.ok) throw new Error('Amazon token exchange mislukt');
       const d = await res.json() as { access_token: string; refresh_token: string };
-      accessToken  = d.access_token;
-      refreshToken = d.refresh_token;
+      accessToken = d.access_token; refreshToken = d.refresh_token;
     } else if (platformSlug === 'etsy') {
-      const codeVerifier = await cache.get(`oauth:pkce:${state}`);
+      const codeVerifier = await cache.get(`oauth:pkce:${state}`) ?? '';
       await cache.del(`oauth:pkce:${state}`);
       const res = await fetch('https://api.etsy.com/v3/public/oauth/token', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type:    'authorization_code',
-          client_id:     process.env.ETSY_CLIENT_ID!,
-          redirect_uri:  `${process.env.APP_URL}/api/integrations/callback/etsy`,
-          code,
-          code_verifier: codeVerifier ?? '',
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ grant_type: 'authorization_code', client_id: process.env.ETSY_CLIENT_ID!, redirect_uri: `${process.env.APP_URL}/api/integrations/callback/etsy`, code, code_verifier: codeVerifier }),
       });
       if (!res.ok) throw new Error('Etsy token exchange mislukt');
       const d = await res.json() as { access_token: string; refresh_token: string };
-      accessToken  = d.access_token;
-      refreshToken = d.refresh_token;
+      accessToken = d.access_token; refreshToken = d.refresh_token;
     } else {
       throw new Error(`Onbekend OAuth platform: ${platformSlug}`);
     }
 
-    // Test de verbinding
-    const connector = getConnector(platformSlug);
-    const tempCreds: IntegrationCredentials = {
-      integrationId, platform: platformSlug,
-      accessToken, refreshToken, shopDomain,
-    };
+    const connector  = getConnector(platformSlug);
+    const tempCreds: IntegrationCredentials = { integrationId, platform: platformSlug, accessToken, refreshToken, shopDomain };
     const testResult = await connector.testConnection(tempCreds);
     if (!testResult.success) throw new Error(`Verbindingstest mislukt: ${testResult.error}`);
 
-    // Sla op in database
-    await db.transaction(async (client) => {
+    await db.transaction(async (client: PoolClient) => {
       await client.query(
         `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, 'active', now(), now())
@@ -227,42 +186,28 @@ export class IntegrationService {
       );
     });
 
-    // Start initiële full sync
     await syncQueue.add(`sync:${platformSlug}:${integrationId}:initial`, {
-      integrationId, tenantId, platformSlug,
-      jobType:    'full_sync',
-      syncJobDbId: uuidv4(),
+      integrationId, tenantId, platformSlug, jobType: 'full_sync', syncJobDbId: uuidv4(),
     }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
 
     logger.info('integration.connected', { tenantId, integrationId, platformSlug });
-
     return { integrationId, tenantId };
   }
 
-  // ── API key koppeling (WooCommerce, Lightspeed etc.) ──────
-  private async connectWithApiKey(
-    input: ConnectIntegrationRequest,
-    tenantId: string
-  ): Promise<ConnectIntegrationResponse> {
+  // ── API key koppeling ─────────────────────────────────────
+  private async connectWithApiKey(input: ConnectIntegrationRequest, tenantId: string): Promise<ConnectIntegrationResponse> {
     const integrationId = uuidv4();
     const connector     = getConnector(input.platformSlug);
-
     const creds: IntegrationCredentials = {
-      integrationId,
-      platform:   input.platformSlug,
-      apiKey:     input.apiKey,
-      apiSecret:  input.apiSecret,
-      storeUrl:   input.storeUrl,
-      shopDomain: input.shopDomain,
+      integrationId, platform: input.platformSlug,
+      apiKey: input.apiKey, apiSecret: input.apiSecret,
+      storeUrl: input.storeUrl, shopDomain: input.shopDomain,
     };
 
-    // Test verbinding voor opslaan
     const testResult = await connector.testConnection(creds);
-    if (!testResult.success) {
-      throw Object.assign(new Error(`Verbinding mislukt: ${testResult.error}`), { httpStatus: 400 });
-    }
+    if (!testResult.success) throw Object.assign(new Error(`Verbinding mislukt: ${testResult.error}`), { httpStatus: 400 });
 
-    await db.transaction(async (client) => {
+    await db.transaction(async (client: PoolClient) => {
       await client.query(
         `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, store_url, status, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, 'active', now(), now())`,
@@ -276,35 +221,27 @@ export class IntegrationService {
     });
 
     await syncQueue.add(`sync:${input.platformSlug}:${integrationId}:initial`, {
-      integrationId, tenantId,
-      platformSlug: input.platformSlug,
-      jobType:      'full_sync',
-      syncJobDbId:  uuidv4(),
+      integrationId, tenantId, platformSlug: input.platformSlug, jobType: 'full_sync', syncJobDbId: uuidv4(),
     }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
 
     logger.info('integration.connected.apikey', { tenantId, integrationId, platform: input.platformSlug });
-
     return { integrationId, status: 'connected' };
   }
 
   // ── Lijst van integraties ─────────────────────────────────
   async listIntegrations(): Promise<IntegrationSummary[]> {
     const { tenantId } = getTenantContext();
-
     const result = await db.query(
-      `SELECT
-         ti.id, ti.platform_slug, ti.shop_domain, ti.shop_name,
-         ti.status, ti.last_sync_at, ti.next_sync_at, ti.error_message,
-         ti.is_primary, ti.created_at,
-         COUNT(o.id)::int AS orders_count
+      `SELECT ti.id, ti.platform_slug, ti.shop_domain, ti.shop_name,
+              ti.status, ti.last_sync_at, ti.next_sync_at, ti.error_message,
+              ti.is_primary, ti.created_at,
+              COUNT(o.id)::int AS orders_count
        FROM tenant_integrations ti
        LEFT JOIN orders o ON o.integration_id = ti.id
        WHERE ti.tenant_id = $1 AND ti.status != 'disconnected'
-       GROUP BY ti.id
-       ORDER BY ti.created_at ASC`,
+       GROUP BY ti.id ORDER BY ti.created_at ASC`,
       [tenantId]
     );
-
     return result.rows.map(row => ({
       id:           row.id,
       platformSlug: row.platform_slug as PlatformSlug,
@@ -324,28 +261,28 @@ export class IntegrationService {
   // ── Sync triggeren ────────────────────────────────────────
   async triggerSync(integrationId: string, jobType: 'full_sync' | 'incremental' = 'incremental'): Promise<{ syncJobId: string }> {
     const { tenantId } = getTenantContext();
-    const syncJobDbId  = uuidv4();
+    const syncJobId    = uuidv4();
+
+    const integration = await db.query(
+      `SELECT platform_slug FROM tenant_integrations WHERE id = $1 AND tenant_id = $2`,
+      [integrationId, tenantId]
+    );
+    if (!integration.rows[0]) throw Object.assign(new Error('Integratie niet gevonden'), { httpStatus: 404 });
+
+    const platformSlug = integration.rows[0].platform_slug as PlatformSlug;
 
     await db.query(
       `INSERT INTO integration_sync_jobs (id, integration_id, tenant_id, job_type, status, created_at)
        VALUES ($1, $2, $3, $4, 'queued', now())`,
-      [syncJobDbId, integrationId, tenantId, jobType],
+      [syncJobId, integrationId, tenantId, jobType],
       { allowNoTenant: true }
     );
 
-    const integration = await db.query(
-      `SELECT platform_slug FROM tenant_integrations WHERE id = $1`,
-      [integrationId]
-    );
-
-    const platformSlug = integration.rows[0]?.platform_slug as PlatformSlug;
-
     await syncQueue.add(`sync:${platformSlug}:${integrationId}`, {
-      integrationId, tenantId, platformSlug,
-      jobType, syncJobDbId,
+      integrationId, tenantId, platformSlug, jobType, syncJobDbId: syncJobId,
     }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
 
-    return { syncJobId: syncJobDbId };
+    return { syncJobId };
   }
 
   // ── Sync status ───────────────────────────────────────────
@@ -361,17 +298,16 @@ export class IntegrationService {
 
     const jobs = await db.query(
       `SELECT id, job_type, status, orders_synced, started_at, completed_at
-       FROM integration_sync_jobs
-       WHERE integration_id = $1
+       FROM integration_sync_jobs WHERE integration_id = $1
        ORDER BY created_at DESC LIMIT 10`,
       [integrationId],
       { allowNoTenant: true }
     );
 
     const row        = integration.rows[0];
-    const allJobs    = jobs.rows;
-    const currentJob = allJobs.find((j: Record<string, unknown>) => j.status === 'running' || j.status === 'queued');
-    const recentJobs = allJobs.filter((j: Record<string, unknown>) => j.status !== 'running' && j.status !== 'queued');
+    const allJobs    = jobs.rows as SyncJobSummary[];
+    const currentJob = allJobs.find(j => j.status === 'running' || j.status === 'queued');
+    const recentJobs = allJobs.filter(j => j.status !== 'running' && j.status !== 'queued');
 
     return {
       integrationId,
@@ -387,14 +323,11 @@ export class IntegrationService {
   // ── Ontkoppelen ───────────────────────────────────────────
   async disconnect(integrationId: string): Promise<void> {
     const { tenantId } = getTenantContext();
-
     await db.query(
-      `UPDATE tenant_integrations
-       SET status = 'disconnected', updated_at = now()
+      `UPDATE tenant_integrations SET status = 'disconnected', updated_at = now()
        WHERE id = $1 AND tenant_id = $2`,
       [integrationId, tenantId]
     );
-
     await cache.del(`integration:${tenantId}:${integrationId}`);
     logger.info('integration.disconnected', { tenantId, integrationId });
   }
