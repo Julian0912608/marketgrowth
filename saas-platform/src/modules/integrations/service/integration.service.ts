@@ -1,5 +1,8 @@
 // ============================================================
 // src/modules/integrations/service/integration.service.ts
+//
+// Fix: shop_domain is nu nullable in de INSERT — platforms zoals
+// bol.com, lightspeed, bigcommerce hebben geen shopDomain.
 // ============================================================
 
 import crypto           from 'crypto';
@@ -168,13 +171,12 @@ export class IntegrationService {
     const testResult = await connector.testConnection(tempCreds);
     if (!testResult.success) throw new Error(`Verbindingstest mislukt: ${testResult.error}`);
 
-    // Sla op zonder transaction (db class heeft geen transaction methode)
     await db.query(
       `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, 'active', now(), now())
        ON CONFLICT (tenant_id, platform_slug, shop_domain) DO UPDATE
        SET status = 'active', shop_name = EXCLUDED.shop_name, updated_at = now()`,
-      [integrationId, tenantId, platformSlug, shopDomain, testResult.shopName],
+      [integrationId, tenantId, platformSlug, shopDomain ?? null, testResult.shopName],
       { allowNoTenant: true }
     );
     await db.query(
@@ -194,34 +196,53 @@ export class IntegrationService {
     return { integrationId, tenantId };
   }
 
-  // ── API key koppeling ─────────────────────────────────────
+  // ── API key koppeling (Bol.com, WooCommerce, etc.) ────────
   private async connectWithApiKey(input: ConnectIntegrationRequest, tenantId: string): Promise<ConnectIntegrationResponse> {
     const integrationId = uuidv4();
     const connector     = getConnector(input.platformSlug);
     const creds: IntegrationCredentials = {
-      integrationId, platform: input.platformSlug,
-      apiKey: input.apiKey, apiSecret: input.apiSecret,
-      storeUrl: input.storeUrl, shopDomain: input.shopDomain,
+      integrationId,
+      platform:   input.platformSlug,
+      apiKey:     input.apiKey,
+      apiSecret:  input.apiSecret,
+      storeUrl:   input.storeUrl,
+      shopDomain: input.shopDomain,
     };
 
     const testResult = await connector.testConnection(creds);
-    if (!testResult.success) throw Object.assign(new Error(`Verbinding mislukt: ${testResult.error}`), { httpStatus: 400 });
+    if (!testResult.success) {
+      throw Object.assign(new Error(`Verbinding mislukt: ${testResult.error}`), { httpStatus: 400 });
+    }
 
+    // FIX: shop_domain is nullable — bol.com/lightspeed/bigcommerce hebben dit niet
     await db.query(
-      `INSERT INTO tenant_integrations (id, tenant_id, platform_slug, shop_domain, shop_name, store_url, status, created_at, updated_at)
+      `INSERT INTO tenant_integrations
+         (id, tenant_id, platform_slug, shop_domain, shop_name, store_url, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, 'active', now(), now())`,
-      [integrationId, tenantId, input.platformSlug, input.shopDomain, testResult.shopName, input.storeUrl],
+      [
+        integrationId,
+        tenantId,
+        input.platformSlug,
+        input.shopDomain ?? null,       // ← null ipv undefined voorkomt NOT NULL crash
+        testResult.shopName ?? null,
+        input.storeUrl ?? null,
+      ],
       { allowNoTenant: true }
     );
+
     await db.query(
       `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at)
        VALUES ($1, $2, $3, $4, now())`,
-      [integrationId, input.apiKey, input.apiSecret, input.storeUrl],
+      [integrationId, input.apiKey ?? null, input.apiSecret ?? null, input.storeUrl ?? null],
       { allowNoTenant: true }
     );
 
     await syncQueue.add(`sync:${input.platformSlug}:${integrationId}:initial`, {
-      integrationId, tenantId, platformSlug: input.platformSlug, jobType: 'full_sync', syncJobDbId: uuidv4(),
+      integrationId,
+      tenantId,
+      platformSlug: input.platformSlug,
+      jobType:      'full_sync',
+      syncJobDbId:  uuidv4(),
     }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
 
     logger.info('integration.connected.apikey', { tenantId, integrationId, platform: input.platformSlug });
