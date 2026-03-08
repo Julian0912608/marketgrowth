@@ -659,13 +659,22 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // ── HTTP GET helper ────────────────────────────────────────
-  private async apiGet(token: string, path: string): Promise<unknown> {
+  private async apiGet(token: string, path: string, retries = 3): Promise<unknown> {
     const res = await fetch(`https://api.bol.com${path}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept':        'application/vnd.retailer.v10+json',
       },
     });
+
+    // 429 Too Many Requests — respecteer Retry-After header
+    if (res.status === 429 && retries > 0) {
+      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '60', 10);
+      const waitMs = Math.min(retryAfter * 1000, 120_000); // max 2 minuten wachten
+      await new Promise(r => setTimeout(r, waitMs));
+      return this.apiGet(token, path, retries - 1);
+    }
+
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Bol.com API ${res.status} op ${path}: ${body.slice(0, 300)}`);
@@ -674,7 +683,7 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // ── HTTP POST helper ───────────────────────────────────────
-  private async apiPost(token: string, path: string, body: unknown): Promise<unknown> {
+  private async apiPost(token: string, path: string, body: unknown, retries = 3): Promise<unknown> {
     const res = await fetch(`https://api.bol.com${path}`, {
       method: 'POST',
       headers: {
@@ -684,6 +693,15 @@ export class BolcomConnector implements IPlatformConnector {
       },
       body: JSON.stringify(body),
     });
+
+    // 429 Too Many Requests — respecteer Retry-After header
+    if (res.status === 429 && retries > 0) {
+      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '60', 10);
+      const waitMs = Math.min(retryAfter * 1000, 120_000); // max 2 minuten wachten
+      await new Promise(r => setTimeout(r, waitMs));
+      return this.apiPost(token, path, body, retries - 1);
+    }
+
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
       throw new Error(`Bol.com POST ${path} mislukt (${res.status}): ${errBody.slice(0, 300)}`);
