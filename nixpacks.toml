@@ -2,10 +2,10 @@
 nixPkgs = ["nodejs_20"]
 
 [phases.install]
-cmds = ["cd saas-platform && npm install --include=dev"]
+cmds = ["npm install"]
 
 [phases.build]
-cmds = ["cd saas-platform && npm run build"]
+cmds = ["npm run build"]
 
 [start]
-cmd = "node saas-platform/dist/index.js"
+cmd = "node dist/index.js"
