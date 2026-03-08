@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { authRouter }       from './modules/auth/api/auth.routes';
 import { onboardingRouter } from './modules/onboarding/api/onboarding.routes';
@@ -8,10 +9,11 @@ import { logger }           from './shared/logging/logger';
 
 // ── DEBUG: env vars controleren bij opstarten ─────────────────
 console.log('=== ENV CHECK ===');
-console.log('NODE_ENV:  ', process.env.NODE_ENV ?? 'NOT SET');
-console.log('PORT:      ', process.env.PORT ?? 'NOT SET');
-console.log('REDIS_URL: ', process.env.REDIS_URL
-  ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***@')  // verberg wachtwoord
+console.log('NODE_ENV:    ', process.env.NODE_ENV    ?? 'NOT SET');
+console.log('PORT:        ', process.env.PORT        ?? 'NOT SET');
+console.log('FRONTEND_URL:', process.env.FRONTEND_URL ?? 'NOT SET ❌');
+console.log('REDIS_URL:   ', process.env.REDIS_URL
+  ? process.env.REDIS_URL.replace(/:\/\/[^@]+@/, '://***@')
   : 'NOT SET ❌'
 );
 console.log('DATABASE_URL set:', process.env.DATABASE_URL ? 'YES ✅' : 'NO ❌');
@@ -19,6 +21,27 @@ console.log('JWT_SECRET set:  ', process.env.JWT_SECRET   ? 'YES ✅' : 'NO ❌'
 console.log('=================');
 
 const app = express();
+
+// ── CORS ──────────────────────────────────────────────────────
+// Sta verzoeken toe van de frontend (Vercel) en lokaal
+const allowedOrigins = [
+  process.env.FRONTEND_URL,           // bijv. https://marketgrowth-frontend.vercel.app
+  'http://localhost:3000',
+  'http://localhost:3001',
+].filter(Boolean) as string[];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Sta requests zonder origin toe (Postman, health checks, Stripe webhooks)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    logger.warn('cors.blocked', { origin });
+    callback(new Error(`CORS: origin niet toegestaan: ${origin}`));
+  },
+  credentials: true,   // nodig voor cookies (refresh token)
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+}));
 
 // Stripe webhook heeft raw body nodig — vóór express.json()
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
