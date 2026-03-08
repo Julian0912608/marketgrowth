@@ -1,7 +1,5 @@
 // ============================================================
 // src/modules/integrations/types/integration.types.ts
-// Fix: jobType toegevoegd aan FetchOptions zodat connectors
-// kunnen onderscheiden tussen full_sync en incremental
 // ============================================================
 
 export type PlatformSlug =
@@ -15,23 +13,24 @@ export type PlatformSlug =
   | 'etsy';
 
 export interface IntegrationCredentials {
-  integrationId: string;
-  platform:      PlatformSlug;
-  accessToken?:  string;
-  refreshToken?: string;
+  integrationId:  string;
+  platform:       PlatformSlug;
+  accessToken?:   string;
+  refreshToken?:  string;
   tokenExpiresAt?: Date;
-  apiKey?:       string;
-  apiSecret?:    string;
-  storeUrl?:     string;
-  shopDomain?:   string;
+  apiKey?:        string;
+  apiSecret?:     string;
+  storeUrl?:      string;
+  shopDomain?:    string;
 }
 
+// FetchOptions — jobType toegevoegd zodat connectors weten of het full_sync is
 export interface FetchOptions {
   updatedAfter?: Date;
   limit?:        number;
   cursor?:       string;
   page?:         number;
-  jobType?:      'full_sync' | 'incremental'; // ← nieuw: voor connectors die anders moeten werken
+  jobType?:      'full_sync' | 'incremental'; // ← nieuw
 }
 
 export interface NormalizedLineItem {
@@ -47,61 +46,65 @@ export interface NormalizedLineItem {
 }
 
 export interface NormalizedOrder {
-  externalId:        string;
-  externalNumber?:   string;
-  totalAmount:       number;
-  subtotalAmount:    number;
-  taxAmount:         number;
-  shippingAmount:    number;
-  discountAmount:    number;
-  currency:          string;
-  status:            string;
-  financialStatus?:  string;
+  externalId:         string;
+  externalNumber?:    string;
+  totalAmount:        number;
+  subtotalAmount:     number;
+  taxAmount:          number;
+  shippingAmount:     number;
+  discountAmount:     number;
+  currency:           string;
+  status:             string;
+  financialStatus?:   string;
   fulfillmentStatus?: string;
   customerEmailHash?: string;
-  isFirstOrder?:     boolean;
-  lineItems:         NormalizedLineItem[];
-  tags?:             string[];
-  note?:             string;
-  source?:           string;
-  orderedAt:         Date;
-  updatedAt:         Date;
+  isFirstOrder?:      boolean;
+  lineItems:          NormalizedLineItem[];
+  tags?:              string[];
+  note?:              string;
+  source?:            string;
+  orderedAt:          Date;
+  updatedAt:          Date;
 }
 
 export interface NormalizedProduct {
-  externalId:       string;
-  title:            string;
-  handle?:          string;
-  status?:          string;
-  productType?:     string;
-  tags?:            string[];
-  vendor?:          string;
-  totalInventory?:  number;
+  externalId:        string;
+  title:             string;
+  handle?:           string;
+  status?:           string;
+  productType?:      string;
+  tags?:             string[];
+  vendor?:           string;
+  totalInventory?:   number;
   requiresShipping?: boolean;
-  priceMin?:        number;
-  priceMax?:        number;
-  publishedAt?:     Date;
-  updatedAt:        Date;
+  priceMin?:         number;
+  priceMax?:         number;
+  publishedAt?:      Date;
+  updatedAt:         Date;
+  // Bol.com specifiek
+  ean?:              string;
+  condition?:        string;
+  fulfillmentBy?:    string;
 }
 
 export interface NormalizedCustomer {
-  externalId:        string;
-  emailHash:         string;
-  firstName?:        string;
-  lastName?:         string;
-  country?:          string;
-  acceptsMarketing?: boolean;
-  totalSpent?:       number;
-  orderCount?:       number;
-  updatedAt:         Date;
+  externalId:         string;
+  emailHash:          string;
+  firstName?:         string;
+  lastName?:          string;
+  country?:           string;
+  acceptsMarketing?:  boolean;
+  totalSpent?:        number;
+  orderCount?:        number;
+  updatedAt:          Date;
 }
 
 export interface PaginatedResult<T> {
-  items:        T[];
-  hasNextPage:  boolean;
-  nextCursor?:  string;
-  nextPage?:    number;
-  totalCount?:  number;
+  items:       T[];
+  hasNextPage: boolean;
+  nextCursor?: string;
+  nextPage?:   number;
+  totalCount?: number;
 }
 
 export interface ConnectionTestResult {
@@ -121,9 +124,9 @@ export interface WebhookRegistration {
 }
 
 export interface TokenRefreshResult {
-  accessToken:  string;
+  accessToken:   string;
   refreshToken?: string;
-  expiresAt:    Date;
+  expiresAt:     Date;
 }
 
 export interface IPlatformConnector {
@@ -150,10 +153,10 @@ export interface ConnectIntegrationRequest {
 }
 
 export interface ConnectIntegrationResponse {
-  integrationId:  string;
-  redirectUrl?:   string;
-  authUrl?:       string;
-  status:         'connected' | 'oauth_required' | 'pending' | 'active' | string;
+  integrationId: string;
+  redirectUrl?:  string;
+  authUrl?:      string;
+  status:        'connected' | 'oauth_required' | 'pending' | 'active' | string;
 }
 
 export interface IntegrationSummary {
@@ -181,11 +184,11 @@ export interface SyncJobSummary {
 }
 
 export interface SyncStatusResponse {
-  integrationId:  string;
-  status:         string;
-  lastSyncAt?:    Date;
-  nextSyncAt?:    Date;
-  errorMessage?:  string;
-  currentJob?:    SyncJobSummary;
-  recentJobs:     SyncJobSummary[];
+  integrationId: string;
+  status:        string;
+  lastSyncAt?:   Date;
+  nextSyncAt?:   Date;
+  errorMessage?: string;
+  currentJob?:   SyncJobSummary;
+  recentJobs:    SyncJobSummary[];
 }
