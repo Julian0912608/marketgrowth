@@ -1,18 +1,13 @@
-// ============================================================
-// src/modules/integrations/api/integration.routes.ts
-// ============================================================
-
 import { Router, Request, Response, NextFunction } from 'express';
 import { IntegrationService } from '../service/integration.service';
-import { tenantMiddleware }   from '../../../shared/middleware/tenant.middleware';
-import { PlatformSlug }       from '../types/integration.types';
+import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
+import { PlatformSlug } from '../types/integration.types';
 
-const router           = Router();
+const router = Router();
 const integrationService = new IntegrationService();
 
 // Alle routes vereisen een ingelogde gebruiker, behalve webhooks en OAuth callbacks
 router.use((req, res, next) => {
-  // Webhooks en OAuth callbacks slaan auth over
   if (req.path.startsWith('/webhook') || req.path.startsWith('/callback')) {
     return next();
   }
@@ -20,7 +15,6 @@ router.use((req, res, next) => {
 });
 
 // ── GET /api/integrations/platforms ──────────────────────────
-// Lijst van beschikbare platforms
 router.get('/platforms', (_req: Request, res: Response) => {
   res.json([
     { slug: 'shopify',     name: 'Shopify',     authType: 'oauth',  logo: '/logos/shopify.svg' },
@@ -35,7 +29,6 @@ router.get('/platforms', (_req: Request, res: Response) => {
 });
 
 // ── GET /api/integrations ─────────────────────────────────────
-// Lijst van gekoppelde integraties van de tenant
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const integrations = await integrationService.listIntegrations();
@@ -44,46 +37,43 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ── POST /api/integrations/connect ───────────────────────────
-// Start een nieuwe koppeling (OAuth redirect of API key)
 router.post('/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const result = await integrationService.connect(req.body);
-
-    // OAuth platforms: redirect de klant naar het platform
     if (result.authUrl) {
       res.json({ status: 'oauth_required', authUrl: result.authUrl });
       return;
     }
-
     res.status(201).json(result);
   } catch (err) { next(err); }
 });
 
 // ── GET /api/integrations/callback/:platform ─────────────────
-// OAuth callback — wordt aangeroepen door het externe platform
+// OAuth callback — aangeroepen door het externe platform na autorisatie
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const platform = req.params.platform as PlatformSlug;
     const { code, state } = req.query as { code: string; state: string };
 
     if (!code || !state) {
-      res.status(400).json({ error: 'Missende code of state parameter' });
+      const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
+      res.redirect(frontendUrl + '/dashboard/integrations?error=missing_params');
       return;
     }
 
     const result = await integrationService.handleOAuthCallback(platform, code, state);
-    const frontendUrl = process.env.FRONTEND_URL ?? 'https://app.marketgrowth.io';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
 
-    // Redirect terug naar de frontend met succes
-    res.redirect(`${frontendUrl}/onboarding?step=connected&integrationId=${result.integrationId}`);
+    // Redirect naar het dashboard integrations pagina — niet onboarding
+    res.redirect(frontendUrl + '/dashboard/integrations?connected=' + result.integrationId);
   } catch (err) {
-    const frontendUrl = process.env.FRONTEND_URL ?? 'https://app.marketgrowth.io';
-    res.redirect(`${frontendUrl}/onboarding?step=error&message=${encodeURIComponent((err as Error).message)}`);
+    const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
+    const message = encodeURIComponent((err as Error).message);
+    res.redirect(frontendUrl + '/dashboard/integrations?error=' + message);
   }
 });
 
 // ── POST /api/integrations/:id/sync ──────────────────────────
-// Trigger een handmatige sync
 router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { jobType = 'incremental' } = req.body as { jobType?: 'full_sync' | 'incremental' };
@@ -93,7 +83,6 @@ router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction)
 });
 
 // ── GET /api/integrations/:id/status ─────────────────────────
-// Sync status opvragen
 router.get('/:id/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const status = await integrationService.getSyncStatus(req.params.id);
@@ -102,7 +91,6 @@ router.get('/:id/status', async (req: Request, res: Response, next: NextFunction
 });
 
 // ── DELETE /api/integrations/:id ─────────────────────────────
-// Integratie ontkoppelen
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     await integrationService.disconnect(req.params.id);
@@ -111,10 +99,8 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 });
 
 // ── POST /api/integrations/webhook/:platform ─────────────────
-// Webhook endpoint voor inkomende platform events
+// Altijd 200 teruggeven — verwerking asynchroon via queue
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
-  // Altijd 200 teruggeven zodat het platform weet dat we de webhook ontvangen hebben
-  // Verwerking gebeurt asynchroon via de queue
   res.sendStatus(200);
 });
 
