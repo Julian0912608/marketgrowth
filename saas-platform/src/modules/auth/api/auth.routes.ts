@@ -1,7 +1,3 @@
-// ============================================================
-// src/modules/auth/api/auth.routes.ts
-// ============================================================
-
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { AuthService } from '../service/auth.service';
@@ -10,11 +6,11 @@ import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { db } from '../../../infrastructure/database/connection';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 
 const router = Router();
 const authService = new AuthService();
 
-// ── Zod schemas ──────────────────────────────────────────────
 const RegisterSchema = z.object({
   email:       z.string().email('Ongeldig e-mailadres'),
   password:    z.string().min(8, 'Wachtwoord moet minimaal 8 tekens zijn'),
@@ -75,7 +71,7 @@ router.post('/register', rateLimitAuth, async (req: Request, res: Response, next
       accessToken: tokens.accessToken,
       expiresIn:   tokens.expiresIn,
       user: {
-        userId:    user.userId ?? user.id,
+        userId:    user.userId || user.id,
         email:     user.email,
         firstName: user.firstName,
         lastName:  user.lastName,
@@ -105,7 +101,7 @@ router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: N
       accessToken: tokens.accessToken,
       expiresIn:   tokens.expiresIn,
       user: {
-        userId:    user.userId ?? user.id,
+        userId:    user.userId || user.id,
         email:     user.email,
         firstName: user.firstName,
         lastName:  user.lastName,
@@ -117,6 +113,7 @@ router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: N
 });
 
 // ── POST /api/auth/refresh ───────────────────────────────────
+// FIX: was authService.refreshToken() — methode heet refreshAccessToken()
 router.post('/refresh', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const refreshToken = req.cookies?.refreshToken;
@@ -125,17 +122,9 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    const tokens = await (authService as any).refreshToken(refreshToken) as any;
+    const result = await authService.refreshAccessToken(refreshToken);
 
-    res.cookie('refreshToken', tokens.refreshToken, {
-      httpOnly: true,
-      secure:   process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge:   30 * 24 * 60 * 60 * 1000,
-      path:     '/api/auth',
-    });
-
-    res.json({ accessToken: tokens.accessToken, expiresIn: tokens.expiresIn });
+    res.json({ accessToken: result.accessToken, expiresIn: 900 });
   } catch (err) { next(err); }
 });
 
@@ -144,34 +133,39 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
   try {
     const refreshToken = req.cookies?.refreshToken;
     if (refreshToken) {
-      const crypto = require('crypto');
-      const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
-      await db.query(
-        `UPDATE refresh_tokens SET revoked = true WHERE token_hash = $1`,
-        [tokenHash],
-        { allowNoTenant: true }
-      );
+      await authService.logout(refreshToken);
     }
     res.clearCookie('refreshToken', { path: '/api/auth' });
     res.json({ success: true });
   } catch (err) { next(err); }
 });
 
-// ── POST /api/auth/password/reset-request ───────────────────
-router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
+// ── GET /api/auth/me ─────────────────────────────────────────
+router.get('/me', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { email } = validate(ResetRequestSchema, req.body);
-    await (authService as any).requestPasswordReset(email);
-    res.json({ message: 'Als dit e-mailadres bekend is, ontvang je een reset-link.' });
-  } catch (err) { next(err); }
-});
+    const { userId } = getTenantContext();
 
-// ── POST /api/auth/password/reset-confirm ───────────────────
-router.post('/password/reset-confirm', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { token, newPassword } = validate(ResetConfirmSchema, req.body);
-    await (authService as any).resetPassword(token, newPassword);
-    res.json({ message: 'Wachtwoord succesvol gewijzigd. Je kunt nu inloggen.' });
+    const result = await db.query<{
+      id: string; email: string; first_name: string; last_name: string; role: string;
+    }>(
+      `SELECT id, email, first_name, last_name, role FROM users WHERE id = $1`,
+      [userId],
+      { allowNoTenant: true }
+    );
+
+    if (!result.rows[0]) {
+      res.status(404).json({ error: 'Gebruiker niet gevonden.' });
+      return;
+    }
+
+    const u = result.rows[0];
+    res.json({
+      userId:    u.id,
+      email:     u.email,
+      firstName: u.first_name,
+      lastName:  u.last_name,
+      role:      u.role,
+    });
   } catch (err) { next(err); }
 });
 
@@ -181,15 +175,12 @@ router.patch('/profile', tenantMiddleware(), async (req: Request, res: Response,
     const { firstName, lastName } = validate(UpdateProfileSchema, req.body);
     const { userId } = getTenantContext();
 
-    // Gebruik geen updated_at — kolom bestaat mogelijk nog niet
-    // Migration 004 voegt dit toe, maar query werkt ook zonder
     await db.query(
       `UPDATE users SET first_name = $1, last_name = $2 WHERE id = $3`,
       [firstName, lastName, userId],
       { allowNoTenant: true }
     );
 
-    // Haal bijgewerkte data terug voor bevestiging
     const result = await db.query<{
       id: string; email: string; first_name: string; last_name: string; role: string;
     }>(
@@ -244,32 +235,67 @@ router.post('/change-password', tenantMiddleware(), async (req: Request, res: Re
   } catch (err) { next(err); }
 });
 
-// ── GET /api/auth/me ─────────────────────────────────────────
-router.get('/me', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+// ── POST /api/auth/password/reset-request ───────────────────
+router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { userId } = getTenantContext();
+    const { email } = validate(ResetRequestSchema, req.body);
 
-    const result = await db.query<{
-      id: string; email: string; first_name: string; last_name: string; role: string;
-    }>(
-      `SELECT id, email, first_name, last_name, role FROM users WHERE id = $1`,
-      [userId],
+    const result = await db.query<{ id: string }>(
+      `SELECT id FROM users WHERE email = $1`,
+      [email.toLowerCase()],
       { allowNoTenant: true }
     );
 
-    if (!result.rows[0]) {
-      res.status(404).json({ error: 'Gebruiker niet gevonden.' });
+    // Altijd success teruggeven — voorkomt user enumeration
+    if (result.rows[0]) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 uur
+
+      await db.query(
+        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, used)
+         VALUES ($1, $2, $3, false)`,
+        [result.rows[0].id, tokenHash, expiresAt],
+        { allowNoTenant: true }
+      );
+    }
+
+    res.json({ message: 'Als dit e-mailadres bekend is, ontvang je een reset-link.' });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/auth/password/reset-confirm ───────────────────
+router.post('/password/reset-confirm', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token, newPassword } = validate(ResetConfirmSchema, req.body);
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+    const result = await db.query<{ id: string; user_id: string; used: boolean; expires_at: Date }>(
+      `SELECT id, user_id, used, expires_at FROM password_reset_tokens WHERE token_hash = $1`,
+      [tokenHash],
+      { allowNoTenant: true }
+    );
+
+    const resetToken = result.rows[0];
+    if (!resetToken || resetToken.used || new Date(resetToken.expires_at) < new Date()) {
+      res.status(400).json({ error: 'Ongeldige of verlopen reset-link.' });
       return;
     }
 
-    const u = result.rows[0];
-    res.json({
-      userId:    u.id,
-      email:     u.email,
-      firstName: u.first_name,
-      lastName:  u.last_name,
-      role:      u.role,
-    });
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await db.query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      [newHash, resetToken.user_id],
+      { allowNoTenant: true }
+    );
+
+    await db.query(
+      `UPDATE password_reset_tokens SET used = true WHERE id = $1`,
+      [resetToken.id],
+      { allowNoTenant: true }
+    );
+
+    res.json({ message: 'Wachtwoord succesvol gewijzigd. Je kunt nu inloggen.' });
   } catch (err) { next(err); }
 });
 
