@@ -121,3 +121,17 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 export default app;
+try {
+  const { aiRouter } = require('./modules/ai-engine/api/ai.routes');
+  app.use('/api/ai', aiRouter);
+  console.log('  aiRouter OK');
+} catch (e: any) {
+  console.error('  aiRouter FAILED:', e.message);
+}
+```
+
+**Stap 4 — frontend pagina plaatsen**
+
+Zet `ai-insights-page.tsx` op:
+```
+app/dashboard/ai-insights/page.tsx
