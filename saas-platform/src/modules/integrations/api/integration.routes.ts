@@ -1,3 +1,4 @@
+import { syncBolcomAdvertisingData } from '../connectors/bolcom-advertising.connector';
 import { Router, Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { IntegrationService }         from '../service/integration.service';
@@ -212,5 +213,56 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   res.sendStatus(200);
 });
+// ── POST /api/integrations/advertising/bolcom/sync ───────────
+// Handmatige trigger van Bol.com advertising data sync
+router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
 
+    // Haal de actieve bol.com integratie op voor deze tenant
+    const integResult = await db.query(
+      `SELECT ic.integration_id, ic.api_key, ic.api_secret
+       FROM integration_credentials ic
+       JOIN tenant_integrations ti ON ti.id = ic.integration_id
+       WHERE ti.tenant_id = $1 AND ti.platform_slug = 'bolcom' AND ti.status = 'active'
+       LIMIT 1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
+
+    if (!integResult.rows[0]) {
+      res.status(404).json({ error: 'Geen actieve Bol.com integratie gevonden' });
+      return;
+    }
+
+    const row = integResult.rows[0];
+    const creds: IntegrationCredentials = {
+      integrationId: row.integration_id,  // ← de fix
+      platform:      'bolcom',
+      apiKey:        row.api_key,
+      apiSecret:     row.api_secret,
+    };
+
+    // Fresh token ophalen
+    const encoded  = Buffer.from(`${creds.apiKey}:${creds.apiSecret}`).toString('base64');
+    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+    });
+
+    if (!tokenRes.ok) {
+      res.status(502).json({ error: 'Bol.com token ophalen mislukt' });
+      return;
+    }
+
+    const { access_token } = await tokenRes.json() as { access_token: string };
+
+    await syncBolcomAdvertisingData(creds, tenantId, access_token);
+
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
 export { router as integrationRouter };
