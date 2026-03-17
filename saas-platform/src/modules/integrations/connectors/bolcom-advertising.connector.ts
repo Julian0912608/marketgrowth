@@ -1,29 +1,27 @@
 // ============================================================
 // saas-platform/src/modules/integrations/connectors/bolcom-advertising.connector.ts
 //
-// Bol.com Advertising API v11
+// Bol.com Advertising API v11 — gebaseerd op de officiële OpenAPI YAML spec
 //
-// Auth:     Zelfde token endpoint als Retailer API
-//           https://login.bol.com/token?grant_type=client_credentials
-//           Maar MET aparte Advertising credentials (Client ID + Secret)
+// Base URL (uit campaign-management.yml servers sectie):
+//   https://api.bol.com/advertiser/sponsored-products/campaign-management
 //
-// Base URL: https://api.bol.com/advertiser/sponsored-products/v11
+// Correcte endpoints (uit YAML paths sectie):
+//   POST /campaigns/list  → campagnes ophalen (getCampaigns)
+//   POST /campaigns       → campagne aanmaken
+//   PUT  /campaigns       → campagne updaten
 //
-// Belangrijk verschil v11 vs v9/v10:
-//   - Alle "GET" lijsten zijn PUT filter endpoints geworden
-//   - Accept/Content-Type: application/vnd.advertiser.v11+json
-//     (NIET vnd.retailer!)
-//
-// Endpoints:
-//   PUT  /campaigns                           → lijst campagnes ophalen
-//   PUT  /reporting/performance/campaigns     → performance data
+// Auth: Client Credentials via https://login.bol.com/token?grant_type=client_credentials
+//   Zelfde flow als Retailer API maar met Advertising credentials
+//   Token scope = "advertiser"
 // ============================================================
 
 import { cache }  from '../../../infrastructure/cache/redis';
 import { db }     from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 
-const ADV_BASE         = 'https://api.bol.com/advertiser/sponsored-products/v11';
+// !! Correcte base URL uit de OpenAPI YAML spec — geen versienummer in het pad
+const CAMPAIGN_BASE    = 'https://api.bol.com/advertiser/sponsored-products/campaign-management';
 const TOKEN_URL        = 'https://login.bol.com/token?grant_type=client_credentials';
 const TOKEN_CACHE_KEY  = 'bolcom:adv:token:';
 const ADV_CONTENT_TYPE = 'application/vnd.advertiser.v11+json';
@@ -56,17 +54,15 @@ export interface BolAdPerformance {
 
 export class BolcomAdvertisingConnector {
 
-  // ── Token ophalen (gecached) ───────────────────────────────
+  // ── Token ophalen ─────────────────────────────────────────
   private async getToken(clientId: string, clientSecret: string): Promise<string> {
     const cacheKey = TOKEN_CACHE_KEY + clientId;
-
     try {
       const cached = await cache.get(cacheKey);
       if (cached) return cached;
     } catch {}
 
     const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
     const res = await fetch(TOKEN_URL, {
       method:  'POST',
       headers: {
@@ -78,150 +74,120 @@ export class BolcomAdvertisingConnector {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`Token ophalen mislukt (${res.status}): ${body.slice(0, 200)}`);
+      throw new Error(`Token mislukt (${res.status}): ${body.slice(0, 200)}`);
     }
 
     const data = await res.json() as { access_token: string; expires_in?: number };
     const ttl  = Math.max((data.expires_in || 299) - 60, 30);
-
     try { await cache.set(cacheKey, data.access_token, ttl); } catch {}
-
     return data.access_token;
   }
 
-  // ── Helperfunctie voor advertiser API calls ────────────────
-  // v11 gebruikt PUT voor alle filter/list endpoints
-  private async advFetch(
-    token: string,
-    path:  string,
-    body:  object
-  ): Promise<{ ok: boolean; status: number; data: any }> {
-    const res = await fetch(`${ADV_BASE}${path}`, {
-      method:  'PUT',
+  // ── Verbinding testen ─────────────────────────────────────
+  async testConnection(clientId: string, clientSecret: string): Promise<{ success: boolean; error?: string }> {
+    // Stap 1: token ophalen
+    let token: string;
+    try {
+      token = await this.getToken(clientId, clientSecret);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Auth mislukt: ${msg}` };
+    }
+
+    // Stap 2: POST /campaigns/list (correct endpoint uit YAML spec)
+    const res = await fetch(`${CAMPAIGN_BASE}/campaigns/list`, {
+      method:  'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept':        ADV_CONTENT_TYPE,
         'Content-Type':  ADV_CONTENT_TYPE,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ page: 1, pageSize: 1 }),
     });
 
     const text = await res.text().catch(() => '');
     let data: any = {};
     try { data = JSON.parse(text); } catch {}
 
-    return { ok: res.ok, status: res.status, data };
-  }
-
-  // ── Verbinding testen ─────────────────────────────────────
-  async testConnection(
-    clientId:     string,
-    clientSecret: string
-  ): Promise<{ success: boolean; error?: string }> {
-    // Stap 1: Token ophalen
-    let token: string;
-    try {
-      token = await this.getToken(clientId, clientSecret);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('401') || msg.includes('400')) {
-        return {
-          success: false,
-          error:   'Ongeldige Client ID of Client Secret. Controleer je Advertising credentials in het Bol.com retailer dashboard.',
-        };
-      }
-      return { success: false, error: `Auth mislukt: ${msg}` };
-    }
-
-    // Stap 2: Test campagnes endpoint — PUT met pageSize=1
-    const result = await this.advFetch(token, '/campaigns', { page: 1, pageSize: 1 });
-
-    if (result.status === 401) {
-      return { success: false, error: 'Token ongeldig. Controleer je Advertising API credentials.' };
-    }
-    if (result.status === 403) {
-      return {
-        success: false,
-        error:   'Geen toegang tot de Advertising API. Controleer of je Advertising API credentials aangemaakt hebt via retailer.bol.com → Instellingen → API-toegang → Advertising.',
-      };
-    }
-    if (!result.ok && result.status !== 404) {
-      return {
-        success: false,
-        error:   `API fout ${result.status}: ${JSON.stringify(result.data).slice(0, 200)}`,
-      };
-    }
+    if (res.status === 401) return { success: false, error: 'Token ongeldig.' };
+    if (res.status === 403) return { success: false, error: `403 van Bol.com: ${data?.detail || text.slice(0, 200)}` };
+    if (!res.ok && res.status !== 404) return { success: false, error: `API fout ${res.status}: ${text.slice(0, 200)}` };
 
     return { success: true };
   }
 
-  // ── Campagnes ophalen ─────────────────────────────────────
-  // v11: PUT /campaigns (geen GET!)
+  // ── Campagnes ophalen via POST /campaigns/list ────────────
   async fetchCampaigns(token: string): Promise<BolAdCampaign[]> {
-    const allCampaigns: BolAdCampaign[] = [];
+    const all: BolAdCampaign[] = [];
     let page = 1;
 
     while (true) {
-      const result = await this.advFetch(token, '/campaigns', { page, pageSize: 50 });
+      const res = await fetch(`${CAMPAIGN_BASE}/campaigns/list`, {
+        method:  'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept':        ADV_CONTENT_TYPE,
+          'Content-Type':  ADV_CONTENT_TYPE,
+        },
+        body: JSON.stringify({ page, pageSize: 50 }),
+      });
 
-      if (!result.ok) {
-        throw new Error(
-          `Campagnes ophalen mislukt (${result.status}): ${JSON.stringify(result.data).slice(0, 200)}`
-        );
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Campagnes ophalen mislukt (${res.status}): ${body.slice(0, 200)}`);
       }
 
-      const campaigns: BolAdCampaign[] = result.data.campaigns || [];
-      allCampaigns.push(...campaigns);
+      const data = await res.json() as { campaigns?: BolAdCampaign[] };
+      const campaigns = data.campaigns || [];
+      all.push(...campaigns);
 
       if (campaigns.length < 50) break;
       page++;
-      if (page > 20) break; // veiligheidsgrens: max 1000 campagnes
+      if (page > 20) break;
     }
 
-    return allCampaigns;
+    return all;
   }
 
   // ── Performance data ophalen ──────────────────────────────
-  // v11: PUT /reporting/performance/campaigns
+  // Reporting heeft een aparte base URL — zie reporting.yml
   async fetchPerformance(
     token:       string,
     campaignIds: string[],
     startDate:   string,
     endDate:     string
-  ): Promise<Record<string, {
-    spend: number; impressions: number; clicks: number;
-    conversions: number; revenue: number;
-  }>> {
+  ): Promise<Record<string, { spend: number; impressions: number; clicks: number; conversions: number; revenue: number }>> {
     if (campaignIds.length === 0) return {};
 
-    const result = await this.advFetch(token, '/reporting/performance/campaigns', {
-      campaignIds,
-      startDate,
-      endDate,
+    // Reporting API base URL (apart van campaign-management)
+    const reportingBase = 'https://api.bol.com/advertiser/sponsored-products/reporting';
+
+    const res = await fetch(`${reportingBase}/performance/campaigns`, {
+      method:  'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        ADV_CONTENT_TYPE,
+        'Content-Type':  ADV_CONTENT_TYPE,
+      },
+      body: JSON.stringify({ campaignIds, startDate, endDate }),
     });
 
-    if (!result.ok) {
-      logger.warn('bolcom.adv.performance.failed', {
-        status: result.status,
-        body:   JSON.stringify(result.data).slice(0, 200),
-      });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      logger.warn('bolcom.adv.performance.failed', { status: res.status, body: body.slice(0, 200) });
       return {};
     }
 
-    const out: Record<string, {
-      spend: number; impressions: number; clicks: number;
-      conversions: number; revenue: number;
-    }> = {};
+    const data = await res.json() as { campaignReports?: any[]; reports?: any[] };
+    const out: Record<string, any> = {};
 
-    // v11 response: campaignReports array
-    const reports = result.data.campaignReports || result.data.reports || [];
-    for (const r of reports) {
+    for (const r of (data.campaignReports || data.reports || [])) {
       out[r.campaignId] = {
-        spend:       parseFloat(r.spend        || r.cost    || 0),
-        impressions: parseInt(r.impressions                || 0),
-        clicks:      parseInt(r.clicks                     || 0),
+        spend:       parseFloat(r.spend || r.cost || 0),
+        impressions: parseInt(r.impressions || 0),
+        clicks:      parseInt(r.clicks || 0),
         conversions: parseFloat(r.conversions14d || r.conversions || 0),
-        revenue:     parseFloat(r.sales14d      || r.revenue || 0),
+        revenue:     parseFloat(r.sales14d || r.revenue || 0),
       };
     }
 
@@ -245,13 +211,7 @@ export class BolcomAdvertisingConnector {
 
     const endDate   = new Date().toISOString().split('T')[0];
     const startDate = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-
-    const performance = await this.fetchPerformance(
-      token,
-      campaigns.map(c => c.campaignId),
-      startDate,
-      endDate
-    );
+    const performance = await this.fetchPerformance(token, campaigns.map(c => c.campaignId), startDate, endDate);
 
     const result: BolAdPerformance[] = campaigns.map(c => {
       const p    = performance[c.campaignId] || { spend: 0, impressions: 0, clicks: 0, conversions: 0, revenue: 0 };
@@ -264,16 +224,12 @@ export class BolcomAdvertisingConnector {
         campaignId:   c.campaignId,
         campaignName: c.name,
         status:       (c.state || 'unknown').toLowerCase(),
-        spend:        p.spend,
-        impressions:  p.impressions,
-        clicks:       p.clicks,
-        conversions:  p.conversions,
-        revenue:      p.revenue,
+        spend: p.spend, impressions: p.impressions, clicks: p.clicks,
+        conversions: p.conversions, revenue: p.revenue,
         roas, ctr, cpc, acos,
       };
     });
 
-    // Opslaan in ad_campaigns tabel
     for (const camp of result) {
       await db.query(
         `INSERT INTO ad_campaigns
@@ -282,27 +238,18 @@ export class BolcomAdvertisingConnector {
          VALUES (gen_random_uuid(), $1, $2, 'bolcom', $3, $4, $5, $6, $7, $8, $9, $10, now())
          ON CONFLICT (tenant_id, platform, name)
          DO UPDATE SET
-           status      = EXCLUDED.status,
-           spend       = EXCLUDED.spend,
-           impressions = EXCLUDED.impressions,
-           clicks      = EXCLUDED.clicks,
-           conversions = EXCLUDED.conversions,
-           revenue     = EXCLUDED.revenue,
-           roas        = EXCLUDED.roas,
-           updated_at  = now()`,
-        [
-          tenantId, integrationId,
-          camp.campaignName, camp.status,
-          camp.spend, camp.impressions, camp.clicks,
-          camp.conversions, camp.revenue, camp.roas,
-        ],
+           status = EXCLUDED.status, spend = EXCLUDED.spend,
+           impressions = EXCLUDED.impressions, clicks = EXCLUDED.clicks,
+           conversions = EXCLUDED.conversions, revenue = EXCLUDED.revenue,
+           roas = EXCLUDED.roas, updated_at = now()`,
+        [tenantId, integrationId, camp.campaignName, camp.status,
+         camp.spend, camp.impressions, camp.clicks, camp.conversions, camp.revenue, camp.roas],
         { allowNoTenant: true }
       );
     }
 
     logger.info('bolcom.adv.sync.complete', {
-      tenantId,
-      campaigns:  result.length,
+      tenantId, campaigns: result.length,
       totalSpend: result.reduce((s, c) => s + c.spend, 0),
     });
 
