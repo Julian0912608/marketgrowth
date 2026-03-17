@@ -76,7 +76,19 @@ export class BolcomAdvertisingConnector {
   // ── Verbinding testen ─────────────────────────────────────
   async testConnection(clientId: string, clientSecret: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const token = await this.getToken(clientId, clientSecret, clientId);
+      // Stap 1: token ophalen — 401 = verkeerde credentials
+      let token: string;
+      try {
+        token = await this.getToken(clientId, clientSecret, clientId);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('401')) {
+          return { success: false, error: 'Ongeldige Client ID of Client Secret. Controleer je Advertising API credentials in het Bol.com retailer dashboard.' };
+        }
+        return { success: false, error: 'Auth mislukt: ' + msg };
+      }
+
+      // Stap 2: test campaign endpoint — 403 = geen Advertising API toegang
       const res = await fetch(ADV_BASE + '/campaigns', {
         method:  'POST',
         headers: {
@@ -86,8 +98,12 @@ export class BolcomAdvertisingConnector {
         },
         body: JSON.stringify({ page: 1, pageSize: 1 }),
       });
+
+      if (res.status === 403) {
+        return { success: false, error: 'Geen toegang tot Advertising API. Vraag toegang aan via advertiserapi-beta@bol.com of controleer of je account Advertising API rechten heeft.' };
+      }
       if (!res.ok && res.status !== 404) {
-        throw new Error('API fout ' + res.status);
+        return { success: false, error: 'API fout ' + res.status + ' — probeer opnieuw.' };
       }
       return { success: true };
     } catch (err: unknown) {
