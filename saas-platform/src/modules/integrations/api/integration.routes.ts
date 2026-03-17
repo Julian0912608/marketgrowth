@@ -90,7 +90,6 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 });
 
 // ── POST /api/integrations/advertising/bolcom/connect ─────────
-// Koppel Bol.com Advertising API — let op: VOOR de /:id routes!
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -101,14 +100,12 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       return;
     }
 
-    // Test verbinding
     const test = await bolcomAdvertisingConnector.testConnection(clientId, clientSecret);
     if (!test.success) {
       res.status(400).json({ error: 'Verbinding mislukt: ' + test.error });
       return;
     }
 
-    // Sla op als aparte integratie
     const integrationId = uuidv4();
 
     await db.query(
@@ -121,7 +118,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       { allowNoTenant: true }
     );
 
-    // Haal het werkelijke id op (bij ON CONFLICT is het het bestaande)
     const existing = await db.query(
       `SELECT id FROM tenant_integrations WHERE tenant_id = $1 AND platform_slug = 'bolcom_ads' LIMIT 1`,
       [tenantId],
@@ -129,7 +125,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
     );
     const actualId = existing.rows[0]?.id || integrationId;
 
-    // Sla credentials op
     await db.query(
       `INSERT INTO integration_credentials (integration_id, api_key, api_secret, updated_at)
        VALUES ($1, $2, $3, now())
@@ -139,7 +134,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       { allowNoTenant: true }
     );
 
-    // Start initiële sync
     const campaigns = await bolcomAdvertisingConnector.syncAdvertisingData(
       tenantId, actualId, clientId, clientSecret
     );
@@ -187,8 +181,94 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
   } catch (err) { next(err); }
 });
 
+// ── POST /api/integrations/advertising/bolcom/debug ───────────
+// TIJDELIJK — verwijder na debuggen
+router.post('/advertising/bolcom/debug', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { clientId, clientSecret } = req.body;
+
+    if (!clientId || !clientSecret) {
+      res.status(400).json({ error: 'clientId en clientSecret zijn verplicht' });
+      return;
+    }
+
+    const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+    // Token ophalen
+    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    const tokenText = await tokenRes.text();
+    let tokenData: any = {};
+    try { tokenData = JSON.parse(tokenText); } catch {}
+
+    if (!tokenRes.ok) {
+      res.json({ step: 'token_failed', status: tokenRes.status, response: tokenData });
+      return;
+    }
+
+    const token = tokenData.access_token;
+    const results: any = {
+      tokenStatus: tokenRes.status,
+      tokenScope:  tokenData.scope,
+    };
+
+    // Test 1: PUT /campaigns (huidige implementatie)
+    const r1 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns', {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/vnd.advertiser.v11+json',
+        'Content-Type':  'application/vnd.advertiser.v11+json',
+      },
+      body: JSON.stringify({ page: 1, pageSize: 1 }),
+    });
+    results.PUT_campaigns = { status: r1.status, body: (await r1.text()).slice(0, 300) };
+
+    // Test 2: GET /campaigns
+    const r2 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns?page=1&pageSize=1', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/vnd.advertiser.v11+json',
+      },
+    });
+    results.GET_campaigns = { status: r2.status, body: (await r2.text()).slice(0, 300) };
+
+    // Test 3: GET /campaigns met application/json
+    const r3 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns?page=1&pageSize=1', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/json',
+      },
+    });
+    results.GET_campaigns_json = { status: r3.status, body: (await r3.text()).slice(0, 300) };
+
+    // Test 4: Alternatieve base URL
+    const r4 = await fetch('https://api.bol.com/advertiser/v11/sponsored-products/campaigns?page=1&pageSize=1', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/vnd.advertiser.v11+json',
+      },
+    });
+    results.GET_alt_url = { status: r4.status, body: (await r4.text()).slice(0, 300) };
+
+    res.json(results);
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
+
 // ── POST /api/integrations/:id/sync ──────────────────────────
-// Let op: ALTIJD NA de specifieke /advertising/* routes!
+// LET OP: altijd NA de /advertising/* routes
 router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { jobType = 'incremental' } = req.body as { jobType?: 'full_sync' | 'incremental' };
@@ -216,69 +296,6 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 // ── POST /api/integrations/webhook/:platform ─────────────────
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   res.sendStatus(200);
-});
-router.post('/advertising/bolcom/debug', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { clientId, clientSecret } = req.body;
-
-    if (!clientId || !clientSecret) {
-      res.status(400).json({ error: 'clientId en clientSecret zijn verplicht' });
-      return;
-    }
-
-    const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
-    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${encoded}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    });
-
-    const tokenText = await tokenRes.text();
-    let tokenData: any = {};
-    try { tokenData = JSON.parse(tokenText); } catch {}
-
-    if (!tokenRes.ok) {
-      res.json({
-        step: 'token',
-        status: tokenRes.status,
-        response: tokenData,
-        raw: tokenText.slice(0, 500),
-      });
-      return;
-    }
-
-    const token = tokenData.access_token;
-
-    const campRes = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns', {
-      method: 'PUT',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/vnd.advertiser.v11+json',
-        'Content-Type': 'application/vnd.advertiser.v11+json',
-      },
-      body: JSON.stringify({ page: 1, pageSize: 1 }),
-    });
-
-    const campText = await campRes.text();
-    let campData: any = {};
-    try { campData = JSON.parse(campText); } catch {}
-
-    res.json({
-      step: 'campaigns',
-      tokenStatus: tokenRes.status,
-      tokenScope: tokenData.scope,
-      campaignStatus: campRes.status,
-      campaignResponse: campData,
-      raw: campText.slice(0, 500),
-    });
-
-  } catch (err: any) {
-    res.json({ error: err.message });
-  }
 });
 
 export { router as integrationRouter };
