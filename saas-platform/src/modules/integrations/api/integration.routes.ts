@@ -73,7 +73,7 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
 // ── GET /api/integrations/callback/:platform ─────────────────
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const platform    = req.params.platform as PlatformSlug;
+    const platform        = req.params.platform as PlatformSlug;
     const { code, state } = req.query as { code: string; state: string };
 
     if (!code || !state) {
@@ -91,7 +91,7 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 });
 
 // ── POST /api/integrations/advertising/bolcom/connect ────────
-// LET OP: staat VOOR /:id/sync zodat Express niet 'advertising' als :id pakt
+// LET OP: staat VOOR /:id/* routes zodat Express 'advertising' niet als :id pakt
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -102,7 +102,7 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       return;
     }
 
-    // Test de verbinding door een token op te halen
+    // Test verbinding door token op te halen
     const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
     const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method: 'POST',
@@ -165,7 +165,7 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
 });
 
 // ── POST /api/integrations/advertising/bolcom/sync ───────────
-// LET OP: staat VOOR /:id/sync
+// LET OP: staat VOOR /:id/* routes
 router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -213,7 +213,22 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
 
     await syncBolcomAdvertisingData(creds, tenantId, access_token);
 
-    res.json({ success: true });
+    // Haal gesyncte campagnes op uit DB voor response
+    const statsResult = await db.query(
+      `SELECT COUNT(*)::int AS campaigns, COALESCE(SUM(spend), 0) AS total_spend
+       FROM ad_campaigns
+       WHERE tenant_id = $1 AND integration_id = $2`,
+      [tenantId, integrationId],
+      { allowNoTenant: true }
+    );
+
+    const stats = statsResult.rows[0];
+
+    res.json({
+      success:    true,
+      campaigns:  stats.campaigns   ?? 0,
+      totalSpend: stats.total_spend ?? 0,
+    });
   } catch (err) { next(err); }
 });
 
