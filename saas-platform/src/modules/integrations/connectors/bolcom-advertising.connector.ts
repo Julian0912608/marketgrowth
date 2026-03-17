@@ -1,30 +1,57 @@
 // saas-platform/src/modules/integrations/connectors/bolcom-advertising.connector.ts
 //
-// Conform Bol.com Sponsored Products Campaign Management API v11.0.0
-// Base URL: https://api.bol.com/advertiser/sponsored-products/campaign-management
-// Auth: JWT (apart adverteerder token — niet het retailer token)
-// Campagnes ophalen: POST /campaigns/list
-// Performance data: NIET beschikbaar in deze API — apart reporting API nodig
+// Conform:
+//   - Bol.com Sponsored Products Campaign Management API v11.0.0
+//   - Bol.com Sponsored Products Reporting API v11.0.0
+//
+// Campaign Management base: https://api.bol.com/advertiser/sponsored-products/campaign-management
+// Reporting base:            https://api.bol.com/advertiser/sponsored-products/reporting
+// Auth: JWT (Bearer token via client_credentials — apart van retailer token)
 
 import { db }     from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 import { IntegrationCredentials } from '../types/integration.types';
 
-const ADV_BASE = 'https://api.bol.com/advertiser/sponsored-products/campaign-management';
+const MGMT_BASE    = 'https://api.bol.com/advertiser/sponsored-products/campaign-management';
+const REPORT_BASE  = 'https://api.bol.com/advertiser/sponsored-products/reporting';
+const BATCH_SIZE   = 100; // max entity-ids per reporting request
+
+// ── Types conform OpenAPI spec ────────────────────────────────
 
 interface BolCampaign {
-  campaignId:    string;
-  name:          string;
-  state:         'ENABLED' | 'PAUSED' | string;
-  startDate?:    string;
-  endDate?:      string;
-  dailyBudget?:  { amount: number; currency: string };
-  totalBudget?:  { amount: number; currency: string };
+  campaignId:   string;
+  name:         string;
+  state:        'ENABLED' | 'PAUSED' | string;
+  startDate?:   string;
+  endDate?:     string;
+  dailyBudget?: { amount: number; currency: string };
+  totalBudget?: { amount: number; currency: string };
   campaignType?: string;
 }
 
-interface CampaignListResponse {
-  campaigns: BolCampaign[];
+interface PerformanceMetrics {
+  impressions:        number;
+  clicks:             number;
+  ctr?:               number;
+  conversions14d:     number;
+  conversionRate14d?: number;
+  averageCpc?:        number;
+  sales14d:           number;   // = revenue
+  cost:               number;   // = spend
+  acos14d?:           number;
+  roas14d?:           number;
+}
+
+interface PerformanceMetricsWithIds extends PerformanceMetrics {
+  entityType: string;
+  entityId:   string;
+  campaignId: string;
+  adGroupId?: string;
+}
+
+interface PerformanceResponse {
+  total?:    PerformanceMetrics;
+  subTotals?: PerformanceMetricsWithIds[];
 }
 
 export interface SyncResult {
@@ -32,46 +59,27 @@ export interface SyncResult {
   campaignCount: number;
 }
 
-// ── Haal adverteerder JWT token op ───────────────────────────
-// Dit is een APART token van het retailer token.
-// De api_key/api_secret van bolcom_ads zijn de adverteerder client credentials.
-async function getAdvertiserToken(apiKey: string, apiSecret: string): Promise<string> {
-  const encoded = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
-  const res = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${encoded}`,
-      'Content-Type':  'application/x-www-form-urlencoded',
-    },
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Adverteerder token ophalen mislukt (${res.status}): ${body.slice(0, 200)}`);
-  }
-
-  const data = await res.json() as { access_token: string };
-  return data.access_token;
+// ── Helper: datum formatteren als YYYY-MM-DD ──────────────────
+function formatDate(date: Date): string {
+  return date.toISOString().split('T')[0];
 }
 
-// ── Campagnes ophalen via POST /campaigns/list ────────────────
+// ── Stap 1: Campagnes ophalen via Campaign Management API ─────
 async function fetchCampaigns(token: string): Promise<BolCampaign[]> {
-  const res = await fetch(`${ADV_BASE}/campaigns/list`, {
+  const res = await fetch(`${MGMT_BASE}/campaigns/list`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
       'Content-Type':  'application/json',
       'Accept':        'application/json',
     },
-    // Lege body = alle campagnes ophalen (geen filter op campaignIds)
-    body: JSON.stringify({}),
+    body: JSON.stringify({}), // lege body = alle campagnes
   });
 
-  if (res.status === 403 || res.status === 401) {
-    throw Object.assign(
-      new Error(`Geen adverteerder toegang (${res.status})`),
-      { noAccess: true }
-    );
+  if (res.status === 401 || res.status === 403) {
+    const err: any = new Error(`Geen adverteerder toegang (${res.status})`);
+    err.noAccess = true;
+    throw err;
   }
 
   if (!res.ok) {
@@ -79,19 +87,71 @@ async function fetchCampaigns(token: string): Promise<BolCampaign[]> {
     throw new Error(`Campagnes ophalen mislukt (${res.status}): ${body.slice(0, 300)}`);
   }
 
-  const data = await res.json() as CampaignListResponse;
+  const data = await res.json() as { campaigns?: BolCampaign[] };
   return data.campaigns ?? [];
+}
+
+// ── Stap 2: Performance data ophalen via Reporting API ────────
+// Conform spec: GET /performance?entity-type=CAMPAIGN&entity-ids=...
+// Max 100 entity-ids per request, datum max 30 dagen geleden
+async function fetchPerformance(
+  token: string,
+  campaignIds: string[],
+  startDate: string,
+  endDate: string,
+): Promise<Map<string, PerformanceMetrics>> {
+  const perfMap = new Map<string, PerformanceMetrics>();
+
+  // Verwerk in batches van max 100 (conform spec maxItems: 100)
+  for (let i = 0; i < campaignIds.length; i += BATCH_SIZE) {
+    const batch = campaignIds.slice(i, i + BATCH_SIZE);
+
+    const params = new URLSearchParams({
+      'entity-type':       'CAMPAIGN',
+      'period-start-date': startDate,
+      'period-end-date':   endDate,
+    });
+
+    // entity-ids als herhaalde query param (array)
+    batch.forEach(id => params.append('entity-ids', id));
+
+    const res = await fetch(`${REPORT_BASE}/performance?${params}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept':        'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      logger.warn('bolcom.adv.reporting.failed', {
+        status: res.status, body: body.slice(0, 300),
+      });
+      continue; // batch overslaan, niet crashen
+    }
+
+    const data = await res.json() as PerformanceResponse;
+
+    // subTotals bevat performance per campagne met campaignId
+    for (const sub of data.subTotals ?? []) {
+      if (sub.entityType === 'CAMPAIGN' && sub.campaignId) {
+        perfMap.set(sub.campaignId, sub);
+      }
+    }
+  }
+
+  return perfMap;
 }
 
 // ── Hoofdfunctie ──────────────────────────────────────────────
 export async function syncBolcomAdvertisingData(
   creds: IntegrationCredentials,
   tenantId: string,
-  token: string,  // dit is al het token dat de route heeft opgehaald
+  token: string,
 ): Promise<SyncResult> {
   const integrationId = creds.integrationId;
 
-  // ── Campagnes ophalen ─────────────────────────────────────
+  // ── Stap 1: Campagnes ophalen ─────────────────────────────
   let campaigns: BolCampaign[] = [];
 
   try {
@@ -115,17 +175,33 @@ export async function syncBolcomAdvertisingData(
     return { hasAccess: true, campaignCount: 0 };
   }
 
-  // ── Campagnes opslaan in DB ───────────────────────────────
-  // NB: spend/impressions/clicks/revenue zijn NIET beschikbaar
-  // in de Campaign Management API. Deze API bevat alleen campagne
-  // configuratie. Voor performance data is een aparte Reporting API nodig.
-  // We slaan daarom 0 op voor metrics — dit is correct gedrag.
+  // ── Stap 2: Performance data ophalen (laatste 30 dagen) ───
+  // Spec: period mag max 30 dagen geleden zijn
+  const endDate   = formatDate(new Date());
+  const startDate = formatDate(new Date(Date.now() - 29 * 24 * 60 * 60 * 1000));
+
+  const campaignIds  = campaigns.map(c => c.campaignId);
+  const perfMap      = await fetchPerformance(token, campaignIds, startDate, endDate);
+
+  // ── Stap 3: Campagnes + performance opslaan in DB ─────────
   let saved = 0;
 
   for (const campaign of campaigns) {
     try {
-      const dailyBudget = campaign.dailyBudget?.amount ?? 0;
-      const status      = campaign.state === 'ENABLED' ? 'active' : 'paused';
+      const perf   = perfMap.get(campaign.campaignId);
+      const status = campaign.state === 'ENABLED' ? 'active' : 'paused';
+
+      // Conform spec veldnamen:
+      // cost     = spend
+      // sales14d = revenue
+      // roas14d  = ROAS
+      // conversions14d = conversions
+      const spend       = perf?.cost            ?? 0;
+      const revenue     = perf?.sales14d        ?? 0;
+      const impressions = perf?.impressions      ?? 0;
+      const clicks      = perf?.clicks           ?? 0;
+      const conversions = perf?.conversions14d   ?? 0;
+      const roas        = perf?.roas14d          ?? (spend > 0 ? Math.round((revenue / spend) * 100) / 100 : null);
 
       await db.query(
         `INSERT INTO ad_campaigns (
@@ -136,21 +212,33 @@ export async function syncBolcomAdvertisingData(
          ) VALUES (
            gen_random_uuid(), $1, $2, $2,
            'bolcom', $3, $4, $5,
-           0, 0, 0, 0, 0, NULL,
+           $6, $7, $8, $9, $10, $11,
            now(), now()
          )
          ON CONFLICT (tenant_id, integration_id, external_id)
          DO UPDATE SET
-           name      = EXCLUDED.name,
-           status    = EXCLUDED.status,
-           synced_at = now(),
-           updated_at = now()`,
+           name        = EXCLUDED.name,
+           status      = EXCLUDED.status,
+           spend       = EXCLUDED.spend,
+           impressions = EXCLUDED.impressions,
+           clicks      = EXCLUDED.clicks,
+           conversions = EXCLUDED.conversions,
+           revenue     = EXCLUDED.revenue,
+           roas        = EXCLUDED.roas,
+           synced_at   = now(),
+           updated_at  = now()`,
         [
           tenantId,
           integrationId,
           campaign.campaignId,
           campaign.name ?? `Campaign ${campaign.campaignId}`,
           status,
+          spend,
+          impressions,
+          clicks,
+          conversions,
+          revenue,
+          roas,
         ],
         { allowNoTenant: true }
       );
@@ -165,6 +253,14 @@ export async function syncBolcomAdvertisingData(
     }
   }
 
-  logger.info('bolcom.adv.sync.complete', { tenantId, integrationId, saved, total: campaigns.length });
+  logger.info('bolcom.adv.sync.complete', {
+    tenantId, integrationId,
+    saved,
+    total:    campaigns.length,
+    withPerf: perfMap.size,
+    startDate,
+    endDate,
+  });
+
   return { hasAccess: true, campaignCount: saved };
 }
