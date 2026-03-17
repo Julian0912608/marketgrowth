@@ -217,5 +217,68 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   res.sendStatus(200);
 });
+router.post('/advertising/bolcom/debug', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { clientId, clientSecret } = req.body;
+
+    if (!clientId || !clientSecret) {
+      res.status(400).json({ error: 'clientId en clientSecret zijn verplicht' });
+      return;
+    }
+
+    const encoded = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    const tokenText = await tokenRes.text();
+    let tokenData: any = {};
+    try { tokenData = JSON.parse(tokenText); } catch {}
+
+    if (!tokenRes.ok) {
+      res.json({
+        step: 'token',
+        status: tokenRes.status,
+        response: tokenData,
+        raw: tokenText.slice(0, 500),
+      });
+      return;
+    }
+
+    const token = tokenData.access_token;
+
+    const campRes = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns', {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.advertiser.v11+json',
+        'Content-Type': 'application/vnd.advertiser.v11+json',
+      },
+      body: JSON.stringify({ page: 1, pageSize: 1 }),
+    });
+
+    const campText = await campRes.text();
+    let campData: any = {};
+    try { campData = JSON.parse(campText); } catch {}
+
+    res.json({
+      step: 'campaigns',
+      tokenStatus: tokenRes.status,
+      tokenScope: tokenData.scope,
+      campaignStatus: campRes.status,
+      campaignResponse: campData,
+      raw: campText.slice(0, 500),
+    });
+
+  } catch (err: any) {
+    res.json({ error: err.message });
+  }
+});
 
 export { router as integrationRouter };
