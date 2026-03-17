@@ -93,8 +93,8 @@ export class BolcomAdvertisingConnector {
         method:  'POST',
         headers: {
           'Authorization': 'Bearer ' + token,
-          'Accept':        'application/vnd.retailer.v11+json',
-          'Content-Type':  'application/vnd.retailer.v11+json',
+          'Accept':        'application/vnd.advertiser.v11+json',
+          'Content-Type':  'application/vnd.advertiser.v11+json',
         },
         body: JSON.stringify({ page: 1, pageSize: 1 }),
       });
@@ -117,8 +117,8 @@ export class BolcomAdvertisingConnector {
       method:  'POST',
       headers: {
         'Authorization': 'Bearer ' + token,
-        'Accept':        'application/vnd.retailer.v11+json',
-        'Content-Type':  'application/vnd.retailer.v11+json',
+        'Accept':        'application/vnd.advertiser.v11+json',
+        'Content-Type':  'application/vnd.advertiser.v11+json',
       },
       body: JSON.stringify({ page: 1, pageSize: 100 }),
     });
@@ -145,8 +145,8 @@ export class BolcomAdvertisingConnector {
       method:  'POST',
       headers: {
         'Authorization': 'Bearer ' + token,
-        'Accept':        'application/vnd.retailer.v11+json',
-        'Content-Type':  'application/vnd.retailer.v11+json',
+        'Accept':        'application/vnd.advertiser.v11+json',
+        'Content-Type':  'application/vnd.advertiser.v11+json',
       },
       body: JSON.stringify({
         campaignIds,
