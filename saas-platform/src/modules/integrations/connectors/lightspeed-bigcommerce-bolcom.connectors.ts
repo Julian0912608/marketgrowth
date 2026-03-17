@@ -474,7 +474,7 @@ export class BolcomConnector implements IPlatformConnector {
       externalId:        String(o.orderId || ''),
       externalNumber:    String(o.orderId || ''),
       totalAmount:       Math.round(totalAmount * 100) / 100,
-      subtotalAmount:    Math.round(totalAmount * 100) / 100,
+      subtotalAmount:    Math.round((totalAmount / 1.21) * 100) / 100,
       taxAmount:         Math.round((totalAmount - totalAmount / 1.21) * 100) / 100,
       shippingAmount:    0,
       discountAmount:    0,
@@ -492,28 +492,35 @@ export class BolcomConnector implements IPlatformConnector {
   private normalizeShipment(s: Record<string, unknown>, orderId: string): NormalizedOrder {
     const items = (s.shipmentItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = items.map(item => {
-      const unitPrice = parsePrice(item.unitPrice || item.offerPrice);
+      // Bol.com prijzen: unitPrice kan een object zijn met 'amount' veld
+      const unitPrice = parsePrice(item.unitPrice || item.offerPrice || item.sellingPrice);
       const quantity  = safeInt(item.quantity || item.quantityShipped || 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
+      // Als unitPrice 0 is, probeer andere prijsvelden
+      const finalPrice = unitPrice > 0 ? unitPrice : parsePrice(
+        (item as any).offerPrice || (item as any).bundleItemPrice || 0
+      );
       return {
         externalId:     String(item.orderItemId || item.shipmentItemId || ''),
         sku:            String(item.ean || ''),
         title:          String(product?.title || item.ean || ''),
         quantity,
-        unitPrice,
-        totalPrice:     Math.round(unitPrice * quantity * 100) / 100,
+        unitPrice:      finalPrice,
+        totalPrice:     Math.round(finalPrice * quantity * 100) / 100,
         discountAmount: 0,
       };
     });
 
-    const totalAmount = lineItems.reduce((acc, li) => acc + li.totalPrice, 0);
+    // Filter line items zonder prijs — EAN-only items zonder prijs weggooien
+    const validItems = lineItems.filter(li => li.unitPrice > 0 || li.title.length > 13);
+    const totalAmount = validItems.reduce((acc, li) => acc + li.totalPrice, 0);
     const shipDate    = s.shipmentDate || s.orderPlacedDateTime;
 
     return {
       externalId:        orderId,
       externalNumber:    orderId,
       totalAmount:       Math.round(totalAmount * 100) / 100,
-      subtotalAmount:    Math.round(totalAmount * 100) / 100,
+      subtotalAmount:    Math.round((totalAmount / 1.21) * 100) / 100,
       taxAmount:         Math.round((totalAmount - totalAmount / 1.21) * 100) / 100,
       shippingAmount:    0,
       discountAmount:    0,
