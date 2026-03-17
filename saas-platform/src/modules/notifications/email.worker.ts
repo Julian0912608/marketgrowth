@@ -57,7 +57,7 @@ export async function scheduleEmailJobs(): Promise<void> {
     'daily-briefing',
     { type: 'daily_briefing' },
     {
-      repeat: { cron: '0 6 * * *' },
+      repeat: { pattern: '0 6 * * *' } as any,
       jobId:  'daily-briefing-scheduled',
     }
   );
