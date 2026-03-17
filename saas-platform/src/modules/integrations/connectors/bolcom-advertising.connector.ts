@@ -1,106 +1,132 @@
 // saas-platform/src/modules/integrations/connectors/bolcom-advertising.connector.ts
 //
-// FIX 1: Correct endpoint /retailer/advertiser/campaigns (niet /sponsored)
-// FIX 2: connection_id = integrationId altijd meegeven bij INSERT ad_campaigns
-// FIX 3: 404 op advertiser endpoint = graceful skip (niet alle accounts hebben ads)
+// Conform Bol.com Sponsored Products Campaign Management API v11.0.0
+// Base URL: https://api.bol.com/advertiser/sponsored-products/campaign-management
+// Auth: JWT (apart adverteerder token — niet het retailer token)
+// Campagnes ophalen: POST /campaigns/list
+// Performance data: NIET beschikbaar in deze API — apart reporting API nodig
 
-import { db }    from '../../../infrastructure/database/connection';
+import { db }     from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 import { IntegrationCredentials } from '../types/integration.types';
 
+const ADV_BASE = 'https://api.bol.com/advertiser/sponsored-products/campaign-management';
+
 interface BolCampaign {
-  campaignId:   string | number;
-  campaignName: string;
-  status:       string;
-  budget?:      number;
-  spend?:       number;
-  impressions?: number;
-  clicks?:      number;
-  conversions?: number;
-  revenue?:     number;
+  campaignId:    string;
+  name:          string;
+  state:         'ENABLED' | 'PAUSED' | string;
+  startDate?:    string;
+  endDate?:      string;
+  dailyBudget?:  { amount: number; currency: string };
+  totalBudget?:  { amount: number; currency: string };
+  campaignType?: string;
 }
 
+interface CampaignListResponse {
+  campaigns: BolCampaign[];
+}
+
+export interface SyncResult {
+  hasAccess:     boolean;
+  campaignCount: number;
+}
+
+// ── Haal adverteerder JWT token op ───────────────────────────
+// Dit is een APART token van het retailer token.
+// De api_key/api_secret van bolcom_ads zijn de adverteerder client credentials.
+async function getAdvertiserToken(apiKey: string, apiSecret: string): Promise<string> {
+  const encoded = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+  const res = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${encoded}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Adverteerder token ophalen mislukt (${res.status}): ${body.slice(0, 200)}`);
+  }
+
+  const data = await res.json() as { access_token: string };
+  return data.access_token;
+}
+
+// ── Campagnes ophalen via POST /campaigns/list ────────────────
+async function fetchCampaigns(token: string): Promise<BolCampaign[]> {
+  const res = await fetch(`${ADV_BASE}/campaigns/list`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
+    },
+    // Lege body = alle campagnes ophalen (geen filter op campaignIds)
+    body: JSON.stringify({}),
+  });
+
+  if (res.status === 403 || res.status === 401) {
+    throw Object.assign(
+      new Error(`Geen adverteerder toegang (${res.status})`),
+      { noAccess: true }
+    );
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Campagnes ophalen mislukt (${res.status}): ${body.slice(0, 300)}`);
+  }
+
+  const data = await res.json() as CampaignListResponse;
+  return data.campaigns ?? [];
+}
+
+// ── Hoofdfunctie ──────────────────────────────────────────────
 export async function syncBolcomAdvertisingData(
   creds: IntegrationCredentials,
   tenantId: string,
-  token: string,
-): Promise<void> {
-  const integrationId = creds.integrationId; // ← DIT was het probleem: werd niet gebruikt
+  token: string,  // dit is al het token dat de route heeft opgehaald
+): Promise<SyncResult> {
+  const integrationId = creds.integrationId;
 
-  // ── Stap 1: Haal campagnes op ─────────────────────────────
+  // ── Campagnes ophalen ─────────────────────────────────────
   let campaigns: BolCampaign[] = [];
 
   try {
-    const res = await fetch('https://api.bol.com/retailer/advertiser/campaigns', {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept':        'application/vnd.retailer.v10+json',
-      },
-    });
-
-    // Niet alle accounts hebben advertising toegang — graceful skip
-    if (res.status === 404 || res.status === 403) {
+    campaigns = await fetchCampaigns(token);
+  } catch (err: any) {
+    if (err.noAccess) {
       logger.warn('bolcom.adv.not_available', {
-        tenantId,
-        integrationId,
-        status: res.status,
-        message: 'Account heeft geen Bol.com adverteerder toegang — advertising sync overgeslagen',
+        tenantId, integrationId,
+        message: 'Account heeft geen Bol.com adverteerder toegang',
       });
-      return; // ← Stop hier, geen crash
+      return { hasAccess: false, campaignCount: 0 };
     }
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      logger.warn('bolcom.adv.performance.failed', {
-        tenantId, integrationId, status: res.status, body: body.slice(0, 300),
-      });
-      return;
-    }
-
-    const data = await res.json() as { campaigns?: BolCampaign[] };
-    campaigns  = data.campaigns ?? [];
-
-  } catch (err) {
     logger.warn('bolcom.adv.fetch.error', {
       tenantId, integrationId,
       error: err instanceof Error ? err.message : String(err),
     });
-    return;
+    return { hasAccess: false, campaignCount: 0 };
   }
 
-  if (campaigns.length === 0) return;
+  if (campaigns.length === 0) {
+    return { hasAccess: true, campaignCount: 0 };
+  }
 
-  // ── Stap 2: Haal performance data op per campagne ─────────
+  // ── Campagnes opslaan in DB ───────────────────────────────
+  // NB: spend/impressions/clicks/revenue zijn NIET beschikbaar
+  // in de Campaign Management API. Deze API bevat alleen campagne
+  // configuratie. Voor performance data is een aparte Reporting API nodig.
+  // We slaan daarom 0 op voor metrics — dit is correct gedrag.
+  let saved = 0;
+
   for (const campaign of campaigns) {
     try {
-      const perfRes = await fetch(
-        `https://api.bol.com/retailer/advertiser/campaigns/${campaign.campaignId}/performance`,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept':        'application/vnd.retailer.v10+json',
-          },
-        }
-      );
+      const dailyBudget = campaign.dailyBudget?.amount ?? 0;
+      const status      = campaign.state === 'ENABLED' ? 'active' : 'paused';
 
-      let spend       = 0;
-      let impressions = 0;
-      let clicks      = 0;
-      let conversions = 0;
-      let revenue     = 0;
-
-      if (perfRes.ok) {
-        const perf = await perfRes.json() as Record<string, number>;
-        spend       = perf.cost          ?? perf.spend        ?? 0;
-        impressions = perf.impressions   ?? 0;
-        clicks      = perf.clicks        ?? 0;
-        conversions = perf.conversions   ?? perf.orders       ?? 0;
-        revenue     = perf.revenue       ?? perf.sales        ?? 0;
-      }
-
-      const roas = spend > 0 ? Math.round((revenue / spend) * 100) / 100 : null;
-
-      // ── FIX: connection_id = integrationId altijd meegeven ─
       await db.query(
         `INSERT INTO ad_campaigns (
            id, tenant_id, connection_id, integration_id,
@@ -110,49 +136,35 @@ export async function syncBolcomAdvertisingData(
          ) VALUES (
            gen_random_uuid(), $1, $2, $2,
            'bolcom', $3, $4, $5,
-           $6, $7, $8, $9, $10, $11,
+           0, 0, 0, 0, 0, NULL,
            now(), now()
          )
          ON CONFLICT (tenant_id, integration_id, external_id)
          DO UPDATE SET
-           name        = EXCLUDED.name,
-           status      = EXCLUDED.status,
-           spend       = EXCLUDED.spend,
-           impressions = EXCLUDED.impressions,
-           clicks      = EXCLUDED.clicks,
-           conversions = EXCLUDED.conversions,
-           revenue     = EXCLUDED.revenue,
-           roas        = EXCLUDED.roas,
-           synced_at   = now(),
-           updated_at  = now()`,
+           name      = EXCLUDED.name,
+           status    = EXCLUDED.status,
+           synced_at = now(),
+           updated_at = now()`,
         [
           tenantId,
-          integrationId,           // $2 = connection_id én integration_id
-          String(campaign.campaignId),
-          campaign.campaignName ?? `Campaign ${campaign.campaignId}`,
-          campaign.status ?? 'UNKNOWN',
-          spend,
-          impressions,
-          clicks,
-          conversions,
-          revenue,
-          roas,
+          integrationId,
+          campaign.campaignId,
+          campaign.name ?? `Campaign ${campaign.campaignId}`,
+          status,
         ],
         { allowNoTenant: true }
       );
 
+      saved++;
+
     } catch (err) {
-      // Één campagne die faalt stopt de rest NIET
       logger.warn('bolcom.adv.campaign.upsert.failed', {
-        tenantId,
-        integrationId,
-        campaignId: campaign.campaignId,
+        tenantId, integrationId, campaignId: campaign.campaignId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  logger.info('bolcom.adv.sync.complete', {
-    tenantId, integrationId, count: campaigns.length,
-  });
+  logger.info('bolcom.adv.sync.complete', { tenantId, integrationId, saved, total: campaigns.length });
+  return { hasAccess: true, campaignCount: saved };
 }
