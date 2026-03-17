@@ -1,12 +1,13 @@
-import { syncBolcomAdvertisingData } from '../connectors/bolcom-advertising.connector';
+// saas-platform/src/modules/integrations/api/integration.routes.ts
+
 import { Router, Request, Response, NextFunction } from 'express';
-import { v4 as uuidv4 } from 'uuid';
-import { IntegrationService }         from '../service/integration.service';
-import { tenantMiddleware }           from '../../../shared/middleware/tenant.middleware';
-import { getTenantContext }           from '../../../shared/middleware/tenant-context';
-import { db }                         from '../../../infrastructure/database/connection';
-import { PlatformSlug }               from '../types/integration.types';
-import { bolcomAdvertisingConnector } from '../connectors/bolcom-advertising.connector';
+import { v4 as uuidv4 }                            from 'uuid';
+import { IntegrationService }                       from '../service/integration.service';
+import { tenantMiddleware }                         from '../../../shared/middleware/tenant.middleware';
+import { getTenantContext }                         from '../../../shared/middleware/tenant-context';
+import { db }                                       from '../../../infrastructure/database/connection';
+import { PlatformSlug, IntegrationCredentials }     from '../types/integration.types';
+import { syncBolcomAdvertisingData }                from '../connectors/bolcom-advertising.connector';
 
 const router             = Router();
 const integrationService = new IntegrationService();
@@ -72,7 +73,7 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
 // ── GET /api/integrations/callback/:platform ─────────────────
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const platform = req.params.platform as PlatformSlug;
+    const platform    = req.params.platform as PlatformSlug;
     const { code, state } = req.query as { code: string; state: string };
 
     if (!code || !state) {
@@ -82,7 +83,6 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 
     const result      = await integrationService.handleOAuthCallback(platform, code, state);
     const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
-
     res.redirect(frontendUrl + '/dashboard/integrations?connected=' + result.integrationId);
   } catch (err) {
     const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
@@ -90,22 +90,34 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
   }
 });
 
-// ── POST /api/integrations/advertising/bolcom/connect ─────────
+// ── POST /api/integrations/advertising/bolcom/connect ────────
+// LET OP: staat VOOR /:id/sync zodat Express niet 'advertising' als :id pakt
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
-    const { clientId, clientSecret } = req.body;
+    const { clientId, clientSecret } = req.body as { clientId: string; clientSecret: string };
 
     if (!clientId || !clientSecret) {
       res.status(400).json({ error: 'Client ID en Client Secret zijn verplicht' });
       return;
     }
 
-    const test = await bolcomAdvertisingConnector.testConnection(clientId, clientSecret);
-    if (!test.success) {
-      res.status(400).json({ error: 'Verbinding mislukt: ' + test.error });
+    // Test de verbinding door een token op te halen
+    const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+    });
+
+    if (!tokenRes.ok) {
+      res.status(400).json({ error: 'Bol.com Advertising verbinding mislukt — controleer Client ID en Secret' });
       return;
     }
+
+    const { access_token } = await tokenRes.json() as { access_token: string };
 
     const integrationId = uuidv4();
 
@@ -135,20 +147,25 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       { allowNoTenant: true }
     );
 
-    const campaigns = await bolcomAdvertisingConnector.syncAdvertisingData(
-      tenantId, actualId, clientId, clientSecret
-    );
+    const creds: IntegrationCredentials = {
+      integrationId: actualId,
+      platform:      'bolcom',
+      apiKey:        clientId,
+      apiSecret:     clientSecret,
+    };
+
+    await syncBolcomAdvertisingData(creds, tenantId, access_token);
 
     res.json({
       success:       true,
       integrationId: actualId,
-      campaigns:     campaigns.length,
-      message:       'Bol.com Advertising gekoppeld en ' + campaigns.length + ' campagnes gesynchroniseerd',
+      message:       'Bol.com Advertising gekoppeld en campagnes gesynchroniseerd',
     });
   } catch (err) { next(err); }
 });
 
-// ── POST /api/integrations/advertising/bolcom/sync ────────────
+// ── POST /api/integrations/advertising/bolcom/sync ───────────
+// LET OP: staat VOOR /:id/sync
 router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -170,18 +187,35 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
 
     const { id: integrationId, api_key: clientId, api_secret: clientSecret } = result.rows[0];
 
-    const campaigns = await bolcomAdvertisingConnector.syncAdvertisingData(
-      tenantId, integrationId, clientId, clientSecret
-    );
-
-    res.json({
-      success:    true,
-      campaigns:  campaigns.length,
-      totalSpend: campaigns.reduce((s, c) => s + c.spend, 0),
+    // Fresh token ophalen
+    const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${encoded}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
     });
+
+    if (!tokenRes.ok) {
+      res.status(502).json({ error: 'Bol.com token ophalen mislukt' });
+      return;
+    }
+
+    const { access_token } = await tokenRes.json() as { access_token: string };
+
+    const creds: IntegrationCredentials = {
+      integrationId,
+      platform:  'bolcom',
+      apiKey:    clientId,
+      apiSecret: clientSecret,
+    };
+
+    await syncBolcomAdvertisingData(creds, tenantId, access_token);
+
+    res.json({ success: true });
   } catch (err) { next(err); }
 });
-
 
 // ── POST /api/integrations/:id/sync ──────────────────────────
 // LET OP: altijd NA de /advertising/* routes
@@ -210,59 +244,8 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 });
 
 // ── POST /api/integrations/webhook/:platform ─────────────────
-router.post('/webhook/:platform', async (req: Request, res: Response) => {
+router.post('/webhook/:platform', async (_req: Request, res: Response) => {
   res.sendStatus(200);
 });
-// ── POST /api/integrations/advertising/bolcom/sync ───────────
-// Handmatige trigger van Bol.com advertising data sync
-router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { tenantId } = getTenantContext();
 
-    // Haal de actieve bol.com integratie op voor deze tenant
-    const integResult = await db.query(
-      `SELECT ic.integration_id, ic.api_key, ic.api_secret
-       FROM integration_credentials ic
-       JOIN tenant_integrations ti ON ti.id = ic.integration_id
-       WHERE ti.tenant_id = $1 AND ti.platform_slug = 'bolcom' AND ti.status = 'active'
-       LIMIT 1`,
-      [tenantId],
-      { allowNoTenant: true }
-    );
-
-    if (!integResult.rows[0]) {
-      res.status(404).json({ error: 'Geen actieve Bol.com integratie gevonden' });
-      return;
-    }
-
-    const row = integResult.rows[0];
-    const creds: IntegrationCredentials = {
-      integrationId: row.integration_id,  // ← de fix
-      platform:      'bolcom',
-      apiKey:        row.api_key,
-      apiSecret:     row.api_secret,
-    };
-
-    // Fresh token ophalen
-    const encoded  = Buffer.from(`${creds.apiKey}:${creds.apiSecret}`).toString('base64');
-    const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${encoded}`,
-        'Content-Type':  'application/x-www-form-urlencoded',
-      },
-    });
-
-    if (!tokenRes.ok) {
-      res.status(502).json({ error: 'Bol.com token ophalen mislukt' });
-      return;
-    }
-
-    const { access_token } = await tokenRes.json() as { access_token: string };
-
-    await syncBolcomAdvertisingData(creds, tenantId, access_token);
-
-    res.json({ success: true });
-  } catch (err) { next(err); }
-});
 export { router as integrationRouter };
