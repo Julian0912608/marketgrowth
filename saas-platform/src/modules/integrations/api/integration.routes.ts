@@ -219,9 +219,9 @@ router.post('/advertising/bolcom/debug', async (req: Request, res: Response, nex
       tokenScope:  tokenData.scope,
     };
 
-    // Test 1: PUT /campaigns (huidige implementatie)
-    const r1 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns', {
-      method: 'PUT',
+    // Test 1: POST /campaigns/list — CORRECTE endpoint uit OpenAPI YAML spec
+    const r1 = await fetch('https://api.bol.com/advertiser/sponsored-products/campaign-management/campaigns/list', {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept':        'application/vnd.advertiser.v11+json',
@@ -229,37 +229,31 @@ router.post('/advertising/bolcom/debug', async (req: Request, res: Response, nex
       },
       body: JSON.stringify({ page: 1, pageSize: 1 }),
     });
-    results.PUT_campaigns = { status: r1.status, body: (await r1.text()).slice(0, 300) };
+    results.POST_campaigns_list = { status: r1.status, body: (await r1.text()).slice(0, 500) };
 
-    // Test 2: GET /campaigns
-    const r2 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns?page=1&pageSize=1', {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept':        'application/vnd.advertiser.v11+json',
-      },
-    });
-    results.GET_campaigns = { status: r2.status, body: (await r2.text()).slice(0, 300) };
-
-    // Test 3: GET /campaigns met application/json
-    const r3 = await fetch('https://api.bol.com/advertiser/sponsored-products/v11/campaigns?page=1&pageSize=1', {
-      method: 'GET',
+    // Test 2: POST /campaigns/list met application/json
+    const r2 = await fetch('https://api.bol.com/advertiser/sponsored-products/campaign-management/campaigns/list', {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept':        'application/json',
+        'Content-Type':  'application/json',
       },
+      body: JSON.stringify({ page: 1, pageSize: 1 }),
     });
-    results.GET_campaigns_json = { status: r3.status, body: (await r3.text()).slice(0, 300) };
+    results.POST_campaigns_list_json = { status: r2.status, body: (await r2.text()).slice(0, 500) };
 
-    // Test 4: Alternatieve base URL
-    const r4 = await fetch('https://api.bol.com/advertiser/v11/sponsored-products/campaigns?page=1&pageSize=1', {
-      method: 'GET',
+    // Test 3: Zonder body
+    const r3 = await fetch('https://api.bol.com/advertiser/sponsored-products/campaign-management/campaigns/list', {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Accept':        'application/vnd.advertiser.v11+json',
+        'Content-Type':  'application/vnd.advertiser.v11+json',
       },
+      body: JSON.stringify({}),
     });
-    results.GET_alt_url = { status: r4.status, body: (await r4.text()).slice(0, 300) };
+    results.POST_campaigns_list_empty = { status: r3.status, body: (await r3.text()).slice(0, 500) };
 
     res.json(results);
   } catch (err: any) {
