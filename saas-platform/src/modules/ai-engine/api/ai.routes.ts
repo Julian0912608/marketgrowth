@@ -207,5 +207,156 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
     });
   } catch (err) { next(err); }
 });
+// ── POST /api/ai/social-content ──────────────────────────────
+// Voeg dit toe aan saas-platform/src/modules/ai-engine/api/ai.routes.ts
+// Plak dit blok direct VOOR de export { router as aiRouter } regel
 
+router.post('/social-content', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+
+    // Alleen Growth+ heeft toegang
+    if (planSlug === 'starter') {
+      res.status(403).json({ error: 'Social Content Generator is available on Growth and Scale plans.' });
+      return;
+    }
+
+    const { platform, tone, topic, customContext, count = 3 } = req.body as {
+      platform:      'instagram' | 'tiktok';
+      tone:          'educational' | 'inspirational' | 'data-driven' | 'behind-the-scenes';
+      topic:         string;
+      customContext?: string;
+      count?:        number;
+    };
+
+    // Haal echte store data op om posts te personaliseren
+    const [ordersResult, adsResult, integrationsResult] = await Promise.all([
+      db.query(
+        `SELECT
+           COUNT(*)::int                              AS total_orders,
+           COALESCE(SUM(total_amount - tax_amount),0) AS revenue,
+           COALESCE(AVG(total_amount - tax_amount),0) AS avg_order_value
+         FROM orders
+         WHERE tenant_id = $1
+           AND ordered_at >= NOW() - INTERVAL '30 days'
+           AND status NOT IN ('cancelled','refunded')`,
+        [tenantId], { allowNoTenant: true }
+      ),
+      db.query(
+        `SELECT
+           COALESCE(SUM(spend),0)       AS total_spend,
+           COALESCE(SUM(revenue),0)     AS total_ad_revenue,
+           COALESCE(AVG(roas),0)        AS avg_roas,
+           COALESCE(SUM(impressions),0) AS total_impressions,
+           COALESCE(SUM(clicks),0)      AS total_clicks
+         FROM ad_campaigns
+         WHERE tenant_id = $1
+           AND updated_at >= NOW() - INTERVAL '30 days'`,
+        [tenantId], { allowNoTenant: true }
+      ),
+      db.query(
+        `SELECT platform_slug FROM tenant_integrations WHERE tenant_id = $1 AND status = 'active'`,
+        [tenantId], { allowNoTenant: true }
+      ),
+    ]);
+
+    const orders       = ordersResult.rows[0];
+    const ads          = adsResult.rows[0];
+    const platforms    = integrationsResult.rows.map((r: any) => r.platform_slug).join(', ');
+
+    const toneGuide: Record<string, string> = {
+      'educational':       'Teach the audience something actionable. Use clear steps or insights.',
+      'inspirational':     'Motivate and inspire. Focus on results, transformation, and possibilities.',
+      'data-driven':       'Lead with a surprising or compelling statistic. Let numbers do the talking.',
+      'behind-the-scenes': 'Be authentic, relatable, and transparent. Share real experiences.',
+    };
+
+    const topicGuide: Record<string, string> = {
+      'roas':                'Return on ad spend, ad profitability, knowing your numbers',
+      'product-performance': 'Which products sell best, product analytics, revenue per product',
+      'ads-tips':            'Advertising tips for ecommerce, campaign optimisation, Meta/Google/TikTok ads',
+      'ecommerce-growth':    'Growing an ecommerce business, scaling, multi-channel selling',
+      'platform-insights':   'Selling on Shopify, Bol.com, Amazon, Etsy — platform-specific insights',
+    };
+
+    const platformGuide: Record<string, string> = {
+      instagram: 'Instagram caption style: conversational, line breaks for readability, emojis allowed, strong hook in first line. 15-20 hashtags.',
+      tiktok:    'TikTok caption style: very short and punchy, hook must be irresistible, CTA to follow or comment. 5-8 hashtags.',
+    };
+
+    const storeContext = `
+Real store data (use this to make posts feel authentic and specific):
+- Orders last 30 days: ${orders.total_orders}
+- Revenue last 30 days: €${parseFloat(orders.revenue).toFixed(0)}
+- Average order value: €${parseFloat(orders.avg_order_value).toFixed(0)}
+- Ad spend last 30 days: €${parseFloat(ads.total_spend).toFixed(0)}
+- Ad revenue (attributed): €${parseFloat(ads.total_ad_revenue).toFixed(0)}
+- Average ROAS: ${parseFloat(ads.avg_roas).toFixed(2)}x
+- Total impressions: ${parseInt(ads.total_impressions).toLocaleString()}
+- Connected platforms: ${platforms || 'not specified'}
+${customContext ? `\nAdditional context from the user: ${customContext}` : ''}
+    `.trim();
+
+    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} unique, high-quality social media post(s) for ${platform}.
+
+TOPIC: ${topicGuide[topic] || topic}
+TONE: ${toneGuide[tone] || tone}
+PLATFORM STYLE: ${platformGuide[platform]}
+
+${storeContext}
+
+IMPORTANT RULES:
+- Write in English
+- Each post must feel real, specific, and valuable — not generic
+- Use the store data naturally (don't just list numbers, tell a story)
+- The hook must stop the scroll — make it unexpected or counterintuitive
+- No corporate language. Write like a founder talking to other founders
+- CTA should be natural, not pushy
+
+Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown, no explanation, just JSON:
+[
+  {
+    "hook": "First line that stops the scroll (1-2 sentences max)",
+    "caption": "Main body of the post (3-6 sentences, use line breaks)",
+    "cta": "Call to action (1 sentence)",
+    "hashtags": ["hashtag1", "hashtag2", "hashtag3"]
+  }
+]`;
+
+    const response = await anthropic.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      messages:   [{ role: 'user', content: prompt }],
+    });
+
+    const text  = response.content[0].type === 'text' ? response.content[0].text : '[]';
+    const clean = text.replace(/```json|```/g, '').trim();
+
+    let posts;
+    try {
+      posts = JSON.parse(clean);
+      if (!Array.isArray(posts)) posts = [posts];
+    } catch {
+      posts = [];
+    }
+
+    // Credit bijhouden
+    try {
+      await db.query(
+        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
+         SELECT $1, f.id, date_trunc('month', now()),
+                (date_trunc('month', now()) + interval '1 month - 1 day')::date, $2
+         FROM features f WHERE f.slug = 'ai-recommendations'
+         ON CONFLICT (tenant_id, feature_id, period_start)
+         DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
+        [tenantId, count],
+        { allowNoTenant: true }
+      );
+    } catch {}
+
+    logger.info('ai.social-content.generated', { tenantId, platform, tone, topic, count });
+    res.json({ posts });
+
+  } catch (err) { next(err); }
+});
 export { router as aiRouter };
