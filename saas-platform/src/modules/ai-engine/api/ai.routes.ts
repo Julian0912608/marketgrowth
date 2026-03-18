@@ -359,4 +359,82 @@ Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown
 
   } catch (err) { next(err); }
 });
+// ── POST /api/ai/video-script ─────────────────────────────────
+// Alleen voor owner/admin — interne tool voor MarketGrow content
+router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = getTenantContext();
+
+    // Controleer of user owner is
+    const userResult = await db.query(
+      `SELECT role FROM users WHERE id = $1`,
+      [userId], { allowNoTenant: true }
+    );
+    if (userResult.rows[0]?.role !== 'owner') {
+      res.status(403).json({ error: 'Not authorized' });
+      return;
+    }
+
+    const { scenario, format, angle, index = 0, total = 1 } = req.body as {
+      scenario:  { store: string; revenue: string; adSpend: string; realRoas: string; metaRoas: string; googleRoas: string; bolRoas: string; insight: string; campaigns: number; topProduct: string; margin: string };
+      format:    { label: string; words: number };
+      angle:     { id: string; label: string };
+      index?:    number;
+      total?:    number;
+    };
+
+    const angleGuide: Record<string, string> = {
+      'problem-reveal': 'Open with the painful problem every ecommerce seller faces, build tension, then reveal how MarketGrow solves it.',
+      'data-story':     'Lead with ONE surprising specific number. Let the number do the work. Unpack the story behind it.',
+      'before-after':   'Paint the before picture (chaos, blind decisions, wasted spend) then the after (clarity, smart decisions, growth).',
+      'tip-listicle':   'Give exactly 3 specific, actionable tips. Each backed by a number. Fast paced. Numbered out loud.',
+      'founder-story':  'First-person voice. Tell the story of discovering this insight. Authentic, relatable, real.',
+    };
+
+    const prompt = `You are a viral video script writer for MarketGrow — an AI analytics platform for ecommerce entrepreneurs.
+
+Write ${total > 1 ? `script ${index + 1} of ${total} — make it COMPLETELY different from the others. ` : 'a '}${format.label} video script (${format.words} spoken words ±10%) using the "${angle.label}" angle.
+
+ANGLE: ${angleGuide[angle.id] ?? angle.label}
+
+DEMO DATA (present as real — never say "demo"):
+- Store: ${scenario.store}
+- Revenue: ${scenario.revenue}/month
+- Ad spend: ${scenario.adSpend}/month
+- Real blended ROAS: ${scenario.realRoas}
+- Meta claimed: ${scenario.metaRoas} | Google claimed: ${scenario.googleRoas} | Bol.com: ${scenario.bolRoas}
+- Key insight: ${scenario.insight}
+- Campaigns: ${scenario.campaigns} | Top product: ${scenario.topProduct} | Margin: ${scenario.margin}
+
+RULES:
+- Spoken English, natural — written to be read aloud
+- Hook stops scroll in 2 seconds — counterintuitive or shocking
+- Mention MarketGrow once naturally, end with: join the waitlist at marketgrow.ai
+- FACELESS video — no visual references to a speaker
+- Mark pauses with ...
+- NO corporate speak
+
+Return ONLY valid JSON (no markdown):
+{"hook":"opening hook - 2 seconds only","script":"full spoken script with ... pauses","visualNotes":["scene 1","scene 2","scene 3","scene 4","scene 5"],"hashtags":["tag1","tag2","tag3","tag4","tag5","tag6","tag7","tag8"]}`;
+
+    const response = await anthropic.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      messages:   [{ role: 'user', content: prompt }],
+    });
+
+    const text  = response.content[0].type === 'text' ? response.content[0].text : '{}';
+    const clean = text.replace(/```json|```/g, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(clean);
+    } catch {
+      const match = clean.match(/\{[\s\S]*\}/);
+      parsed = match ? JSON.parse(match[0]) : { hook: '', script: text, visualNotes: [], hashtags: [] };
+    }
+
+    res.json(parsed);
+  } catch (err) { next(err); }
+});
 export { router as aiRouter };
