@@ -1,24 +1,16 @@
-// ============================================================
-// src/modules/integrations/workers/sync.scheduler.ts
-//
-// Periodieke sync scheduler.
-// Elke 15 minuten: zet incremental sync jobs in de queue
-// voor alle actieve integraties die toe zijn aan sync.
-//
-// Dit is een aparte process naast de API server.
-// Gebruik: node -r ts-node/register src/modules/integrations/workers/sync.scheduler.ts
-// In productie: gebruik een cron job of Kubernetes CronJob
-// ============================================================
+// saas-platform/src/modules/integrations/workers/sync.scheduler.ts
 
-import { db }       from '../../../infrastructure/database/connection';
-import { logger }   from '../../../shared/logging/logger';
+import { db }        from '../../../infrastructure/database/connection';
+import { logger }    from '../../../shared/logging/logger';
 import { syncQueue } from './sync.worker';
-import { PlatformSlug } from '../types/integration.types';
-import crypto from 'crypto';
+import { syncBolcomAdvertisingData } from '../connectors/bolcom-advertising.connector';
+import { PlatformSlug, IntegrationCredentials } from '../types/integration.types';
 
 const SCHEDULER_INTERVAL_MS = 15 * 60 * 1000; // 15 minuten
-const BATCH_SIZE = 100; // Verwerk 100 integraties per ronde
+const ADV_INTERVAL_MS       = 60 * 60 * 1000; // 1 uur voor advertising
+const BATCH_SIZE             = 100;
 
+// ── Reguliere order/product sync ─────────────────────────────
 async function scheduleIncrementalSyncs(): Promise<void> {
   const startTime = Date.now();
   let offset = 0;
@@ -26,13 +18,13 @@ async function scheduleIncrementalSyncs(): Promise<void> {
 
   logger.info('scheduler.run.start', { timestamp: new Date().toISOString() });
 
-  // Pagineer door alle actieve integraties die een sync nodig hebben
   while (true) {
     const rows = await db.query(
       `SELECT ti.id, ti.tenant_id, ti.platform_slug
        FROM tenant_integrations ti
        JOIN tenant_subscriptions ts ON ts.tenant_id = ti.tenant_id
        WHERE ti.status = 'active'
+         AND ti.platform_slug != 'bolcom_ads'
          AND (ti.next_sync_at IS NULL OR ti.next_sync_at <= now())
          AND ts.status IN ('active', 'trialing')
        ORDER BY ti.next_sync_at ASC NULLS FIRST
@@ -45,7 +37,6 @@ async function scheduleIncrementalSyncs(): Promise<void> {
 
     for (const row of rows.rows) {
       try {
-        // Sync job in database registreren
         const dbResult = await db.query(
           `INSERT INTO integration_sync_jobs (integration_id, tenant_id, job_type, status)
            VALUES ($1, $2, 'incremental', 'queued')
@@ -55,8 +46,7 @@ async function scheduleIncrementalSyncs(): Promise<void> {
         );
         const syncJobDbId = dbResult.rows[0].id;
 
-        // Job in queue plaatsen
-        const job = await syncQueue.add(
+        await syncQueue.add(
           `${row.platform_slug}:incremental`,
           {
             integrationId: row.id,
@@ -68,12 +58,10 @@ async function scheduleIncrementalSyncs(): Promise<void> {
           {
             attempts: 3,
             backoff: { type: 'exponential', delay: 10_000 },
-            // Voorkomen dat dezelfde integratie dubbel in de queue zit
             jobId: `incremental:${row.id}:${Math.floor(Date.now() / SCHEDULER_INTERVAL_MS)}`,
           }
         );
 
-        // next_sync_at bijwerken zodat deze niet opnieuw gepakt wordt
         await db.query(
           `UPDATE tenant_integrations
            SET next_sync_at = now() + INTERVAL '15 minutes'
@@ -86,35 +74,122 @@ async function scheduleIncrementalSyncs(): Promise<void> {
       } catch (err) {
         logger.error('scheduler.job.error', {
           integrationId: row.id,
-          tenantId: row.tenant_id,
-          error: (err as Error).message,
+          tenantId:      row.tenant_id,
+          error:         (err as Error).message,
         });
       }
     }
 
     offset += BATCH_SIZE;
-
-    // Kleine pauze tussen batches om database niet te overbelasten
     if (rows.rows.length === BATCH_SIZE) {
       await new Promise(r => setTimeout(r, 100));
     }
   }
 
-  const duration = Date.now() - startTime;
   logger.info('scheduler.run.complete', {
     totalScheduled,
-    durationMs: duration,
+    durationMs: Date.now() - startTime,
   });
 }
 
+// ── Advertising sync (bolcom_ads) — elk uur ───────────────────
+async function scheduleAdvertisingSync(): Promise<void> {
+  logger.info('scheduler.advertising.start', { timestamp: new Date().toISOString() });
+
+  let totalSynced = 0;
+
+  try {
+    // Haal alle actieve bolcom_ads integraties op voor tenants met actief abonnement
+    const rows = await db.query(
+      `SELECT ti.id AS integration_id, ti.tenant_id,
+              ic.api_key, ic.api_secret
+       FROM tenant_integrations ti
+       JOIN integration_credentials ic ON ic.integration_id = ti.id
+       JOIN tenant_subscriptions ts    ON ts.tenant_id = ti.tenant_id
+       WHERE ti.platform_slug = 'bolcom_ads'
+         AND ti.status = 'active'
+         AND ts.status IN ('active', 'trialing')
+         AND (ti.next_sync_at IS NULL OR ti.next_sync_at <= now())
+       ORDER BY ti.next_sync_at ASC NULLS FIRST
+       LIMIT $1`,
+      [BATCH_SIZE],
+      { allowNoTenant: true }
+    );
+
+    for (const row of rows.rows) {
+      try {
+        // Token ophalen
+        const encoded  = Buffer.from(`${row.api_key}:${row.api_secret}`).toString('base64');
+        const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
+          method:  'POST',
+          headers: {
+            'Authorization': `Basic ${encoded}`,
+            'Content-Type':  'application/x-www-form-urlencoded',
+          },
+        });
+
+        if (!tokenRes.ok) {
+          logger.warn('scheduler.advertising.token_failed', {
+            integrationId: row.integration_id,
+            tenantId:      row.tenant_id,
+            status:        tokenRes.status,
+          });
+          continue;
+        }
+
+        const { access_token } = await tokenRes.json() as { access_token: string };
+
+        const creds: IntegrationCredentials = {
+          integrationId: row.integration_id,
+          platform:      'bolcom',
+          apiKey:        row.api_key,
+          apiSecret:     row.api_secret,
+        };
+
+        const result = await syncBolcomAdvertisingData(creds, row.tenant_id, access_token);
+
+        // next_sync_at bijwerken naar over 1 uur
+        await db.query(
+          `UPDATE tenant_integrations
+           SET next_sync_at = now() + INTERVAL '1 hour',
+               last_sync_at = now(),
+               updated_at   = now()
+           WHERE id = $1`,
+          [row.integration_id],
+          { allowNoTenant: true }
+        );
+
+        if (result.hasAccess) totalSynced++;
+
+        logger.info('scheduler.advertising.synced', {
+          tenantId:      row.tenant_id,
+          integrationId: row.integration_id,
+          hasAccess:     result.hasAccess,
+          campaigns:     result.campaignCount,
+        });
+
+      } catch (err) {
+        logger.error('scheduler.advertising.error', {
+          integrationId: row.integration_id,
+          tenantId:      row.tenant_id,
+          error:         (err as Error).message,
+        });
+      }
+    }
+  } catch (err) {
+    logger.error('scheduler.advertising.fatal', { error: (err as Error).message });
+  }
+
+  logger.info('scheduler.advertising.complete', { totalSynced });
+}
+
 // ── Stale job cleanup ─────────────────────────────────────────
-// Jobs die al langer dan 30 minuten 'running' zijn zijn waarschijnlijk crasht
 async function cleanupStaleJobs(): Promise<void> {
   const result = await db.query(
     `UPDATE integration_sync_jobs
-     SET status = 'failed',
+     SET status        = 'failed',
          error_message = 'Job timeout — automatisch hersteld door scheduler',
-         completed_at = now()
+         completed_at  = now()
      WHERE status = 'running'
        AND started_at < now() - INTERVAL '30 minutes'
      RETURNING id, integration_id`,
@@ -124,12 +199,10 @@ async function cleanupStaleJobs(): Promise<void> {
 
   if (result.rows.length > 0) {
     logger.warn('scheduler.stale_jobs.cleaned', { count: result.rows.length });
-
-    // Zet de bijbehorende integraties terug op 'active' zodat ze opnieuw geprobeerd worden
     for (const row of result.rows) {
       await db.query(
         `UPDATE tenant_integrations
-         SET status = CASE WHEN error_count >= 5 THEN 'error' ELSE 'active' END,
+         SET status     = CASE WHEN error_count >= 5 THEN 'error' ELSE 'active' END,
              updated_at = now()
          WHERE id = $1`,
         [row.integration_id],
@@ -142,19 +215,26 @@ async function cleanupStaleJobs(): Promise<void> {
 // ── Hoofdloop ─────────────────────────────────────────────────
 async function main(): Promise<void> {
   logger.info('sync.scheduler.started', {
-    intervalMinutes: SCHEDULER_INTERVAL_MS / 60_000,
-    batchSize: BATCH_SIZE,
+    intervalMinutes:    SCHEDULER_INTERVAL_MS / 60_000,
+    advIntervalMinutes: ADV_INTERVAL_MS / 60_000,
+    batchSize:          BATCH_SIZE,
   });
 
   // Direct uitvoeren bij opstarten
   await scheduleIncrementalSyncs();
+  await scheduleAdvertisingSync();
   await cleanupStaleJobs();
 
-  // Dan elke 15 minuten
+  // Reguliere sync: elke 15 minuten
   setInterval(async () => {
     await scheduleIncrementalSyncs();
     await cleanupStaleJobs();
   }, SCHEDULER_INTERVAL_MS);
+
+  // Advertising sync: elk uur
+  setInterval(async () => {
+    await scheduleAdvertisingSync();
+  }, ADV_INTERVAL_MS);
 }
 
 main().catch(err => {
