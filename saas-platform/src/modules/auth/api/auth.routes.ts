@@ -113,7 +113,6 @@ router.post('/login', rateLimitAuth, async (req: Request, res: Response, next: N
 });
 
 // ── POST /api/auth/refresh ───────────────────────────────────
-// FIX: was authService.refreshToken() — methode heet refreshAccessToken()
 router.post('/refresh', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const refreshToken = req.cookies?.refreshToken;
@@ -121,9 +120,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       res.status(401).json({ error: 'Geen actieve sessie gevonden.' });
       return;
     }
-
     const result = await authService.refreshAccessToken(refreshToken);
-
     res.json({ accessToken: result.accessToken, expiresIn: 900 });
   } catch (err) { next(err); }
 });
@@ -144,7 +141,6 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
 router.get('/me', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
-
     const result = await db.query<{
       id: string; email: string; first_name: string; last_name: string; role: string;
     }>(
@@ -152,12 +148,10 @@ router.get('/me', tenantMiddleware(), async (req: Request, res: Response, next: 
       [userId],
       { allowNoTenant: true }
     );
-
     if (!result.rows[0]) {
       res.status(404).json({ error: 'Gebruiker niet gevonden.' });
       return;
     }
-
     const u = result.rows[0];
     res.json({
       userId:    u.id,
@@ -240,47 +234,16 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
   try {
     const { email } = validate(ResetRequestSchema, req.body);
 
-    const result = await db.query<{ id: string }>(
-      `SELECT id FROM users WHERE email = $1`,
-      [email.toLowerCase()],
-      { allowNoTenant: true }
-    );
-
-    // Altijd success teruggeven — voorkomt user enumeration
-    if (result.rows[0]) {
-      const token = crypto.randomBytes(32).toString('hex');
-      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 uur
-
-      await db.query(
-        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, used)
-         VALUES ($1, $2, $3, false)`,
-        [result.rows[0].id, tokenHash, expiresAt],
-        { allowNoTenant: true }
-      );
-    }
-
-    res.json({ message: 'Als dit e-mailadres bekend is, ontvang je een reset-link.' });
-  } catch (err) { next(err); }
-});
-
-// ── POST /api/auth/password/reset-confirm ───────────────────
-
-router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { email } = validate(ResetRequestSchema, req.body);
-
     const result = await db.query<{ id: string; first_name: string }>(
       `SELECT id, first_name FROM users WHERE email = $1`,
       [email.toLowerCase()],
       { allowNoTenant: true }
     );
 
-    // Altijd success teruggeven — voorkomt user enumeration
     if (result.rows[0]) {
       const token     = crypto.randomBytes(32).toString('hex');
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 uur
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
       await db.query(
         `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, used)
@@ -290,7 +253,6 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
         { allowNoTenant: true }
       );
 
-      // Stuur reset email via Resend
       const appUrl    = process.env.APP_URL || 'https://marketgrow.ai';
       const resetUrl  = `${appUrl}/reset-password?token=${token}`;
       const firstName = result.rows[0].first_name || 'there';
@@ -302,13 +264,11 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
   <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
     <tr><td align="center">
       <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
-
         <tr>
           <td style="background:#0f172a;border-radius:16px 16px 0 0;padding:28px 36px;">
             <span style="color:#fff;font-size:18px;font-weight:800;">⚡ MarketGrow</span>
           </td>
         </tr>
-
         <tr>
           <td style="background:#1e293b;padding:32px 36px;">
             <h1 style="color:#fff;font-size:20px;margin:0 0 12px;">Reset your password</h1>
@@ -316,32 +276,25 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
               Hi ${firstName}, we received a request to reset your MarketGrow password.
               Click the button below to choose a new password.
             </p>
-            <a href="${resetUrl}"
-               style="display:inline-block;background:#4f46e5;color:#fff;font-weight:600;font-size:14px;padding:12px 28px;border-radius:10px;text-decoration:none;">
+            <a href="${resetUrl}" style="display:inline-block;background:#4f46e5;color:#fff;font-weight:600;font-size:14px;padding:12px 28px;border-radius:10px;text-decoration:none;">
               Reset password
             </a>
             <p style="color:#64748b;font-size:12px;margin:24px 0 0;line-height:1.6;">
-              This link expires in 1 hour. If you didn't request a password reset,
-              you can safely ignore this email.
+              This link expires in 1 hour. If you didn't request a password reset, you can safely ignore this email.
             </p>
           </td>
         </tr>
-
         <tr>
           <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:16px 36px;text-align:center;">
-            <p style="color:#475569;font-size:11px;margin:0;">
-              © ${new Date().getFullYear()} MarketGrow · marketgrow.ai
-            </p>
+            <p style="color:#475569;font-size:11px;margin:0;">© ${new Date().getFullYear()} MarketGrow · marketgrow.ai</p>
           </td>
         </tr>
-
       </table>
     </td></tr>
   </table>
 </body>
 </html>`;
 
-      // Verstuur via Resend — fire and forget (niet awaiten zodat response snel is)
       fetch('https://api.resend.com/emails', {
         method:  'POST',
         headers: {
@@ -355,7 +308,6 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
           html,
         }),
       }).catch(err => {
-        // Log maar laat de response niet mislukken
         console.error('Password reset email failed:', err.message);
       });
     }
@@ -363,3 +315,40 @@ router.post('/password/reset-request', rateLimitAuth, async (req: Request, res: 
     res.json({ message: 'Als dit e-mailadres bekend is, ontvang je een reset-link.' });
   } catch (err) { next(err); }
 });
+
+// ── POST /api/auth/password/reset-confirm ───────────────────
+router.post('/password/reset-confirm', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token, newPassword } = validate(ResetConfirmSchema, req.body);
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+    const result = await db.query<{ id: string; user_id: string; used: boolean; expires_at: Date }>(
+      `SELECT id, user_id, used, expires_at FROM password_reset_tokens WHERE token_hash = $1`,
+      [tokenHash],
+      { allowNoTenant: true }
+    );
+
+    const resetToken = result.rows[0];
+    if (!resetToken || resetToken.used || new Date(resetToken.expires_at) < new Date()) {
+      res.status(400).json({ error: 'Ongeldige of verlopen reset-link.' });
+      return;
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await db.query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      [newHash, resetToken.user_id],
+      { allowNoTenant: true }
+    );
+
+    await db.query(
+      `UPDATE password_reset_tokens SET used = true WHERE id = $1`,
+      [resetToken.id],
+      { allowNoTenant: true }
+    );
+
+    res.json({ message: 'Wachtwoord succesvol gewijzigd. Je kunt nu inloggen.' });
+  } catch (err) { next(err); }
+});
+
+export { router as authRouter };
