@@ -1,14 +1,12 @@
 // ============================================================
 // src/modules/analytics/api/analytics.routes.ts
-//
-// Fix: top-products krijgt nu ook period parameter.
 // ============================================================
 
-import { featureGate } from '../../../shared/middleware/feature-gate.middleware';
 import { Router, Request, Response, NextFunction } from 'express';
 import { db }               from '../../../infrastructure/database/connection';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
+import { featureGate }      from '../../../shared/middleware/feature-gate.middleware';
 
 export const analyticsRouter = Router();
 
@@ -27,9 +25,9 @@ analyticsRouter.get('/overview', async (req: Request, res: Response, next: NextF
 
     const current = await db.query(
       `SELECT
-         COUNT(*)::int                      AS orders_count,
-         COALESCE(SUM(total), 0)            AS revenue,
-         COALESCE(AVG(total), 0)            AS avg_order_value,
+         COUNT(*)::int                       AS orders_count,
+         COALESCE(SUM(total), 0)             AS revenue,
+         COALESCE(AVG(total), 0)             AS avg_order_value,
          COUNT(DISTINCT customer_email)::int AS unique_customers
        FROM unified_orders
        WHERE tenant_id = $1
@@ -129,7 +127,6 @@ analyticsRouter.get('/by-platform', async (req: Request, res: Response, next: Ne
 });
 
 // ── GET /api/analytics/top-products ────────────────────────────
-// FIX: period parameter toegevoegd — top products filtert nu op geselecteerde periode
 analyticsRouter.get('/top-products', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -187,142 +184,136 @@ analyticsRouter.get('/ads', async (req: Request, res: Response, next: NextFuncti
        ORDER BY spend DESC`,
       params
     );
-// ============================================================
-// Toevoegen aan: src/modules/analytics/api/analytics.routes.ts
-// Voeg dit blok toe na de bestaande routes, voor de export
-// ============================================================
 
-import { featureGate } from '../../../shared/middleware/feature-gate.middleware';
-
-// ── GET /api/analytics/export ───────────────────────────────────
-// Alleen beschikbaar voor Growth+ (report-export feature)
-// Exporteert orders als CSV of JSON
-analyticsRouter.get('/export',
-  featureGate('report-export'),
-  async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { tenantId } = getTenantContext();
-    const {
-      format   = 'csv',
-      period   = '30d',
-      platform,
-      type     = 'orders', // 'orders' | 'products' | 'ads'
-    } = req.query as {
-      format?:   string;
-      period?:   string;
-      platform?: string;
-      type?:     string;
-    };
-
-    const days  = period === '7d' ? 7 : period === '90d' ? 90 : period === '1y' ? 365 : 30;
-    const since = new Date(Date.now() - days * 86400000);
-    const params: any[] = [tenantId, since];
-    const platformFilter = platform ? ` AND o.platform_slug = $${params.push(platform)}` : '';
-
-    let rows: any[] = [];
-    let filename    = '';
-    let headers: string[] = [];
-
-    if (type === 'orders') {
-      const result = await db.query(
-        `SELECT
-           o.external_number         AS order_number,
-           o.platform_slug           AS platform,
-           o.ordered_at              AS date,
-           o.status,
-           o.financial_status,
-           o.total_amount            AS total,
-           o.subtotal_amount         AS subtotal,
-           o.tax_amount              AS tax,
-           o.shipping_amount         AS shipping,
-           o.discount_amount         AS discount,
-           o.currency
-         FROM orders o
-         WHERE o.tenant_id = $1
-           AND o.ordered_at >= $2
-           AND o.status NOT IN ('cancelled', 'refunded')
-           ${platformFilter}
-         ORDER BY o.ordered_at DESC
-         LIMIT 10000`,
-        params, { allowNoTenant: true }
-      );
-      rows     = result.rows;
-      filename = `orders-${period}-${new Date().toISOString().split('T')[0]}`;
-      headers  = ['order_number', 'platform', 'date', 'status', 'financial_status',
-                  'total', 'subtotal', 'tax', 'shipping', 'discount', 'currency'];
-
-    } else if (type === 'products') {
-      const result = await db.query(
-        `SELECT
-           oli.title                                AS product,
-           oli.sku,
-           o.platform_slug                          AS platform,
-           SUM(oli.quantity)::int                   AS total_sold,
-           ROUND(SUM(oli.total_price)::numeric, 2)  AS total_revenue,
-           ROUND(AVG(oli.unit_price)::numeric, 2)   AS avg_price
-         FROM order_line_items oli
-         JOIN orders o ON o.id = oli.order_id
-         WHERE oli.tenant_id = $1
-           AND o.ordered_at >= $2
-           AND o.status NOT IN ('cancelled', 'refunded')
-           ${platformFilter}
-         GROUP BY oli.title, oli.sku, o.platform_slug
-         ORDER BY total_revenue DESC
-         LIMIT 5000`,
-        params, { allowNoTenant: true }
-      );
-      rows     = result.rows;
-      filename = `products-${period}-${new Date().toISOString().split('T')[0]}`;
-      headers  = ['product', 'sku', 'platform', 'total_sold', 'total_revenue', 'avg_price'];
-
-    } else if (type === 'ads') {
-      const result = await db.query(
-        `SELECT
-           platform, name AS campaign, status,
-           ROUND(spend::numeric, 2)       AS spend,
-           impressions, clicks, conversions,
-           ROUND(revenue::numeric, 2)     AS revenue,
-           ROUND(roas::numeric, 2)        AS roas
-         FROM ad_campaigns
-         WHERE tenant_id = $1
-         ORDER BY spend DESC
-         LIMIT 1000`,
-        [tenantId], { allowNoTenant: true }
-      );
-      rows     = result.rows;
-      filename = `ads-${new Date().toISOString().split('T')[0]}`;
-      headers  = ['platform', 'campaign', 'status', 'spend', 'impressions',
-                  'clicks', 'conversions', 'revenue', 'roas'];
-    }
-
-    if (format === 'json') {
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}.json"`);
-      res.json({ exported_at: new Date().toISOString(), period, rows });
-      return;
-    }
-
-    // CSV output
-    const escape = (val: any): string => {
-      if (val === null || val === undefined) return '';
-      const str = String(val);
-      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-        return '"' + str.replace(/"/g, '""') + '"';
-      }
-      return str;
-    };
-
-    const csvLines = [
-      headers.join(','),
-      ...rows.map(row => headers.map(h => escape(row[h])).join(',')),
-    ];
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
-    res.send('\uFEFF' + csvLines.join('\n')); // BOM voor Excel compatibiliteit
-  } catch (err) { next(err); }
-});
-    
     res.json({ campaigns: result.rows });
   } catch (err) { next(err); }
 });
+
+// ── GET /api/analytics/export ───────────────────────────────────
+// Alleen beschikbaar voor Growth+ (report-export feature)
+analyticsRouter.get('/export',
+  featureGate('report-export'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { tenantId } = getTenantContext();
+      const {
+        format   = 'csv',
+        period   = '30d',
+        platform,
+        type     = 'orders',
+      } = req.query as {
+        format?:   string;
+        period?:   string;
+        platform?: string;
+        type?:     string;
+      };
+
+      const days  = period === '7d' ? 7 : period === '90d' ? 90 : period === '1y' ? 365 : 30;
+      const since = new Date(Date.now() - days * 86400000);
+      const params: any[] = [tenantId, since];
+      const platformFilter = platform ? ` AND o.platform_slug = $${params.push(platform)}` : '';
+
+      let rows: any[] = [];
+      let filename    = '';
+      let headers: string[] = [];
+
+      if (type === 'orders') {
+        const result = await db.query(
+          `SELECT
+             o.external_number  AS order_number,
+             o.platform_slug    AS platform,
+             o.ordered_at       AS date,
+             o.status,
+             o.financial_status,
+             o.total_amount     AS total,
+             o.subtotal_amount  AS subtotal,
+             o.tax_amount       AS tax,
+             o.shipping_amount  AS shipping,
+             o.discount_amount  AS discount,
+             o.currency
+           FROM orders o
+           WHERE o.tenant_id = $1
+             AND o.ordered_at >= $2
+             AND o.status NOT IN ('cancelled', 'refunded')
+             ${platformFilter}
+           ORDER BY o.ordered_at DESC
+           LIMIT 10000`,
+          params, { allowNoTenant: true }
+        );
+        rows     = result.rows;
+        filename = `orders-${period}-${new Date().toISOString().split('T')[0]}`;
+        headers  = ['order_number', 'platform', 'date', 'status', 'financial_status',
+                    'total', 'subtotal', 'tax', 'shipping', 'discount', 'currency'];
+
+      } else if (type === 'products') {
+        const result = await db.query(
+          `SELECT
+             oli.title                                AS product,
+             oli.sku,
+             o.platform_slug                          AS platform,
+             SUM(oli.quantity)::int                   AS total_sold,
+             ROUND(SUM(oli.total_price)::numeric, 2)  AS total_revenue,
+             ROUND(AVG(oli.unit_price)::numeric, 2)   AS avg_price
+           FROM order_line_items oli
+           JOIN orders o ON o.id = oli.order_id
+           WHERE oli.tenant_id = $1
+             AND o.ordered_at >= $2
+             AND o.status NOT IN ('cancelled', 'refunded')
+             ${platformFilter}
+           GROUP BY oli.title, oli.sku, o.platform_slug
+           ORDER BY total_revenue DESC
+           LIMIT 5000`,
+          params, { allowNoTenant: true }
+        );
+        rows     = result.rows;
+        filename = `products-${period}-${new Date().toISOString().split('T')[0]}`;
+        headers  = ['product', 'sku', 'platform', 'total_sold', 'total_revenue', 'avg_price'];
+
+      } else if (type === 'ads') {
+        const result = await db.query(
+          `SELECT
+             platform, name AS campaign, status,
+             ROUND(spend::numeric, 2)    AS spend,
+             impressions, clicks, conversions,
+             ROUND(revenue::numeric, 2)  AS revenue,
+             ROUND(roas::numeric, 2)     AS roas
+           FROM ad_campaigns
+           WHERE tenant_id = $1
+           ORDER BY spend DESC
+           LIMIT 1000`,
+          [tenantId], { allowNoTenant: true }
+        );
+        rows     = result.rows;
+        filename = `ads-${new Date().toISOString().split('T')[0]}`;
+        headers  = ['platform', 'campaign', 'status', 'spend', 'impressions',
+                    'clicks', 'conversions', 'revenue', 'roas'];
+      }
+
+      if (format === 'json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}.json"`);
+        res.json({ exported_at: new Date().toISOString(), period, rows });
+        return;
+      }
+
+      // CSV output
+      const escape = (val: any): string => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+      };
+
+      const csvLines = [
+        headers.join(','),
+        ...rows.map(row => headers.map(h => escape(row[h])).join(',')),
+      ];
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
+      res.send('\uFEFF' + csvLines.join('\n'));
+    } catch (err) { next(err); }
+  }
+);
