@@ -42,7 +42,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-admin-token'],
 }));
 
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
@@ -101,6 +101,14 @@ try {
   console.log('  aiRouter OK');
 } catch (e: any) {
   console.error('  aiRouter FAILED:', e.message);
+}
+
+try {
+  const { adminRouter } = require('./modules/admin/api/admin.routes');
+  app.use('/api/admin', adminRouter);
+  console.log('  adminRouter OK');
+} catch (e: any) {
+  console.error('  adminRouter FAILED:', e.message);
 }
 
 console.log('All routers loaded.');
