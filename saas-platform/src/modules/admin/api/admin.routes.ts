@@ -1,10 +1,5 @@
 // ============================================================
 // src/modules/admin/api/admin.routes.ts
-// Backend admin API — draait op Railway
-// Mount in app.ts: app.use('/api/admin', adminRouter)
-//
-// Beveiliging: alle routes controleren x-admin-token header
-// Stel in Railway env: ADMIN_SECRET=jouw-geheime-sleutel
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -21,6 +16,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
   apiVersion: '2023-10-16',
 });
 
+const PLAN_PRICE_IDS: Record<string, string> = {
+  starter: process.env.STRIPE_PRICE_STARTER ?? '',
+  growth:  process.env.STRIPE_PRICE_GROWTH  ?? '',
+  scale:   process.env.STRIPE_PRICE_SCALE   ?? '',
+};
+
 // ── Admin authenticatie middleware ────────────────────────────
 function adminAuth(req: Request, res: Response, next: NextFunction): void {
   const token = req.headers['x-admin-token'] || req.query.admin_token;
@@ -35,11 +36,9 @@ router.use(adminAuth);
 
 // ============================================================
 // GET /admin/kpis
-// KPI overzicht voor het dashboard
 // ============================================================
 router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // MRR per plan
     const mrrResult = await db.query<{
       plan_slug: string;
       tenant_count: string;
@@ -56,12 +55,6 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
       [], { allowNoTenant: true }
     );
 
-    const mrrByPlan: Record<string, number> = { starter: 0, growth: 0, scale: 0 };
-    let activeTenants  = 0;
-    let trialingTenants = 0;
-    let totalMRR       = 0;
-
-    // Actieve vs trialing aparte query
     const statusResult = await db.query<{ status: string; count: string }>(
       `SELECT status, COUNT(*) as count
        FROM tenant_subscriptions
@@ -69,6 +62,11 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
        GROUP BY status`,
       [], { allowNoTenant: true }
     );
+
+    const mrrByPlan: Record<string, number> = { starter: 0, growth: 0, scale: 0 };
+    let activeTenants   = 0;
+    let trialingTenants = 0;
+    let totalMRR        = 0;
 
     for (const row of statusResult.rows) {
       if (row.status === 'active')   activeTenants   = parseInt(row.count);
@@ -81,14 +79,12 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
       totalMRR += mrr;
     }
 
-    // Nieuwe klanten afgelopen 30 dagen
     const newResult = await db.query<{ count: string }>(
       `SELECT COUNT(*) as count FROM tenants
        WHERE created_at > now() - INTERVAL '30 days'`,
       [], { allowNoTenant: true }
     );
 
-    // Churn afgelopen 30 dagen
     const churnResult = await db.query<{ count: string }>(
       `SELECT COUNT(*) as count FROM tenant_subscriptions
        WHERE status = 'cancelled'
@@ -96,13 +92,11 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
       [], { allowNoTenant: true }
     );
 
-    // Past due
     const pastDueResult = await db.query<{ count: string }>(
       `SELECT COUNT(*) as count FROM tenant_subscriptions WHERE status = 'past_due'`,
       [], { allowNoTenant: true }
     );
 
-    // Trial conversie (trialing → active in 30d)
     const convResult = await db.query<{ converted: string; total: string }>(
       `SELECT
          COUNT(CASE WHEN status = 'active' AND created_at > now() - INTERVAL '30 days' THEN 1 END) AS converted,
@@ -117,7 +111,7 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
 
     res.json({
       mrr:              Math.round(totalMRR),
-      mrr_growth:       0, // TODO: vergelijk met vorige maand
+      mrr_growth:       0,
       active_tenants:   activeTenants,
       trialing_tenants: trialingTenants,
       past_due:         parseInt(pastDueResult.rows[0]?.count || '0'),
@@ -131,7 +125,6 @@ router.get('/kpis', async (req: Request, res: Response, next: NextFunction) => {
 
 // ============================================================
 // GET /admin/tenants
-// Alle tenants met subscription info
 // ============================================================
 router.get('/tenants', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -146,11 +139,13 @@ router.get('/tenants', async (req: Request, res: Response, next: NextFunction) =
          t.created_at,
          p.slug           AS plan_slug,
          ts.status        AS billing_status,
-         p.monthly_price_cents AS mrr_cents,
+         ts.stripe_sub_id,
+         COALESCE(p.monthly_price_cents, 0) AS mrr_cents,
          (SELECT COUNT(*) FROM tenant_integrations ti WHERE ti.tenant_id = t.id AND ti.status = 'active') AS integrations,
          COALESCE(fu.usage_count, 0) AS ai_credits_used,
          ul.limit_value              AS ai_credits_limit,
-        NULL::timestamptz AS last_active_at       FROM tenants t
+         NULL::timestamptz           AS last_active_at
+       FROM tenants t
        LEFT JOIN tenant_subscriptions ts ON ts.tenant_id = t.id
        LEFT JOIN plans p ON p.id = ts.plan_id
        LEFT JOIN feature_usage fu ON fu.tenant_id = t.id
@@ -170,7 +165,7 @@ router.get('/tenants', async (req: Request, res: Response, next: NextFunction) =
 
 // ============================================================
 // POST /admin/tenants/:id/change-plan
-// Plan handmatig wijzigen voor een klant
+// Wijzigt plan in DB + Stripe
 // ============================================================
 router.post('/tenants/:id/change-plan', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -182,6 +177,33 @@ router.post('/tenants/:id/change-plan', async (req: Request, res: Response, next
       return;
     }
 
+    const priceId = PLAN_PRICE_IDS[planSlug];
+
+    // Haal huidige Stripe subscription op
+    const subResult = await db.query<{ stripe_sub_id: string }>(
+      `SELECT stripe_sub_id FROM tenant_subscriptions
+       WHERE tenant_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+      [id], { allowNoTenant: true }
+    );
+
+    const stripeSubId = subResult.rows[0]?.stripe_sub_id;
+
+    // Update Stripe als er een actieve subscription is en een price ID beschikbaar
+    if (stripeSubId && priceId) {
+      try {
+        const subscription = await stripe.subscriptions.retrieve(stripeSubId);
+        await stripe.subscriptions.update(stripeSubId, {
+          items: [{ id: subscription.items.data[0].id, price: priceId }],
+          proration_behavior: 'create_prorations',
+        });
+        logger.info('admin.stripe.plan_changed', { tenantId: id, planSlug });
+      } catch (stripeErr: any) {
+        // Log maar stop niet — DB update gaat altijd door
+        logger.warn('admin.stripe.plan_change_failed', { tenantId: id, error: stripeErr.message });
+      }
+    }
+
+    // Update database
     await db.query(
       `UPDATE tenant_subscriptions
        SET plan_id = (SELECT id FROM plans WHERE slug = $2),
@@ -200,14 +222,42 @@ router.post('/tenants/:id/change-plan', async (req: Request, res: Response, next
 
 // ============================================================
 // POST /admin/tenants/:id/suspend
-// Account opschorten
+// Schorst account op in DB + annuleert Stripe subscription
 // ============================================================
 router.post('/tenants/:id/suspend', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
 
+    // Haal Stripe subscription op
+    const subResult = await db.query<{ stripe_sub_id: string }>(
+      `SELECT stripe_sub_id FROM tenant_subscriptions
+       WHERE tenant_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+      [id], { allowNoTenant: true }
+    );
+
+    const stripeSubId = subResult.rows[0]?.stripe_sub_id;
+
+    // Annuleer Stripe subscription direct (niet einde periode)
+    if (stripeSubId) {
+      try {
+        await stripe.subscriptions.cancel(stripeSubId);
+        logger.info('admin.stripe.subscription_cancelled', { tenantId: id });
+      } catch (stripeErr: any) {
+        logger.warn('admin.stripe.cancel_failed', { tenantId: id, error: stripeErr.message });
+      }
+    }
+
+    // Zet tenant op suspended
     await db.query(
       `UPDATE tenants SET status = 'suspended', updated_at = now() WHERE id = $1`,
+      [id], { allowNoTenant: true }
+    );
+
+    // Zet subscription op cancelled
+    await db.query(
+      `UPDATE tenant_subscriptions
+       SET status = 'cancelled', updated_at = now()
+       WHERE tenant_id = $1`,
       [id], { allowNoTenant: true }
     );
 
@@ -221,7 +271,6 @@ router.post('/tenants/:id/suspend', async (req: Request, res: Response, next: Ne
 
 // ============================================================
 // POST /admin/tenants/:id/reset-credits
-// AI credits voor deze maand resetten
 // ============================================================
 router.post('/tenants/:id/reset-credits', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -237,7 +286,6 @@ router.post('/tenants/:id/reset-credits', async (req: Request, res: Response, ne
       [id], { allowNoTenant: true }
     );
 
-    // Cache entry verwijderen zodat de credit check opnieuw berekend wordt
     const cacheKey = `usage:${id}:ai-recommendations`;
     await cache.del(cacheKey);
 
@@ -248,8 +296,6 @@ router.post('/tenants/:id/reset-credits', async (req: Request, res: Response, ne
 
 // ============================================================
 // POST /admin/tenants/:id/impersonate
-// Tijdelijk JWT aanmaken om in te loggen als klant
-// Token verloopt na 30 minuten
 // ============================================================
 router.post('/tenants/:id/impersonate', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -267,33 +313,23 @@ router.post('/tenants/:id/impersonate', async (req: Request, res: Response, next
     }
 
     const token = jwt.sign(
-      {
-        userId:       user.id,
-        tenantId:     user.tenant_id,
-        impersonated: true,       // vlag zodat je dit kan loggen/zien in de UI
-      },
+      { userId: user.id, tenantId: user.tenant_id, impersonated: true },
       process.env.JWT_SECRET!,
       { expiresIn: '30m' }
     );
 
-    const appUrl = process.env.APP_URL || 'https://marketgrowth-frontend.vercel.app';
-
+    const appUrl = process.env.APP_URL || 'https://marketgrow.ai';
     logger.warn('admin.tenant.impersonated', { adminAction: true, tenantId: id });
 
-    res.json({
-      token,
-      url: `${appUrl}/dashboard`,
-    });
+    res.json({ token, url: `${appUrl}/dashboard` });
   } catch (err) { next(err); }
 });
 
 // ============================================================
 // GET /admin/health/queue
-// BullMQ queue status
 // ============================================================
 router.get('/health/queue', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Haal queue dieptes op uit Redis (BullMQ slaat ze op als keys)
     const waiting   = await cache.get('bull:sync-jobs:waiting')   ?? '0';
     const active    = await cache.get('bull:sync-jobs:active')    ?? '0';
     const completed = await cache.get('bull:sync-jobs:completed') ?? '0';
@@ -305,7 +341,6 @@ router.get('/health/queue', async (req: Request, res: Response, next: NextFuncti
 
 // ============================================================
 // GET /admin/health/db
-// Database verbinding en query latency
 // ============================================================
 router.get('/health/db', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -316,11 +351,7 @@ router.get('/health/db', async (req: Request, res: Response, next: NextFunction)
     );
     const latency = Date.now() - start;
 
-    res.json({
-      status:  'ok',
-      latency_ms: latency,
-      tenants: result.rows[0].tenants,
-    });
+    res.json({ status: 'ok', latency_ms: latency, tenants: result.rows[0].tenants });
   } catch (err) {
     res.json({ status: 'error', error: String(err) });
   }
@@ -328,7 +359,6 @@ router.get('/health/db', async (req: Request, res: Response, next: NextFunction)
 
 // ============================================================
 // GET /admin/health/redis
-// Redis ping
 // ============================================================
 router.get('/health/redis', async (req: Request, res: Response, next: NextFunction) => {
   try {
