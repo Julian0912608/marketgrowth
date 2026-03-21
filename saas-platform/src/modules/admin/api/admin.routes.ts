@@ -150,8 +150,7 @@ router.get('/tenants', async (req: Request, res: Response, next: NextFunction) =
          (SELECT COUNT(*) FROM tenant_integrations ti WHERE ti.tenant_id = t.id AND ti.status = 'active') AS integrations,
          COALESCE(fu.usage_count, 0) AS ai_credits_used,
          ul.limit_value              AS ai_credits_limit,
-         (SELECT MAX(created_at) FROM sync_jobs sj WHERE sj.tenant_id = t.id) AS last_active_at
-       FROM tenants t
+        NULL::timestamptz AS last_active_at       FROM tenants t
        LEFT JOIN tenant_subscriptions ts ON ts.tenant_id = t.id
        LEFT JOIN plans p ON p.id = ts.plan_id
        LEFT JOIN feature_usage fu ON fu.tenant_id = t.id
