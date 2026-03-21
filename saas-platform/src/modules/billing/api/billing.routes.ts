@@ -1,9 +1,15 @@
+// ============================================================
+// src/modules/billing/api/billing.routes.ts
+// Wijziging: sendNewSignupNotification aangeroepen na checkout
+// ============================================================
+
 import { Router, Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import { db } from '../../../infrastructure/database/connection';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { logger } from '../../../shared/logging/logger';
+import { sendNewSignupNotification } from '../../notifications/admin.notifications.service';
 
 const router = Router();
 
@@ -35,9 +41,14 @@ router.post('/checkout', tenantMiddleware(), async (req: Request, res: Response,
       customer: existingCustomerId || undefined,
       customer_email: existingCustomerId ? undefined : email,
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${process.env.FRONTEND_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard?upgraded=true`,
-      cancel_url:  `${process.env.FRONTEND_URL || 'https://marketgrowth-frontend.vercel.app'}/onboarding`,
+      subscription_data: {
+        trial_period_days: 14,
+        metadata: { tenantId, planSlug },
+      },
+      success_url: `${process.env.FRONTEND_URL || 'https://marketgrow.ai'}/onboarding?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.FRONTEND_URL || 'https://marketgrow.ai'}/onboarding`,
       metadata: { tenantId, planSlug },
+      allow_promotion_codes: true,
     });
     res.json({ url: session.url });
   } catch (err) { next(err); }
@@ -59,14 +70,14 @@ router.post('/portal', tenantMiddleware(), async (req: Request, res: Response, n
     if (!customerId) { res.status(400).json({ error: 'Geen Stripe klant gevonden' }); return; }
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${process.env.FRONTEND_URL || 'https://marketgrowth-frontend.vercel.app'}/dashboard/settings`,
+      return_url: `${process.env.FRONTEND_URL || 'https://marketgrow.ai'}/settings`,
     });
     res.json({ url: session.url });
   } catch (err) { next(err); }
 });
 
 router.post('/webhook', async (req: Request, res: Response, next: NextFunction) => {
-  const sig = req.headers['stripe-signature'];
+  const sig    = req.headers['stripe-signature'];
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
   if (!sig || !secret) { res.status(400).json({ error: 'Webhook configuratie ontbreekt' }); return; }
 
@@ -80,6 +91,7 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
       const session  = event.data.object as Stripe.Checkout.Session;
       const tenantId = session.metadata?.tenantId;
       const planSlug = session.metadata?.planSlug;
+
       if (tenantId) {
         await db.query(
           `UPDATE tenants SET stripe_customer_id=$2, stripe_subscription_id=$3, plan_slug=$4, billing_status='active', updated_at=now() WHERE id=$1`,
@@ -87,6 +99,13 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
           { allowNoTenant: true }
         );
         logger.info('billing.webhook.checkout_completed', { tenantId, planSlug });
+
+        // ── Stuur signup notificatie naar hello@marketgrow.ai ──
+        if (planSlug) {
+          sendNewSignupNotification(tenantId, planSlug).catch(err => {
+            logger.error('billing.webhook.signup_notification_failed', { error: err.message });
+          });
+        }
       }
     }
     res.json({ received: true });
