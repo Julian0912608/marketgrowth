@@ -1,15 +1,13 @@
 // ============================================================
-// saas-platform/src/modules/notifications/email.worker.ts
-//
-// BullMQ worker + scheduled job voor dagelijkse briefing emails
-// Voeg dit toe aan src/index.ts na de andere workers
+// src/modules/notifications/email.worker.ts
+// Wijziging: dagelijkse admin update om 18:00 toegevoegd
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
 import { logger }             from '../../shared/logging/logger';
 import { sendDailyBriefings } from './email.service';
+import { sendDailyAdminUpdate } from './admin.notifications.service';
 
-// Gebruik dezelfde Redis connectie als de sync worker
 function buildConnection() {
   const url = process.env.REDIS_URL;
   const IORedis = require('ioredis');
@@ -36,23 +34,20 @@ function buildConnection() {
 
 const emailConnection = buildConnection();
 
-// ── Queue ──────────────────────────────────────────────────────
 export const emailQueue = new Queue('email-notifications', {
   connection: emailConnection,
 });
 
-// ── Scheduled job: elke dag om 7:00 Amsterdam tijd ────────────
 export async function scheduleEmailJobs(): Promise<void> {
   // Verwijder bestaande repeatable jobs om duplicaten te voorkomen
   const repeatable = await emailQueue.getRepeatableJobs();
   for (const job of repeatable) {
-    if (job.name === 'daily-briefing') {
+    if (job.name === 'daily-briefing' || job.name === 'admin-daily-update') {
       await emailQueue.removeRepeatableByKey(job.key);
     }
   }
 
-  // Plan dagelijkse briefing om 7:00 Amsterdam tijd (UTC+1/+2)
-  // Cron: 0 6 * * * = elke dag om 06:00 UTC = 07:00 CET / 08:00 CEST
+  // Klant briefing: elke dag om 07:00 Amsterdam (06:00 UTC)
   await emailQueue.add(
     'daily-briefing',
     { type: 'daily_briefing' },
@@ -62,10 +57,24 @@ export async function scheduleEmailJobs(): Promise<void> {
     }
   );
 
-  logger.info('email.scheduler.registered', { cron: '0 6 * * * (UTC) = 07:00 Amsterdam' });
+  // Admin dagelijkse update: elke dag om 18:00 Amsterdam (17:00 UTC)
+  await emailQueue.add(
+    'admin-daily-update',
+    { type: 'admin_daily_update' },
+    {
+      repeat: { pattern: '0 17 * * *' } as any,
+      jobId:  'admin-daily-update-scheduled',
+    }
+  );
+
+  logger.info('email.scheduler.registered', {
+    jobs: [
+      '0 6 * * * (UTC) = 07:00 Amsterdam — klant briefings',
+      '0 17 * * * (UTC) = 18:00 Amsterdam — admin update',
+    ],
+  });
 }
 
-// ── Worker ─────────────────────────────────────────────────────
 export const emailWorker = new Worker(
   'email-notifications',
   async (job: Job) => {
@@ -73,6 +82,10 @@ export const emailWorker = new Worker(
 
     if (job.name === 'daily-briefing') {
       await sendDailyBriefings();
+    }
+
+    if (job.name === 'admin-daily-update') {
+      await sendDailyAdminUpdate();
     }
 
     logger.info('email.job.complete', { jobName: job.name });
