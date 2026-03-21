@@ -4,6 +4,7 @@
 // Fix: top-products krijgt nu ook period parameter.
 // ============================================================
 
+import { featureGate } from '../../../shared/middleware/feature-gate.middleware';
 import { Router, Request, Response, NextFunction } from 'express';
 import { db }               from '../../../infrastructure/database/connection';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
