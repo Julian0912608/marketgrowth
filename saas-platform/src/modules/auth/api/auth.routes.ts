@@ -350,5 +350,16 @@ router.post('/password/reset-confirm', async (req: Request, res: Response, next:
     res.json({ message: 'Wachtwoord succesvol gewijzigd. Je kunt nu inloggen.' });
   } catch (err) { next(err); }
 });
-
+// ── DELETE /api/auth/account ─────────────────────────────────
+router.delete('/account', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+    await db.query(
+      `DELETE FROM tenants WHERE id = $1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
 export { router as authRouter };
