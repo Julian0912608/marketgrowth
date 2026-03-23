@@ -31,6 +31,7 @@ const PLATFORM_NAMES: Record<PlatformSlug, string> = {
   magento:     'Magento',
   amazon:      'Amazon',
   etsy:        'Etsy',
+  google_ads: 'Google Ads',
 };
 
 const OAUTH_PLATFORMS: PlatformSlug[] = ['shopify', 'amazon', 'etsy'];
