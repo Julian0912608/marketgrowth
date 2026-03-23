@@ -80,8 +80,73 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
   } catch (err) { next(err); }
 });
 
+// ── GET /api/integrations/callback/google-ads ────────────────
+// LET OP: staat VOOR /callback/:platform — anders vangt Express google-ads als :platform
+router.get('/callback/google-ads', async (req: Request, res: Response) => {
+  const { code, state, error } = req.query as { code?: string; state?: string; error?: string };
+  const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
+
+  logger.info('google.ads.callback.received', { hasCode: !!code, hasState: !!state, error });
+
+  if (error || !code || !state) {
+    return res.redirect(`${frontendUrl}/dashboard/integrations?error=google_auth_failed`);
+  }
+
+  try {
+    const { tenantId } = JSON.parse(Buffer.from(state, 'base64').toString());
+
+    logger.info('google.ads.callback.processing', { tenantId });
+
+    const { accessToken, refreshToken, expiresAt } = await exchangeGoogleCode(code);
+
+    const integrationId = uuidv4();
+    await db.query(
+      `INSERT INTO tenant_integrations
+         (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
+       VALUES ($1, $2, 'google_ads', NULL, 'Google Ads', 'active', now(), now())
+       ON CONFLICT (tenant_id, platform_slug, shop_domain)
+       DO UPDATE SET status = 'active', shop_name = 'Google Ads', updated_at = now()`,
+      [integrationId, tenantId],
+      { allowNoTenant: true }
+    );
+
+    const existing = await db.query(
+      `SELECT id FROM tenant_integrations WHERE tenant_id = $1 AND platform_slug = 'google_ads' LIMIT 1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
+    const actualId = existing.rows[0]?.id || integrationId;
+
+    await db.query(
+      `INSERT INTO integration_credentials
+         (integration_id, access_token, refresh_token, token_expires_at, updated_at)
+       VALUES ($1, $2, $3, $4, now())
+       ON CONFLICT (integration_id)
+       DO UPDATE SET
+         access_token     = EXCLUDED.access_token,
+         refresh_token    = EXCLUDED.refresh_token,
+         token_expires_at = EXCLUDED.token_expires_at,
+         updated_at       = now()`,
+      [actualId, accessToken, refreshToken, expiresAt],
+      { allowNoTenant: true }
+    );
+
+    logger.info('google.ads.callback.saved', { tenantId, integrationId: actualId });
+
+    // Start sync op achtergrond
+    syncGoogleAdsData(tenantId, actualId, accessToken).catch(err =>
+      logger.error('google.ads.initial_sync.failed', { tenantId, error: (err as Error).message })
+    );
+
+    res.redirect(`${frontendUrl}/dashboard/integrations?connected=${actualId}`);
+  } catch (err: any) {
+    logger.error('google.ads.callback.error', { error: err.message });
+    res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
 // ── GET /api/integrations/callback/:platform ─────────────────
-// LET OP: google-ads callback wordt apart afgehandeld hieronder
+// LET OP: staat NA /callback/google-ads
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const platform        = req.params.platform as PlatformSlug;
@@ -102,7 +167,6 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 });
 
 // ── POST /api/integrations/advertising/bolcom/connect ────────
-// LET OP: staat VOOR /:id/* routes zodat Express 'advertising' niet als :id pakt
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -113,7 +177,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       return;
     }
 
-    // Test verbinding door token op te halen
     const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
     const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method: 'POST',
@@ -129,8 +192,7 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
     }
 
     const { access_token } = await tokenRes.json() as { access_token: string };
-
-    const integrationId = uuidv4();
+    const integrationId    = uuidv4();
 
     await db.query(
       `INSERT INTO tenant_integrations
@@ -224,19 +286,13 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
 
     const statsResult = await db.query(
       `SELECT COUNT(*)::int AS campaigns, COALESCE(SUM(spend), 0) AS total_spend
-       FROM ad_campaigns
-       WHERE tenant_id = $1 AND integration_id = $2`,
+       FROM ad_campaigns WHERE tenant_id = $1 AND integration_id = $2`,
       [tenantId, integrationId],
       { allowNoTenant: true }
     );
 
     const stats = statsResult.rows[0];
-
-    res.json({
-      success:    true,
-      campaigns:  stats.campaigns   ?? 0,
-      totalSpend: stats.total_spend ?? 0,
-    });
+    res.json({ success: true, campaigns: stats.campaigns ?? 0, totalSpend: stats.total_spend ?? 0 });
   } catch (err) { next(err); }
 });
 
@@ -248,65 +304,6 @@ router.get('/advertising/google/connect', async (req: Request, res: Response, ne
     const authUrl = buildGoogleAuthUrl(state);
     res.json({ authUrl });
   } catch (err) { next(err); }
-});
-
-// ── GET /api/integrations/callback/google-ads ────────────────
-// LET OP: geen tenantMiddleware — Google stuurt gebruiker hierheen zonder JWT
-router.get('/callback/google-ads', async (req: Request, res: Response) => {
-  const { code, state, error } = req.query as { code?: string; state?: string; error?: string };
-  const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
-
-  if (error || !code || !state) {
-    return res.redirect(`${frontendUrl}/dashboard/integrations?error=google_auth_failed`);
-  }
-
-  try {
-    const { tenantId } = JSON.parse(Buffer.from(state, 'base64').toString());
-
-    const { accessToken, refreshToken, expiresAt } = await exchangeGoogleCode(code);
-
-    const integrationId = uuidv4();
-    await db.query(
-      `INSERT INTO tenant_integrations
-         (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
-       VALUES ($1, $2, 'google_ads', NULL, 'Google Ads', 'active', now(), now())
-       ON CONFLICT (tenant_id, platform_slug, shop_domain)
-       DO UPDATE SET status = 'active', shop_name = 'Google Ads', updated_at = now()`,
-      [integrationId, tenantId],
-      { allowNoTenant: true }
-    );
-
-    const existing = await db.query(
-      `SELECT id FROM tenant_integrations WHERE tenant_id = $1 AND platform_slug = 'google_ads' LIMIT 1`,
-      [tenantId],
-      { allowNoTenant: true }
-    );
-    const actualId = existing.rows[0]?.id || integrationId;
-
-    await db.query(
-      `INSERT INTO integration_credentials
-         (integration_id, access_token, refresh_token, token_expires_at, updated_at)
-       VALUES ($1, $2, $3, $4, now())
-       ON CONFLICT (integration_id)
-       DO UPDATE SET
-         access_token     = EXCLUDED.access_token,
-         refresh_token    = EXCLUDED.refresh_token,
-         token_expires_at = EXCLUDED.token_expires_at,
-         updated_at       = now()`,
-      [actualId, accessToken, refreshToken, expiresAt],
-      { allowNoTenant: true }
-    );
-
-    // Start directe sync op de achtergrond
-    syncGoogleAdsData(tenantId, actualId, accessToken).catch(err =>
-      logger.error('google.ads.initial_sync.failed', { tenantId, error: (err as Error).message })
-    );
-
-    res.redirect(`${frontendUrl}/dashboard/integrations?connected=${actualId}`);
-  } catch (err: any) {
-    logger.error('google.ads.callback.error', { error: err.message });
-    res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent(err.message)}`);
-  }
 });
 
 // ── POST /api/integrations/advertising/google/sync ───────────
@@ -331,7 +328,6 @@ router.post('/advertising/google/sync', async (req: Request, res: Response, next
 
     let { id: integrationId, access_token: accessToken, refresh_token: refreshToken, token_expires_at: tokenExpiresAt } = result.rows[0];
 
-    // Token verversen als verlopen
     if (tokenExpiresAt && new Date(tokenExpiresAt) < new Date()) {
       const refreshed = await refreshGoogleToken(refreshToken);
       accessToken = refreshed.accessToken;
@@ -345,11 +341,7 @@ router.post('/advertising/google/sync', async (req: Request, res: Response, next
     }
 
     const syncResult = await syncGoogleAdsData(tenantId, integrationId, accessToken);
-
-    res.json({
-      success:       true,
-      campaignCount: syncResult.campaignCount,
-    });
+    res.json({ success: true, campaignCount: syncResult.campaignCount });
   } catch (err) { next(err); }
 });
 
