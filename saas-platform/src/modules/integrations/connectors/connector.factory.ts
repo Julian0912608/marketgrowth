@@ -17,10 +17,12 @@ const connectorMap: Record<PlatformSlug, () => IPlatformConnector> = {
   magento:     () => new WooCommerceConnector(), // WooCommerce-compatibele REST API
   amazon:      () => new AmazonConnector(),
   etsy:        () => new EtsyConnector(),
+  google_ads: () => { throw new Error('Google Ads gebruikt geen connector'); },
 };
 
 export function getConnector(platform: PlatformSlug): IPlatformConnector {
   const factory = connectorMap[platform];
   if (!factory) throw new Error(`Onbekend platform: ${platform}`);
   return factory();
+  google_ads: () => { throw new Error('Google Ads gebruikt geen connector'); },
 }
