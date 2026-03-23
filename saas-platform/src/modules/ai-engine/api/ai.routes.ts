@@ -4,6 +4,7 @@ import { db } from '../../../infrastructure/database/connection';
 import { cache } from '../../../infrastructure/cache/redis';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
+import { generateAdCreative, generateCarouselSlides } from '../services/nano-banana.service';
 import { logger } from '../../../shared/logging/logger';
 
 const router = Router();
