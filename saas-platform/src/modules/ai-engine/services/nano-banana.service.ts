@@ -143,7 +143,6 @@ export async function generateAdCreative(req: AdCreativeRequest): Promise<Genera
     }],
     generationConfig: {
       responseModalities: ['IMAGE', 'TEXT'],
-      responseMimeType:   'image/jpeg',
     },
   };
 
