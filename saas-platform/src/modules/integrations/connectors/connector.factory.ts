@@ -24,5 +24,4 @@ export function getConnector(platform: PlatformSlug): IPlatformConnector {
   const factory = connectorMap[platform];
   if (!factory) throw new Error(`Onbekend platform: ${platform}`);
   return factory();
-  google_ads: () => { throw new Error('Google Ads gebruikt geen connector'); },
 }
