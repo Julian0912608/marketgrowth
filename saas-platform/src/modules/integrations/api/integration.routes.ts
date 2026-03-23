@@ -7,6 +7,7 @@ import { tenantMiddleware }                         from '../../../shared/middle
 import { getTenantContext }                         from '../../../shared/middleware/tenant-context';
 import { db }                                       from '../../../infrastructure/database/connection';
 import { PlatformSlug, IntegrationCredentials }     from '../types/integration.types';
+import { buildGoogleAuthUrl, exchangeGoogleCode, syncGoogleAdsData } from '../connectors/google-ads.connector';
 import { syncBolcomAdvertisingData }                from '../connectors/bolcom-advertising.connector';
 
 const router             = Router();
