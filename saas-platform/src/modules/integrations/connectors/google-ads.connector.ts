@@ -29,8 +29,8 @@ const AUTH_URL        = 'https://accounts.google.com/o/oauth2/v2/auth';
 const CLIENT_ID       = () => process.env.GOOGLE_ADS_CLIENT_ID       ?? '';
 const CLIENT_SECRET   = () => process.env.GOOGLE_ADS_CLIENT_SECRET   ?? '';
 const DEVELOPER_TOKEN = () => process.env.GOOGLE_ADS_DEVELOPER_TOKEN ?? '';
-const REDIRECT_URI    = () => `${process.env.APP_URL || 'https://marketgrow.ai'}/api/integrations/callback/google-ads`;
-
+const REDIRECT_URI    = () => process.env.GOOGLE_OAUTH_REDIRECT_URI 
+  ?? 'https://marketgrowth-production.up.railway.app/api/integrations/callback/google-ads';
 // ── Types ─────────────────────────────────────────────────────
 
 interface GoogleAdsCampaign {
