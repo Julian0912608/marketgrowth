@@ -380,7 +380,7 @@ ${jsonSchema}`;
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 contents: [{ parts: [{ text: post.image_prompt }] }],
-                generationConfig: { responseModalities: ['IMAGE', 'TEXT'],
+                generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
               }),
             }
           );
