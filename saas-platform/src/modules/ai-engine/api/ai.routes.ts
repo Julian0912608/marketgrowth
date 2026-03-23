@@ -1,11 +1,15 @@
+// ============================================================
+// src/modules/ai-engine/api/ai.routes.ts
+// ============================================================
+
 import { Router, Request, Response, NextFunction } from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import { db } from '../../../infrastructure/database/connection';
-import { cache } from '../../../infrastructure/cache/redis';
+import { db }               from '../../../infrastructure/database/connection';
+import { cache }            from '../../../infrastructure/cache/redis';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
+import { logger }           from '../../../shared/logging/logger';
 import { generateAdCreative, generateCarouselSlides } from '../services/nano-banana.service';
-import { logger } from '../../../shared/logging/logger';
 
 const router = Router();
 router.use(tenantMiddleware());
@@ -18,18 +22,16 @@ const CACHE_TTL: Record<string, number> = {
   scale:   3600,
 };
 
-// ── GET /api/ai/insights ─────────────────────────────────────
+// ── GET /api/ai/insights ──────────────────────────────────────
 router.get('/insights', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
-    const force = req.query.force === 'true';
+    const force    = req.query.force === 'true';
     const cacheKey = 'ai:insights:' + tenantId;
 
     if (!force) {
       const cached = await cache.get(cacheKey);
-      if (cached) {
-        return res.json({ ...JSON.parse(cached), fromCache: true });
-      }
+      if (cached) return res.json({ ...JSON.parse(cached), fromCache: true });
     }
 
     const [ordersResult, productsResult, integrationsResult] = await Promise.all([
@@ -45,19 +47,14 @@ router.get('/insights', async (req: Request, res: Response, next: NextFunction) 
         [tenantId], { allowNoTenant: true }
       ),
       db.query(
-        `SELECT
-           oli.title,
-           ti.platform_slug,
-           SUM(oli.quantity)::int AS sold,
-           SUM(oli.total_price)   AS revenue
+        `SELECT oli.title, SUM(oli.quantity)::int AS sold, SUM(oli.total_price) AS revenue
          FROM order_line_items oli
          JOIN orders o ON o.id = oli.order_id
-         JOIN tenant_integrations ti ON ti.tenant_id = oli.tenant_id
          WHERE oli.tenant_id = $1
            AND o.ordered_at >= NOW() - INTERVAL '30 days'
            AND o.status NOT IN ('cancelled', 'refunded')
            AND oli.total_price > 0
-         GROUP BY oli.title, ti.platform_slug
+         GROUP BY oli.title
          ORDER BY revenue DESC
          LIMIT 5`,
         [tenantId], { allowNoTenant: true }
@@ -74,45 +71,30 @@ router.get('/insights', async (req: Request, res: Response, next: NextFunction) 
 
     if (integrations.length === 0) {
       return res.json({
-        briefing: 'Koppel je eerste winkel om AI-acties te ontvangen. Ga naar Integraties om Bol.com, Shopify of een ander platform te verbinden.',
-        actions:  [{ priority: 'high', title: 'Koppel je winkel', description: 'Ga naar de Integraties pagina om je eerste verkoopkanaal te verbinden.', channel: 'algemeen' }],
+        briefing: 'Connect your first store to start receiving AI insights. Go to Integrations to link Bol.com, Shopify or another platform.',
+        actions:  [{ priority: 'high', title: 'Connect your store', description: 'Go to Integrations and link your first platform.' }],
         alerts:   [],
         fromCache: false,
       });
     }
 
-    const platformNames = integrations.map((i: any) => i.platform_slug).join(', ');
-    const hasOrders     = parseInt(stats.total_orders) > 0;
+    const hasOrders = stats.total_orders > 0;
 
     const prompt = hasOrders
-      ? `Je bent de AI engine van MarketGrow — een ecommerce action platform.
-Je taak is NIET om te analyseren wat er is gebeurd. Je taak is om de ondernemer te vertellen wat hij vandaag moet doen, op welk kanaal, met welk product.
+      ? `You are an ecommerce AI analyst. Analyse the data below and give an actionable daily briefing.
 
-Verkoopdata van de afgelopen 30 dagen:
-- Totaal orders: ${stats.total_orders}
-- Omzet (excl. BTW): €${parseFloat(stats.revenue).toFixed(2)}
-- Gemiddelde orderwaarde: €${parseFloat(stats.avg_order_value).toFixed(2)}
-- Gekoppelde platforms: ${platformNames}
-- Top producten: ${topProducts.map((p: any) => p.title + ' (' + p.sold + 'x verkocht, €' + parseFloat(p.revenue).toFixed(2) + ' omzet, platform: ' + (p.platform_slug || 'onbekend') + ')').join(' | ')}
+DATA:
+- Orders (last 30 days): ${stats.total_orders}
+- Revenue (last 30 days): €${parseFloat(stats.revenue).toFixed(2)}
+- Avg order value: €${parseFloat(stats.avg_order_value).toFixed(2)}
+- Connected platforms: ${integrations.map((i: any) => i.platform_slug).join(', ')}
+- Top products: ${topProducts.map((p: any) => `${p.title} (${p.sold} sold, €${parseFloat(p.revenue).toFixed(0)})`).join(', ')}
 
-REGELS voor je output:
-1. Elke actie moet SPECIFIEK zijn: noem het product, het platform én het concrete getal
-2. Acties zijn altijd uitvoerbaar vandaag — geen vage adviezen
-3. Onderscheid per kanaal: als een product op Bol.com beter loopt dan Shopify, zeg dat expliciet
-4. High priority = doe dit vandaag. Medium = deze week. Low = overweeg dit
-5. Alerts zijn echte waarschuwingen: dalende trend, product dat stopt, ongewone dip
-
-Voorbeelden van GOEDE acties:
-- "Verhoog je dagbudget voor [product] op Bol.com met €30 — dit product converteert 4x beter dan je Shopify variant"
-- "Stop de advertenties voor [product] — ROAS is onder break-even gezakt"
-- "Zet [product] ook live op Bol.com — vergelijkbare producten doen het daar 60% beter"
-
-Geef een JSON response met exact deze structuur (geen markdown, alleen JSON):
-{"briefing":"2-3 zinnen met de meest opvallende beweging — specifiek, met cijfers","actions":[{"priority":"high","title":"Korte actietitel met platform/product","description":"Concrete uitleg: wat, op welk platform, waarom en met welk getal","channel":"bolcom"},{"priority":"medium","title":"...","description":"...","channel":"shopify"},{"priority":"low","title":"...","description":"...","channel":"algemeen"}],"alerts":["Concrete waarschuwing met cijfer of lege array"]}`
-      : `Je bent de AI engine van MarketGrow. De gebruiker heeft ${integrations.length} winkel(s) gekoppeld (${platformNames}) maar nog geen orders de afgelopen 30 dagen.
-
-Geef een motiverende maar concrete briefing als JSON (geen markdown, alleen JSON):
-{"briefing":"Geef aan dat de setup goed staat en wat ze kunnen verwachten zodra orders binnenkomen","actions":[{"priority":"high","title":"Wacht op eerste orders","description":"Je winkel is gekoppeld. Zodra de eerste orders binnenkomen analyseert MarketGrow je data en krijg je direct je eerste acties per kanaal.","channel":"algemeen"},{"priority":"medium","title":"Controleer sync status","description":"Ga naar Integraties en check of de laatste sync succesvol was — zo weet je zeker dat orders direct zichtbaar zijn.","channel":"algemeen"}],"alerts":[]}`;
+Return ONLY valid JSON (no markdown):
+{"briefing":"2-3 sentence summary of performance and key opportunity","actions":[{"priority":"high","title":"Action title","description":"Specific actionable recommendation"},{"priority":"medium","title":"Action title","description":"Specific actionable recommendation"},{"priority":"low","title":"Action title","description":"Specific actionable recommendation"}],"alerts":["Alert message if any issue detected"]}`
+      : `You are an ecommerce AI analyst. The store has no orders yet.
+Return ONLY valid JSON:
+{"briefing":"Encourage connecting store and explain what insights will appear once data flows in","actions":[{"priority":"high","title":"Sync your store data","description":"Trigger a full sync from Integrations to start seeing insights."},{"priority":"medium","title":"Check sync status","description":"Go to Integrations and verify the sync is active."}],"alerts":[]}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -134,11 +116,12 @@ Geef een motiverende maar concrete briefing als JSON (geen markdown, alleen JSON
 
     try {
       await db.query(
-        'INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count) ' +
-        "SELECT $1, f.id, date_trunc('month', now()), (date_trunc('month', now()) + interval '1 month - 1 day')::date, 1 " +
-        "FROM features f WHERE f.slug = 'ai-recommendations' " +
-        'ON CONFLICT (tenant_id, feature_id, period_start) ' +
-        'DO UPDATE SET usage_count = feature_usage.usage_count + 1, updated_at = now()',
+        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
+         SELECT $1, f.id, date_trunc('month', now()),
+                (date_trunc('month', now()) + interval '1 month - 1 day')::date, 1
+         FROM features f WHERE f.slug = 'ai-recommendations'
+         ON CONFLICT (tenant_id, feature_id, period_start)
+         DO UPDATE SET usage_count = feature_usage.usage_count + 1, updated_at = now()`,
         [tenantId], { allowNoTenant: true }
       );
     } catch {}
@@ -148,66 +131,23 @@ Geef een motiverende maar concrete briefing als JSON (geen markdown, alleen JSON
   } catch (err) { next(err); }
 });
 
-// ── GET /api/ai/credits ──────────────────────────────────────
-router.get('/credits', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { tenantId, planSlug } = getTenantContext();
-
-    const [usageResult, limitResult] = await Promise.all([
-      db.query(
-        `SELECT COALESCE(usage_count, 0) AS used
-         FROM feature_usage fu
-         JOIN features f ON f.id = fu.feature_id
-         WHERE fu.tenant_id = $1
-           AND f.slug = 'ai-recommendations'
-           AND fu.period_start <= now()
-           AND fu.period_end   >= now()
-         LIMIT 1`,
-        [tenantId], { allowNoTenant: true }
-      ),
-      db.query(
-        `SELECT ul.limit_value
-         FROM usage_limits ul
-         JOIN plans p ON p.id = ul.plan_id
-         JOIN features f ON f.id = ul.feature_id
-         WHERE p.slug = $1
-           AND f.slug = 'ai-recommendations'
-           AND ul.limit_type = 'monthly'
-         LIMIT 1`,
-        [planSlug], { allowNoTenant: true }
-      ),
-    ]);
-
-    const used      = parseInt(usageResult.rows[0]?.used ?? '0');
-    const limit     = limitResult.rows[0]?.limit_value ?? null;
-    const unlimited = limit === null;
-
-    res.json({
-      used,
-      limit,
-      remaining:  unlimited ? null : Math.max(0, limit - used),
-      unlimited,
-    });
-  } catch (err) { next(err); }
-});
-
-// ── POST /api/ai/chat ────────────────────────────────────────
+// ── POST /api/ai/chat ─────────────────────────────────────────
 router.post('/chat', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
 
     if (planSlug === 'starter') {
-      res.status(403).json({ error: 'AI Chat is beschikbaar vanaf het Growth plan.' });
+      res.status(403).json({ error: 'AI Chat is available from the Growth plan.' });
       return;
     }
 
     const { message } = req.body;
-    if (!message) { res.status(400).json({ error: 'Bericht is verplicht' }); return; }
+    if (!message) { res.status(400).json({ error: 'Message is required' }); return; }
 
     const ordersResult = await db.query(
-      'SELECT COUNT(*)::int AS orders, COALESCE(SUM(total_amount - tax_amount), 0) AS revenue ' +
-      "FROM orders WHERE tenant_id = $1 AND ordered_at >= NOW() - INTERVAL '30 days' " +
-      "AND status NOT IN ('cancelled', 'refunded')",
+      `SELECT COUNT(*)::int AS orders, COALESCE(SUM(total_amount - tax_amount), 0) AS revenue
+       FROM orders WHERE tenant_id = $1 AND ordered_at >= NOW() - INTERVAL '30 days'
+       AND status NOT IN ('cancelled', 'refunded')`,
       [tenantId], { allowNoTenant: true }
     );
     const stats = ordersResult.rows[0];
@@ -215,34 +155,96 @@ router.post('/chat', async (req: Request, res: Response, next: NextFunction) => 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 500,
-      system:     'Je bent een ecommerce AI adviseur voor MarketGrow — een action platform dat ecommerce ondernemers vertelt wat ze vandaag moeten doen per kanaal en product. De gebruiker heeft ' + stats.orders + ' orders en €' + parseFloat(stats.revenue).toFixed(2) + ' omzet de afgelopen 30 dagen. Antwoord altijd in het Nederlands. Geef concrete, uitvoerbare adviezen — noem altijd het platform en het product als dat relevant is.',
+      system:     `You are an ecommerce AI advisor for MarketGrow. The user has ${stats.orders} orders and €${parseFloat(stats.revenue).toFixed(2)} revenue in the last 30 days. Answer in English, concise and actionable.`,
       messages:   [{ role: 'user', content: message }],
     });
 
     const text = response.content[0].type === 'text' ? response.content[0].text : '';
+
+    try {
+      await db.query(
+        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
+         SELECT $1, f.id, date_trunc('month', now()),
+                (date_trunc('month', now()) + interval '1 month - 1 day')::date, 1
+         FROM features f WHERE f.slug = 'ai-recommendations'
+         ON CONFLICT (tenant_id, feature_id, period_start)
+         DO UPDATE SET usage_count = feature_usage.usage_count + 1, updated_at = now()`,
+        [tenantId], { allowNoTenant: true }
+      );
+    } catch {}
+
     res.json({ response: text });
   } catch (err) { next(err); }
 });
 
-// ── POST /api/ai/social-content ──────────────────────────────
+// ── GET /api/ai/credits ───────────────────────────────────────
+router.get('/credits', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+
+    const limits: Record<string, number | null> = {
+      starter: 100,
+      growth:  2000,
+      scale:   null,
+    };
+    const limit = limits[planSlug] ?? 100;
+
+    const usageResult = await db.query(
+      `SELECT COALESCE(fu.usage_count, 0) AS used
+       FROM feature_usage fu JOIN features f ON f.id = fu.feature_id
+       WHERE fu.tenant_id = $1 AND f.slug = 'ai-recommendations'
+         AND fu.period_start = date_trunc('month', now())`,
+      [tenantId], { allowNoTenant: true }
+    );
+
+    const used      = parseInt(usageResult.rows[0]?.used || '0');
+    const unlimited = limit === null;
+
+    res.json({
+      used,
+      limit,
+      remaining: unlimited ? null : Math.max(0, limit - used),
+      unlimited,
+    });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/ai/social-content ───────────────────────────────
 router.post('/social-content', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId } = getTenantContext();
+    const { tenantId, planSlug } = getTenantContext();
 
-    const { platform, tone, topic, customContext, count = 3 } = req.body as {
-      platform:      'instagram' | 'tiktok';
-      tone:          'educational' | 'inspirational' | 'data-driven' | 'behind-the-scenes';
-      topic:         string;
+    if (planSlug === 'starter') {
+      res.status(403).json({ error: 'Social Content Generator is available on Growth and Scale plans.' });
+      return;
+    }
+
+    const {
+      platform,
+      tone,
+      topic,
+      format        = 'single',
+      customContext = '',
+      count         = 3,
+      generateImage = false,
+    } = req.body as {
+      platform:       'instagram' | 'tiktok';
+      tone:           string;
+      topic:          string;
+      format?:        'single' | 'carousel' | 'video_script';
       customContext?: string;
-      count?:        number;
+      count?:         number;
+      generateImage?: boolean;
     };
 
-    const [ordersResult, adsResult, integrationsResult] = await Promise.all([
+    // Haal echte store data op
+    const [ordersResult, adsResult, topProductsResult, integrationsResult] = await Promise.all([
       db.query(
         `SELECT
            COUNT(*)::int                              AS total_orders,
            COALESCE(SUM(total_amount - tax_amount),0) AS revenue,
-           COALESCE(AVG(total_amount - tax_amount),0) AS avg_order_value
+           COALESCE(AVG(total_amount - tax_amount),0) AS avg_order_value,
+           COALESCE(MAX(total_amount - tax_amount),0) AS highest_order
          FROM orders
          WHERE tenant_id = $1
            AND ordered_at >= NOW() - INTERVAL '30 days'
@@ -254,11 +256,21 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
            COALESCE(SUM(spend),0)       AS total_spend,
            COALESCE(SUM(revenue),0)     AS total_ad_revenue,
            COALESCE(AVG(roas),0)        AS avg_roas,
+           COALESCE(MAX(roas),0)        AS best_roas,
            COALESCE(SUM(impressions),0) AS total_impressions,
-           COALESCE(SUM(clicks),0)      AS total_clicks
+           COUNT(CASE WHEN status='active' THEN 1 END)::int AS active_campaigns
          FROM ad_campaigns
-         WHERE tenant_id = $1
-           AND updated_at >= NOW() - INTERVAL '30 days'`,
+         WHERE tenant_id = $1 AND updated_at >= NOW() - INTERVAL '30 days'`,
+        [tenantId], { allowNoTenant: true }
+      ),
+      db.query(
+        `SELECT oli.title, SUM(oli.quantity)::int AS sold, SUM(oli.total_price) AS revenue
+         FROM order_line_items oli
+         JOIN orders o ON o.id = oli.order_id
+         WHERE oli.tenant_id = $1
+           AND o.ordered_at >= NOW() - INTERVAL '30 days'
+           AND o.status NOT IN ('cancelled','refunded')
+         GROUP BY oli.title ORDER BY revenue DESC LIMIT 3`,
         [tenantId], { allowNoTenant: true }
       ),
       db.query(
@@ -267,72 +279,81 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
       ),
     ]);
 
-    const orders    = ordersResult.rows[0];
-    const ads       = adsResult.rows[0];
-    const platforms = integrationsResult.rows.map((r: any) => r.platform_slug).join(', ');
+    const orders      = ordersResult.rows[0];
+    const ads         = adsResult.rows[0];
+    const topProducts = topProductsResult.rows;
+    const platforms   = integrationsResult.rows.map((r: any) => r.platform_slug).join(', ');
 
-    const toneGuide: Record<string, string> = {
-      'educational':       'Teach the audience something actionable. Use clear steps or insights.',
-      'inspirational':     'Motivate and inspire. Focus on results, transformation, and possibilities.',
-      'data-driven':       'Lead with a surprising or compelling statistic. Let numbers do the talking.',
-      'behind-the-scenes': 'Be authentic, relatable, and transparent. Share real experiences.',
+    const topProductsText = topProducts.length > 0
+      ? `Top products:\n${topProducts.map((p: any) => `  - ${p.title}: ${p.sold} sold, €${parseFloat(p.revenue).toFixed(0)} revenue`).join('\n')}`
+      : '';
+
+    const storeContext = `
+REAL STORE DATA (use this to make content authentic and specific):
+Sales (last 30 days):
+- Orders: ${orders.total_orders}
+- Revenue: €${parseFloat(orders.revenue).toFixed(0)}
+- Average order value: €${parseFloat(orders.avg_order_value).toFixed(0)}
+- Highest single order: €${parseFloat(orders.highest_order).toFixed(0)}
+
+Advertising (last 30 days):
+- Ad spend: €${parseFloat(ads.total_spend).toFixed(0)}
+- Ad revenue attributed: €${parseFloat(ads.total_ad_revenue).toFixed(0)}
+- Average ROAS: ${parseFloat(ads.avg_roas).toFixed(2)}x
+- Best campaign ROAS: ${parseFloat(ads.best_roas).toFixed(2)}x
+- Total impressions: ${parseInt(ads.total_impressions).toLocaleString()}
+- Active campaigns: ${ads.active_campaigns}
+
+${topProductsText}
+Connected platforms: ${platforms || 'not specified'}
+${customContext ? `\nAdditional context: ${customContext}` : ''}`.trim();
+
+    const formatGuide: Record<string, string> = {
+      'single':       'Create a single standalone post with hook, caption, and CTA.',
+      'carousel':     `Create a ${count}-slide carousel.\nSlide 1: Hook/attention grabber\nSlides 2-${count-1}: Value/insights (one point per slide)\nLast slide: CTA/conclusion`,
+      'video_script': 'Create a short-form video script (30-60 seconds). Include: hook (0-3s), main content (3-45s), CTA (45-60s). Write as spoken word, natural and conversational.',
     };
 
-    const topicGuide: Record<string, string> = {
-      'roas':                'Return on ad spend, ad profitability, knowing your numbers',
-      'product-performance': 'Which products sell best, product analytics, revenue per product',
-      'ads-tips':            'Advertising tips for ecommerce, campaign optimisation, Meta/Google/TikTok ads',
-      'ecommerce-growth':    'Growing an ecommerce business, scaling, multi-channel selling',
-      'platform-insights':   'Selling on Shopify, Bol.com, Amazon, Etsy — platform-specific insights',
+    const toneGuide: Record<string, string> = {
+      'educational':       'Teach something actionable. Use clear steps or insights.',
+      'inspirational':     'Motivate and inspire. Focus on results and possibilities.',
+      'data-driven':       'Lead with a surprising statistic. Let numbers tell the story.',
+      'behind-the-scenes': 'Be authentic and transparent. Share real experiences.',
     };
 
     const platformGuide: Record<string, string> = {
-      instagram: 'Instagram caption style: conversational, line breaks for readability, emojis allowed, strong hook in first line. 15-20 hashtags.',
-      tiktok:    'TikTok caption style: very short and punchy, hook must be irresistible, CTA to follow or comment. 5-8 hashtags.',
+      instagram: 'Instagram: conversational, line breaks, emojis allowed, strong hook. 15-20 hashtags.',
+      tiktok:    'TikTok: very short and punchy, irresistible hook, CTA to follow/comment. 5-8 hashtags.',
     };
 
-    const storeContext = `
-Real store data (use this to make posts feel authentic and specific):
-- Orders last 30 days: ${orders.total_orders}
-- Revenue last 30 days: €${parseFloat(orders.revenue).toFixed(0)}
-- Average order value: €${parseFloat(orders.avg_order_value).toFixed(0)}
-- Ad spend last 30 days: €${parseFloat(ads.total_spend).toFixed(0)}
-- Ad revenue (attributed): €${parseFloat(ads.total_ad_revenue).toFixed(0)}
-- Average ROAS: ${parseFloat(ads.avg_roas).toFixed(2)}x
-- Total impressions: ${parseInt(ads.total_impressions).toLocaleString()}
-- Connected platforms: ${platforms || 'not specified'}
-${customContext ? `\nAdditional context from the user: ${customContext}` : ''}
-    `.trim();
+    const jsonSchema = format === 'carousel'
+      ? `[{"slides":[{"headline":"...","body":"...","visual_hint":"..."}],"caption":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`
+      : format === 'video_script'
+      ? `[{"hook":"...","script":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`
+      : `[{"hook":"...","caption":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`;
 
-    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} unique, high-quality social media post(s) for ${platform}.
+    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} ${format === 'carousel' ? 'carousel post(s)' : format === 'video_script' ? 'video script(s)' : 'post(s)'} for ${platform}.
 
-TOPIC: ${topicGuide[topic] || topic}
+TOPIC: ${topic}
 TONE: ${toneGuide[tone] || tone}
-PLATFORM STYLE: ${platformGuide[platform]}
+FORMAT: ${formatGuide[format] || format}
+PLATFORM: ${platformGuide[platform]}
 
 ${storeContext}
 
-IMPORTANT RULES:
+RULES:
 - Write in English
-- Each post must feel real, specific, and valuable — not generic
-- Use the store data naturally (don't just list numbers, tell a story)
-- The hook must stop the scroll — make it unexpected or counterintuitive
-- No corporate language. Write like a founder talking to other founders
-- CTA should be natural, not pushy
+- Use the store data naturally — tell a story, don't just list numbers
+- The hook must stop the scroll immediately
+- No corporate language — write like a founder talking to founders
+- For image_prompt: write a detailed Nano Banana/AI image generation prompt for the perfect visual to accompany this post. Be specific about style, composition, colors, and mood.
 
-Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown, no explanation, just JSON:
-[
-  {
-    "hook": "First line that stops the scroll (1-2 sentences max)",
-    "caption": "Main body of the post (3-6 sentences, use line breaks)",
-    "cta": "Call to action (1 sentence)",
-    "hashtags": ["hashtag1", "hashtag2", "hashtag3"]
-  }
-]`;
+Return ONLY valid JSON array. No markdown:
+${jsonSchema}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
-      max_tokens: 2000,
+      max_tokens: 3000,
       messages:   [{ role: 'user', content: prompt }],
     });
 
@@ -347,6 +368,33 @@ Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown
       posts = [];
     }
 
+    // Optioneel: genereer Nano Banana beelden voor eerste 2 posts
+    if (generateImage && posts.length > 0 && process.env.GEMINI_API_KEY) {
+      const imagePromises = posts.slice(0, 2).map(async (post: any) => {
+        try {
+          if (!post.image_prompt) return null;
+          const geminiRes = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${process.env.GEMINI_API_KEY}`,
+            {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: post.image_prompt }] }],
+                generationConfig: { responseModalities: ['IMAGE', 'TEXT'], responseMimeType: 'image/jpeg' },
+              }),
+            }
+          );
+          if (!geminiRes.ok) return null;
+          const imgData   = await geminiRes.json() as any;
+          const imagePart = imgData.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData?.data);
+          if (!imagePart) return null;
+          return `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
+        } catch { return null; }
+      });
+      const images = await Promise.all(imagePromises);
+      posts = posts.map((post: any, i: number) => ({ ...post, generatedImage: images[i] ?? null }));
+    }
+
     try {
       await db.query(
         `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -355,28 +403,120 @@ Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown
          FROM features f WHERE f.slug = 'ai-recommendations'
          ON CONFLICT (tenant_id, feature_id, period_start)
          DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
-        [tenantId, count],
-        { allowNoTenant: true }
+        [tenantId, count], { allowNoTenant: true }
       );
     } catch {}
 
-    logger.info('ai.social-content.generated', { tenantId, platform, tone, topic, count });
-    res.json({ posts });
+    logger.info('ai.social-content.generated', { tenantId, platform, tone, topic, format, count });
+    res.json({ posts, format });
   } catch (err) { next(err); }
 });
 
-// ── POST /api/ai/video-script ─────────────────────────────────
+// ── POST /api/ai/generate-creative ───────────────────────────
+router.post('/generate-creative', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+
+    if (planSlug === 'starter') {
+      res.status(403).json({ error: 'AI Creative Generator is available on Growth and Scale plans.' });
+      return;
+    }
+
+    const {
+      productTitle,
+      productDescription,
+      productPrice,
+      productPlatform = 'shopify',
+      productImageUrl,
+      format   = 'single',
+      platform = 'instagram',
+      style    = 'minimal',
+      slideCount = 3,
+    } = req.body as {
+      productTitle:        string;
+      productDescription?: string;
+      productPrice?:       number;
+      productPlatform?:    string;
+      productImageUrl?:    string;
+      format?:             'single' | 'carousel' | 'story' | 'banner';
+      platform?:           'instagram' | 'tiktok' | 'google' | 'meta';
+      style?:              'minimal' | 'bold' | 'lifestyle' | 'product-focus';
+      slideCount?:         number;
+    };
+
+    if (!productTitle) { res.status(400).json({ error: 'productTitle is required' }); return; }
+
+    // Haal verkoopdata op voor dit product
+    const salesResult = await db.query(
+      `SELECT SUM(oli.total_price) AS revenue, SUM(oli.quantity)::int AS sold
+       FROM order_line_items oli
+       JOIN orders o ON o.id = oli.order_id
+       WHERE oli.tenant_id = $1
+         AND LOWER(oli.title) LIKE LOWER($2)
+         AND o.ordered_at >= NOW() - INTERVAL '30 days'
+         AND o.status NOT IN ('cancelled','refunded')`,
+      [tenantId, `%${productTitle}%`], { allowNoTenant: true }
+    );
+
+    const adsResult = await db.query(
+      `SELECT AVG(roas) AS avg_roas FROM ad_campaigns
+       WHERE tenant_id = $1 AND LOWER(name) LIKE LOWER($2) AND updated_at >= NOW() - INTERVAL '30 days'`,
+      [tenantId, `%${productTitle.split(' ')[0]}%`], { allowNoTenant: true }
+    );
+
+    const sales = salesResult.rows[0];
+    const ads   = adsResult.rows[0];
+
+    const productContext = {
+      title:       productTitle,
+      description: productDescription,
+      price:       productPrice,
+      platform:    productPlatform,
+      revenue30d:  parseFloat(sales?.revenue ?? '0'),
+      sold30d:     sales?.sold ?? 0,
+      roas:        parseFloat(ads?.avg_roas ?? '0'),
+      imageUrl:    productImageUrl,
+    };
+
+    let result;
+    if (format === 'carousel') {
+      const slides = await generateCarouselSlides(
+        { product: productContext, format, platform, style },
+        Math.min(slideCount, 5)
+      );
+      result = { type: 'carousel', slides };
+    } else {
+      const creative = await generateAdCreative({ product: productContext, format, platform, style });
+      result = { type: 'single', creative };
+    }
+
+    try {
+      await db.query(
+        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
+         SELECT $1, f.id, date_trunc('month', now()),
+                (date_trunc('month', now()) + interval '1 month - 1 day')::date, $2
+         FROM features f WHERE f.slug = 'ai-recommendations'
+         ON CONFLICT (tenant_id, feature_id, period_start)
+         DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
+        [tenantId, format === 'carousel' ? slideCount : 1], { allowNoTenant: true }
+      );
+    } catch {}
+
+    logger.info('ai.creative.generated', { tenantId, productTitle, format, platform });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/ai/video-script (intern MarketGrow tool) ────────
 router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
 
     const userResult = await db.query(
-      `SELECT role FROM users WHERE id = $1`,
-      [userId], { allowNoTenant: true }
+      `SELECT role FROM users WHERE id = $1`, [userId], { allowNoTenant: true }
     );
     if (userResult.rows[0]?.role !== 'owner') {
-      res.status(403).json({ error: 'Not authorized' });
-      return;
+      res.status(403).json({ error: 'Not authorized' }); return;
     }
 
     const { scenario, format, angle, index = 0, total = 1 } = req.body as {
