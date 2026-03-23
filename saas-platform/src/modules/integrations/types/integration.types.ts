@@ -10,7 +10,8 @@ export type PlatformSlug =
   | 'bolcom'
   | 'magento'
   | 'amazon'
-  | 'etsy';
+  | 'etsy'
+  | 'google_ads';
 
 export interface IntegrationCredentials {
   integrationId:  string;
