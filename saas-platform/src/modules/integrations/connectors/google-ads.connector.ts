@@ -57,9 +57,11 @@ export interface GoogleAdsSyncResult {
 // ── OAuth helpers ─────────────────────────────────────────────
 
 export function buildGoogleAuthUrl(state: string): string {
+  const redirectUri = REDIRECT_URI();
+  console.log('GOOGLE_REDIRECT_URI:', redirectUri); // ← tijdelijk
   const params = new URLSearchParams({
     client_id:     CLIENT_ID(),
-    redirect_uri:  REDIRECT_URI(),
+    redirect_uri:  redirectUri,
     response_type: 'code',
     scope:         'https://www.googleapis.com/auth/adwords',
     access_type:   'offline',
