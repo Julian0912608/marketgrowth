@@ -22,6 +22,112 @@ const CACHE_TTL: Record<string, number> = {
   scale:   3600,
 };
 
+// ── Image prompt helpers ──────────────────────────────────────
+
+interface StoreData {
+  revenue:    string;
+  orders:     number;
+  roas:       string;
+  topProduct: string;
+}
+
+const TOPIC_VISUAL: Record<string, string> = {
+  'roas':                'data dashboard with ROAS metrics, charts showing ad performance, clean analytics interface',
+  'product-performance': 'ecommerce product display, bestseller badge, revenue stats overlay, product photography style',
+  'ads-tips':            'advertising campaign interface, ad creative mockup, marketing strategy visual',
+  'ecommerce-growth':    'growth chart trending upward, revenue milestone, scaling business visual',
+  'platform-insights':   'multi-platform dashboard showing Shopify Bol.com Amazon logos, unified analytics screen',
+};
+
+const PLATFORM_VISUAL: Record<string, string> = {
+  'instagram': '1:1 square format, Instagram-optimised, thumb-stopping, clean dark background, bold typography overlay space',
+  'tiktok':    '9:16 vertical format, TikTok-style, energetic composition, bold colors, mobile-first design',
+};
+
+const TONE_VISUAL: Record<string, string> = {
+  'educational':       'clean infographic style, minimal design, clear visual hierarchy, professional SaaS look',
+  'inspirational':     'aspirational imagery, warm accent colors, success-oriented, motivational mood',
+  'data-driven':       'data visualization, charts and numbers prominently featured, tech dark-mode aesthetic',
+  'behind-the-scenes': 'authentic candid style, real workspace, natural lighting, relatable founder imagery',
+};
+
+function buildEnrichedImagePrompt(opts: {
+  basePrompt:  string;
+  platform:    string;
+  topic:       string;
+  tone:        string;
+  format:      string;
+  storeData:   StoreData;
+}): string {
+  const { basePrompt, platform, topic, tone, format, storeData } = opts;
+  const topicVisual   = TOPIC_VISUAL[topic]   ?? 'ecommerce analytics dashboard';
+  const platformStyle = PLATFORM_VISUAL[platform] ?? PLATFORM_VISUAL['instagram'];
+  const toneStyle     = TONE_VISUAL[tone]     ?? 'clean professional design';
+
+  return `Create a professional social media visual for an ecommerce analytics SaaS platform called MarketGrow.
+
+TOPIC VISUAL: ${topicVisual}
+STYLE: ${toneStyle}
+FORMAT: ${platformStyle}
+${storeData.topProduct ? `STORE CONTEXT: Top product is "${storeData.topProduct}"` : ''}
+${storeData.roas !== '0.00' ? `PERFORMANCE CONTEXT: ${storeData.roas}x ROAS, ${storeData.orders} orders last 30 days` : ''}
+
+CONTENT BRIEF: ${basePrompt}
+
+DESIGN REQUIREMENTS:
+- Brand colors: indigo #4f46e5 as primary accent, dark slate #0f172a background
+- Leave clean space for text overlay (top or bottom third)
+- No real people or faces
+- No copyrighted logos or brand marks
+- High-quality photorealistic output
+- The visual must directly relate to: ${topic.replace(/-/g, ' ')}
+${format === 'story' ? '- Vertical 9:16 format optimised for mobile stories' : ''}`;
+}
+
+function buildSlideImagePrompt(opts: {
+  slideHeadline: string;
+  slideBody:     string;
+  visualHint:    string;
+  basePrompt:    string;
+  slideIndex:    number;
+  totalSlides:   number;
+  platform:      string;
+  topic:         string;
+  tone:          string;
+  storeData:     StoreData;
+}): string {
+  const { slideHeadline, slideBody, visualHint, basePrompt, slideIndex, totalSlides, platform, topic, tone, storeData } = opts;
+  const topicVisual   = TOPIC_VISUAL[topic]   ?? 'ecommerce analytics dashboard';
+  const platformStyle = PLATFORM_VISUAL[platform] ?? PLATFORM_VISUAL['instagram'];
+  const toneStyle     = TONE_VISUAL[tone]     ?? 'clean professional design';
+
+  const slideRole = slideIndex === 1
+    ? 'OPENING slide — strong visual hook, make viewers want to swipe'
+    : slideIndex === totalSlides
+    ? 'FINAL slide — clear call-to-action visual with MarketGrow branding'
+    : `MIDDLE slide ${slideIndex} of ${totalSlides} — focused on: "${slideHeadline}"`;
+
+  return `Create carousel slide ${slideIndex} of ${totalSlides} for a social media post about ecommerce analytics.
+
+SLIDE ROLE: ${slideRole}
+SLIDE CONTENT: "${slideHeadline}" — ${slideBody}
+VISUAL HINT: ${visualHint}
+
+TOPIC VISUAL: ${topicVisual}
+STYLE: ${toneStyle}
+FORMAT: ${platformStyle} — 1:1 square carousel slide
+${storeData.topProduct ? `STORE CONTEXT: Top product "${storeData.topProduct}"` : ''}
+${storeData.roas !== '0.00' ? `PERFORMANCE: ${storeData.roas}x ROAS` : ''}
+
+DESIGN REQUIREMENTS:
+- Brand colors: indigo #4f46e5 accent, dark slate #0f172a background
+- Large readable area for headline: "${slideHeadline}"
+- CONSISTENT visual style with other slides in this carousel
+- No real people or faces
+- High-quality photorealistic output
+- Topic: ${topic.replace(/-/g, ' ')}`;
+}
+
 // ── GET /api/ai/insights ──────────────────────────────────────
 router.get('/insights', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -71,9 +177,9 @@ router.get('/insights', async (req: Request, res: Response, next: NextFunction) 
 
     if (integrations.length === 0) {
       return res.json({
-        briefing: 'Connect your first store to start receiving AI insights. Go to Integrations to link Bol.com, Shopify or another platform.',
-        actions:  [{ priority: 'high', title: 'Connect your store', description: 'Go to Integrations and link your first platform.' }],
-        alerts:   [],
+        briefing:  'Connect your first store to start receiving AI insights. Go to Integrations to link Bol.com, Shopify or another platform.',
+        actions:   [{ priority: 'high', title: 'Connect your store', description: 'Go to Integrations and link your first platform.' }],
+        alerts:    [],
         fromCache: false,
       });
     }
@@ -106,11 +212,8 @@ Return ONLY valid JSON:
     const clean = text.replace(/```json|```/g, '').trim();
 
     let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch {
-      parsed = { briefing: text.slice(0, 300), actions: [], alerts: [] };
-    }
+    try { parsed = JSON.parse(clean); }
+    catch { parsed = { briefing: text.slice(0, 300), actions: [], alerts: [] }; }
 
     await cache.set(cacheKey, JSON.stringify(parsed), CACHE_TTL[planSlug] || 3600);
 
@@ -187,8 +290,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
       growth:  2000,
       scale:   null,
     };
-    const limit = limits[planSlug] ?? 100;
-
+    const limit     = limits[planSlug] ?? 100;
     const usageResult = await db.query(
       `SELECT COALESCE(fu.usage_count, 0) AS used
        FROM feature_usage fu JOIN features f ON f.id = fu.feature_id
@@ -237,7 +339,6 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
       generateImage?: boolean;
     };
 
-    // Haal echte store data op
     const [ordersResult, adsResult, topProductsResult, integrationsResult] = await Promise.all([
       db.query(
         `SELECT
@@ -284,12 +385,19 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
     const topProducts = topProductsResult.rows;
     const platforms   = integrationsResult.rows.map((r: any) => r.platform_slug).join(', ');
 
+    const storeData: StoreData = {
+      revenue:    parseFloat(orders.revenue).toFixed(0),
+      orders:     orders.total_orders,
+      roas:       parseFloat(ads.avg_roas).toFixed(2),
+      topProduct: topProducts[0]?.title ?? '',
+    };
+
     const topProductsText = topProducts.length > 0
       ? `Top products:\n${topProducts.map((p: any) => `  - ${p.title}: ${p.sold} sold, €${parseFloat(p.revenue).toFixed(0)} revenue`).join('\n')}`
       : '';
 
     const storeContext = `
-REAL STORE DATA (use this to make content authentic and specific):
+REAL STORE DATA:
 Sales (last 30 days):
 - Orders: ${orders.total_orders}
 - Revenue: €${parseFloat(orders.revenue).toFixed(0)}
@@ -301,7 +409,7 @@ Advertising (last 30 days):
 - Ad revenue attributed: €${parseFloat(ads.total_ad_revenue).toFixed(0)}
 - Average ROAS: ${parseFloat(ads.avg_roas).toFixed(2)}x
 - Best campaign ROAS: ${parseFloat(ads.best_roas).toFixed(2)}x
-- Total impressions: ${parseInt(ads.total_impressions).toLocaleString()}
+- Impressions: ${parseInt(ads.total_impressions).toLocaleString()}
 - Active campaigns: ${ads.active_campaigns}
 
 ${topProductsText}
@@ -310,31 +418,39 @@ ${customContext ? `\nAdditional context: ${customContext}` : ''}`.trim();
 
     const formatGuide: Record<string, string> = {
       'single':       'Create a single standalone post with hook, caption, and CTA.',
-      'carousel':     `Create a ${count}-slide carousel.\nSlide 1: Hook/attention grabber\nSlides 2-${count-1}: Value/insights (one point per slide)\nLast slide: CTA/conclusion`,
-      'video_script': 'Create a short-form video script (30-60 seconds). Include: hook (0-3s), main content (3-45s), CTA (45-60s). Write as spoken word, natural and conversational.',
+      'carousel':     `Create a ${count}-slide carousel. Slide 1: hook/attention. Slides 2-${count-1}: one insight per slide. Last slide: CTA.`,
+      'video_script': 'Create a 30-60 second video script. Hook (0-3s), main content (3-45s), CTA (45-60s). Spoken word, natural.',
     };
 
     const toneGuide: Record<string, string> = {
-      'educational':       'Teach something actionable. Use clear steps or insights.',
+      'educational':       'Teach something actionable. Clear steps or insights.',
       'inspirational':     'Motivate and inspire. Focus on results and possibilities.',
       'data-driven':       'Lead with a surprising statistic. Let numbers tell the story.',
-      'behind-the-scenes': 'Be authentic and transparent. Share real experiences.',
+      'behind-the-scenes': 'Authentic and transparent. Share real experiences.',
     };
 
     const platformGuide: Record<string, string> = {
       instagram: 'Instagram: conversational, line breaks, emojis allowed, strong hook. 15-20 hashtags.',
-      tiktok:    'TikTok: very short and punchy, irresistible hook, CTA to follow/comment. 5-8 hashtags.',
+      tiktok:    'TikTok: short and punchy, irresistible hook, CTA to follow/comment. 5-8 hashtags.',
+    };
+
+    const topicGuide: Record<string, string> = {
+      'roas':                'Return on ad spend — true blended ROAS vs platform-reported ROAS, ad profitability',
+      'product-performance': 'Which products sell best, product analytics, revenue per SKU, bestsellers',
+      'ads-tips':            'Advertising tips for ecommerce, campaign optimisation, Meta/Google/Bol.com ads',
+      'ecommerce-growth':    'Growing an ecommerce business, scaling, multi-channel selling, revenue milestones',
+      'platform-insights':   'Selling on Shopify, Bol.com, Amazon, Etsy — platform-specific insights',
     };
 
     const jsonSchema = format === 'carousel'
-      ? `[{"slides":[{"headline":"...","body":"...","visual_hint":"..."}],"caption":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`
+      ? `[{"slides":[{"headline":"short bold headline","body":"2-3 sentences","visual_hint":"specific description of what image works best for THIS slide — be very specific about what is shown"}],"caption":"post caption","cta":"call to action","hashtags":[...],"image_prompt":"overall visual style and brand direction for the carousel"}]`
       : format === 'video_script'
-      ? `[{"hook":"...","script":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`
-      : `[{"hook":"...","caption":"...","cta":"...","hashtags":[...],"image_prompt":"..."}]`;
+      ? `[{"hook":"2-second opener","script":"full script with ... pauses","cta":"closing CTA","hashtags":[...],"image_prompt":"specific thumbnail visual — what is shown, style, colors, composition"}]`
+      : `[{"hook":"scroll-stopping first line","caption":"post body","cta":"1 sentence CTA","hashtags":[...],"image_prompt":"specific image description — what is shown, style, composition, colors — directly related to ${topic}"}]`;
 
-    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} ${format === 'carousel' ? 'carousel post(s)' : format === 'video_script' ? 'video script(s)' : 'post(s)'} for ${platform}.
+    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${format === 'carousel' ? '1 carousel post' : `${count} ${format === 'video_script' ? 'video script(s)' : 'post(s)'}`} for ${platform}.
 
-TOPIC: ${topic}
+TOPIC: ${topicGuide[topic] || topic}
 TONE: ${toneGuide[tone] || tone}
 FORMAT: ${formatGuide[format] || format}
 PLATFORM: ${platformGuide[platform]}
@@ -346,9 +462,10 @@ RULES:
 - Use the store data naturally — tell a story, don't just list numbers
 - The hook must stop the scroll immediately
 - No corporate language — write like a founder talking to founders
-- For image_prompt: write a detailed Nano Banana/AI image generation prompt for the perfect visual to accompany this post. Be specific about style, composition, colors, and mood.
+- For image_prompt: be VERY specific and directly related to the topic "${topic.replace(/-/g, ' ')}". Example: instead of "a dashboard" write "dark-mode analytics dashboard showing ROAS chart with indigo accent colors, revenue line trending up, clean SaaS UI". Mention: composition, colors (indigo #4f46e5 brand), mood, exactly what is visible.
+- For carousel slide visual_hints: each slide needs a UNIQUE specific visual — not generic, directly tied to that slide's content.
 
-Return ONLY valid JSON array. No markdown:
+Return ONLY valid JSON array. No markdown, no explanation:
 ${jsonSchema}`;
 
     const response = await anthropic.messages.create({
@@ -360,26 +477,24 @@ ${jsonSchema}`;
     const text  = response.content[0].type === 'text' ? response.content[0].text : '[]';
     const clean = text.replace(/```json|```/g, '').trim();
 
-    let posts;
+    let posts: any[];
     try {
       posts = JSON.parse(clean);
       if (!Array.isArray(posts)) posts = [posts];
-    } catch {
-      posts = [];
-    }
+    } catch { posts = []; }
 
-    // Optioneel: genereer Nano Banana beelden voor eerste 2 posts
+    // ── Nano Banana beeldgeneratie ────────────────────────────
     if (generateImage && posts.length > 0 && process.env.GEMINI_API_KEY) {
-      const imagePromises = posts.slice(0, 2).map(async (post: any) => {
+
+      const generateSingleImage = async (imagePrompt: string): Promise<string | null> => {
         try {
-          if (!post.image_prompt) return null;
           const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key=${process.env.GEMINI_API_KEY}`,
             {
               method:  'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                contents: [{ parts: [{ text: post.image_prompt }] }],
+                contents: [{ parts: [{ text: imagePrompt }] }],
                 generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
               }),
             }
@@ -390,9 +505,48 @@ ${jsonSchema}`;
           if (!imagePart) return null;
           return `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
         } catch { return null; }
-      });
-      const images = await Promise.all(imagePromises);
-      posts = posts.map((post: any, i: number) => ({ ...post, generatedImage: images[i] ?? null }));
+      };
+
+      posts = await Promise.all(posts.map(async (post: any) => {
+        if (!post.image_prompt) return post;
+
+        if (format === 'carousel' && post.slides?.length > 0) {
+          // Genereer een beeld PER slide
+          const slideImages: (string | null)[] = [];
+          for (let i = 0; i < post.slides.length; i++) {
+            const slide = post.slides[i];
+            const slidePrompt = buildSlideImagePrompt({
+              slideHeadline: slide.headline,
+              slideBody:     slide.body,
+              visualHint:    slide.visual_hint,
+              basePrompt:    post.image_prompt,
+              slideIndex:    i + 1,
+              totalSlides:   post.slides.length,
+              platform,
+              topic,
+              tone,
+              storeData,
+            });
+            const img = await generateSingleImage(slidePrompt);
+            slideImages.push(img);
+            // Kleine pauze tussen API calls
+            if (i < post.slides.length - 1) await new Promise(r => setTimeout(r, 700));
+          }
+          return { ...post, slideImages };
+        } else {
+          // Single of video_script: 1 verrijkt beeld
+          const enrichedPrompt = buildEnrichedImagePrompt({
+            basePrompt: post.image_prompt,
+            platform,
+            topic,
+            tone,
+            format,
+            storeData,
+          });
+          const generatedImage = await generateSingleImage(enrichedPrompt);
+          return { ...post, generatedImage };
+        }
+      }));
     }
 
     try {
@@ -446,7 +600,6 @@ router.post('/generate-creative', async (req: Request, res: Response, next: Next
 
     if (!productTitle) { res.status(400).json({ error: 'productTitle is required' }); return; }
 
-    // Haal verkoopdata op voor dit product
     const salesResult = await db.query(
       `SELECT SUM(oli.total_price) AS revenue, SUM(oli.quantity)::int AS sold
        FROM order_line_items oli
@@ -571,9 +724,8 @@ Return ONLY valid JSON (no markdown):
     const clean = text.replace(/```json|```/g, '').trim();
 
     let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch {
+    try { parsed = JSON.parse(clean); }
+    catch {
       const match = clean.match(/\{[\s\S]*\}/);
       parsed = match ? JSON.parse(match[0]) : { hook: '', script: text, visualNotes: [], hashtags: [] };
     }
