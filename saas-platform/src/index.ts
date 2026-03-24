@@ -8,7 +8,7 @@ process.on('unhandledRejection', (reason: any) => {
   console.error(reason?.stack ?? '');
 });
 
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { errorHandler } from './shared/middleware/error-handler';
@@ -34,16 +34,24 @@ const allowedOrigins = [
   'http://localhost:3001',
 ].filter(Boolean) as string[];
 
-app.use(cors({
+const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
+    // Geen origin = server-to-server of curl — altijd toestaan
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error('CORS blocked: ' + origin));
+    // Blokkeer maar gooi geen Error — anders missen we CORS headers op de 403
+    callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-admin-token'],
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+};
+
+// CORS middleware op alle routes
+app.use(cors(corsOptions));
+
+// Expliciete OPTIONS preflight handler — MOET voor alle andere routes staan
+app.options('*', cors(corsOptions));
 
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
@@ -124,6 +132,11 @@ try {
 } catch (e: any) {
   console.error('  emailWorker FAILED:', e.message);
 }
+
+// ── Catch-all 404 handler ─────────────────────────────────────
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Route niet gevonden' });
+});
 
 app.use(errorHandler());
 
