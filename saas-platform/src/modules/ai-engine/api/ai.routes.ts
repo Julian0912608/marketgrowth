@@ -374,13 +374,13 @@ ${jsonSchema}`;
         try {
           if (!post.image_prompt) return null;
           const geminiRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=${process.env.GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key=${process.env.GEMINI_API_KEY}`,
             {
               method:  'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 contents: [{ parts: [{ text: post.image_prompt }] }],
-                generationConfig: { responseModalities: ['IMAGE', 'TEXT'] },
+                generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
               }),
             }
           );
