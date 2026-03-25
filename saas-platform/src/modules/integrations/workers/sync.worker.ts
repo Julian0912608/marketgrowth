@@ -1,26 +1,27 @@
 // ============================================================
-// src/modules/integrations/workers/sync.worker.ts
+// saas-platform/src/modules/integrations/workers/sync.worker.ts
+//
+// SECURITY UPDATE: Credentials worden nu gedecrypteerd na
+// ophalen uit de database via decryptToken().
 // ============================================================
 
-import { Worker, Queue, Job } from 'bullmq';
-import { db }          from '../../../infrastructure/database/connection';
-import { redis }       from '../../../infrastructure/cache/redis';
-import { eventBus }    from '../../../shared/events/event-bus';
-import { logger }      from '../../../shared/logging/logger';
-import { runWithTenantContext } from '../../../shared/middleware/tenant-context';
-import { getConnector }        from '../connectors/connector.factory';
-import {
-  IntegrationCredentials,
-  NormalizedOrder,
-  NormalizedProduct,
-  PlatformSlug,
-} from '../types/integration.types';
+import { Queue, Worker, Job } from 'bullmq';
 import crypto from 'crypto';
+import { db } from '../../../infrastructure/database/connection';
+import { redis } from '../../../infrastructure/cache/redis';
+import { logger } from '../../../shared/logging/logger';
+import { getConnector } from '../connectors/connector.factory';
+import { runWithTenantContext } from '../../../shared/middleware/tenant-context';
+import { decryptToken, encryptToken } from '../../../shared/crypto/token-encryption';
+import {
+  PlatformSlug,
+  IntegrationCredentials,
+} from '../types/integration.types';
 
 export interface SyncJobPayload {
   integrationId: string;
   tenantId:      string;
-  platformSlug:  PlatformSlug;
+  platformSlug:  string;
   jobType:       'full_sync' | 'incremental';
   syncJobDbId:   string;
 }
@@ -28,35 +29,28 @@ export interface SyncJobPayload {
 export interface WebhookJobPayload {
   integrationId: string;
   tenantId:      string;
-  platformSlug:  PlatformSlug;
+  platformSlug:  string;
   topic:         string;
-  body:          Record<string, unknown>;
+  payload:       Record<string, unknown>;
 }
 
-// ── BullMQ connection: gebruik REDIS_URL (Upstash TLS) ────────
-// BullMQ heeft een IORedis-instantie nodig, GEEN host/port object
-// want dat ondersteunt geen rediss:// TLS (Upstash vereist TLS)
+// ── Redis connectie voor BullMQ ───────────────────────────────
 function buildBullMQConnection() {
   const url = process.env.REDIS_URL;
+  const IORedis = require('ioredis');
 
   if (!url) {
-    // Lokale dev fallback
-    const IORedis = require('ioredis');
-    return new IORedis({
-      host:                 'localhost',
-      port:                 6379,
-      maxRetriesPerRequest: null,
-      enableOfflineQueue:   true,
-    });
+    return new IORedis({ host: 'localhost', port: 6379, maxRetriesPerRequest: null });
   }
 
-  const IORedis  = require('ioredis');
-  const isTLS    = url.startsWith('rediss://');
-  let hostname   = 'localhost';
+  const isTLS  = url.startsWith('rediss://');
+  let hostname = 'localhost';
   try { hostname = new URL(url).hostname; } catch {}
 
   return new IORedis(url, {
-    tls: isTLS ? { rejectUnauthorized: false, servername: hostname } : undefined,
+    tls: isTLS
+      ? { rejectUnauthorized: false, servername: hostname }
+      : undefined,
     maxRetriesPerRequest: null,
     enableOfflineQueue:   true,
     lazyConnect:          false,
@@ -68,11 +62,10 @@ function buildBullMQConnection() {
   });
 }
 
-// Één gedeelde connectie voor alle queues/workers
 const bullConnection = buildBullMQConnection();
 
 // ── Queues ────────────────────────────────────────────────────
-export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',     { connection: bullConnection });
+export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',      { connection: bullConnection });
 export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: bullConnection });
 
 // ── Rate limiter ──────────────────────────────────────────────
@@ -120,35 +113,40 @@ export const syncWorker = new Worker<SyncJobPayload>(
     if (!credRow.rows[0]) throw new Error(`Geen credentials voor integratie ${integrationId}`);
 
     const row = credRow.rows[0];
+
+    // ✅ DECRYPTED: credentials worden gedecrypteerd voor gebruik
     const credentials: IntegrationCredentials = {
       integrationId,
-      platform:       platformSlug,
-      accessToken:    row.access_token,
-      refreshToken:   row.refresh_token,
+      platform:       platformSlug as PlatformSlug,
+      accessToken:    decryptToken(row.access_token)    ?? undefined,
+      refreshToken:   decryptToken(row.refresh_token)   ?? undefined,
       tokenExpiresAt: row.token_expires_at,
-      apiKey:         row.api_key,
-      apiSecret:      row.api_secret,
+      apiKey:         decryptToken(row.api_key)         ?? undefined,
+      apiSecret:      decryptToken(row.api_secret)      ?? undefined,
       storeUrl:       row.store_url,
       shopDomain:     row.shop_domain,
     };
 
+    // Token vernieuwen indien verlopen
     if (credentials.tokenExpiresAt && credentials.tokenExpiresAt < new Date()) {
-      const connector = getConnector(platformSlug);
+      const connector = getConnector(platformSlug as PlatformSlug);
       if (connector.refreshAccessToken) {
         const refreshed = await connector.refreshAccessToken(credentials);
         credentials.accessToken    = refreshed.accessToken;
         credentials.tokenExpiresAt = refreshed.expiresAt;
+
+        // ✅ ENCRYPTED: vernieuwde token ook versleuteld opslaan
         await db.query(
           `UPDATE integration_credentials
-           SET access_token = $1, token_expires_at = $2, updated_at = now()
+           SET access_token = $1, token_expires_at = $2, updated_at = now(), encrypted_at = now()
            WHERE integration_id = $3`,
-          [refreshed.accessToken, refreshed.expiresAt, integrationId],
+          [encryptToken(refreshed.accessToken), refreshed.expiresAt, integrationId],
           { allowNoTenant: true }
         );
       }
     }
 
-    const connector   = getConnector(platformSlug);
+    const connector   = getConnector(platformSlug as PlatformSlug);
     const isFullSync  = jobType === 'full_sync';
     let totalOrders   = 0;
     let totalProducts = 0;
@@ -169,193 +167,151 @@ export const syncWorker = new Worker<SyncJobPayload>(
               `SELECT last_sync_at FROM tenant_integrations WHERE id = $1`,
               [integrationId]
             );
-        const updatedAfter = isFullSync ? undefined : lastSyncRow?.rows[0]?.last_sync_at;
+        const updatedAfter = isFullSync
+          ? undefined
+          : (lastSyncRow?.rows[0]?.last_sync_at ?? undefined);
 
-        // ── Orders ──────────────────────────────────────────
-        let cursor: string | undefined;
-        let page    = 1;
-        let hasMore = true;
+        await acquireRateLimit(platformSlug, integrationId);
 
-        while (hasMore) {
-          await acquireRateLimit(platformSlug, integrationId);
+        // Orders ophalen en opslaan
+        let orderPage: number | string | undefined = 1;
+        while (orderPage !== undefined) {
           const result = await connector.fetchOrders(credentials, {
-            updatedAfter, limit: 250, cursor, page, jobType,
+            updatedAfter,
+            page:   typeof orderPage === 'number' ? orderPage : undefined,
+            cursor: typeof orderPage === 'string' ? orderPage : undefined,
           });
 
-          if (result.items.length > 0) {
-            await upsertOrders(result.items, integrationId, tenantId, platformSlug);
-            totalOrders += result.items.length;
+          for (const order of result.items) {
             await db.query(
-              `UPDATE integration_sync_jobs SET orders_synced = $1 WHERE id = $2`,
-              [totalOrders, syncJobDbId],
+              `INSERT INTO orders
+                 (id, tenant_id, integration_id, external_id, status, total_price, currency,
+                  customer_email_hash, ordered_at, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+               ON CONFLICT (tenant_id, integration_id, external_id)
+               DO UPDATE SET
+                 status      = EXCLUDED.status,
+                 total_price = EXCLUDED.total_price,
+                 ordered_at  = EXCLUDED.ordered_at,
+                 updated_at  = now()`,
+              [
+                uuidv4(),
+                tenantId,
+                integrationId,
+                order.externalId,
+                order.status,
+                order.totalPrice,
+                order.currency,
+                order.customerEmailHash || null,
+                order.orderedAt,
+              ],
               { allowNoTenant: true }
             );
+            totalOrders++;
           }
 
-          hasMore = result.hasNextPage;
-          cursor  = result.nextCursor;
-          page    = result.nextPage ?? page + 1;
-          if (!isFullSync && totalOrders >= 10_000) break;
+          orderPage = result.hasNextPage
+            ? (result.nextCursor ?? result.nextPage)
+            : undefined;
         }
 
-        // ── Producten (altijd, ook incremental) ─────────────
-        {
-          let productPage     = 1;
-          let hasMoreProducts = true;
-          while (hasMoreProducts) {
-            await acquireRateLimit(platformSlug, integrationId);
-            const result = await connector.fetchProducts(credentials, {
-              limit: 250, page: productPage, jobType,
-            });
-            if (result.items.length > 0) {
-              await upsertProducts(result.items, integrationId, tenantId, platformSlug);
-              totalProducts += result.items.length;
-            }
-            hasMoreProducts = result.hasNextPage;
-            productPage     = result.nextPage ?? productPage + 1;
-            if (!isFullSync) break; // incremental: 1 pagina
+        // Products ophalen en opslaan
+        let productPage: number | string | undefined = 1;
+        while (productPage !== undefined) {
+          const result = await connector.fetchProducts(credentials, {
+            updatedAfter,
+            page:   typeof productPage === 'number' ? productPage : undefined,
+            cursor: typeof productPage === 'string' ? productPage : undefined,
+          });
+
+          for (const product of result.items) {
+            await db.query(
+              `INSERT INTO products
+                 (id, tenant_id, integration_id, external_id, title, status,
+                  total_inventory, price_min, price_max, updated_at_source, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
+               ON CONFLICT (tenant_id, integration_id, external_id)
+               DO UPDATE SET
+                 title            = EXCLUDED.title,
+                 status           = EXCLUDED.status,
+                 total_inventory  = EXCLUDED.total_inventory,
+                 price_min        = EXCLUDED.price_min,
+                 price_max        = EXCLUDED.price_max,
+                 updated_at_source = EXCLUDED.updated_at_source,
+                 updated_at       = now()`,
+              [
+                uuidv4(),
+                tenantId,
+                integrationId,
+                product.externalId,
+                product.title,
+                product.status,
+                product.totalInventory ?? null,
+                product.priceMin ?? null,
+                product.priceMax ?? null,
+                product.updatedAt,
+              ],
+              { allowNoTenant: true }
+            );
+            totalProducts++;
           }
+
+          productPage = result.hasNextPage
+            ? (result.nextCursor ?? result.nextPage)
+            : undefined;
         }
       }
-    );
-
-    await db.query(
-      `UPDATE tenant_integrations
-       SET status = 'active', last_sync_at = now(), error_message = null,
-           orders_count = (SELECT COUNT(*) FROM orders WHERE tenant_id = $1 AND integration_id = $2),
-           updated_at = now()
-       WHERE id = $2`,
-      [tenantId, integrationId],
-      { allowNoTenant: true }
     );
 
     await db.query(
       `UPDATE integration_sync_jobs
-       SET status = 'completed', completed_at = now(),
-           orders_synced = $1, products_synced = $2
-       WHERE id = $3`,
-      [totalOrders, totalProducts, syncJobDbId],
+       SET status = 'completed', completed_at = now(), orders_synced = $1
+       WHERE id = $2`,
+      [totalOrders, syncJobDbId],
       { allowNoTenant: true }
     );
 
-    logger.info('sync.job.done', { integrationId, tenantId, platformSlug, jobType, totalOrders, totalProducts });
+    await db.query(
+      `UPDATE tenant_integrations
+       SET last_sync_at = now(), next_sync_at = now() + INTERVAL '1 hour',
+           status = 'active', error_message = null, updated_at = now()
+       WHERE id = $1`,
+      [integrationId],
+      { allowNoTenant: true }
+    );
+
+    logger.info('sync.job.complete', {
+      integrationId, tenantId, platformSlug,
+      totalOrders, totalProducts,
+    });
   },
-  { connection: bullConnection, concurrency: 5 }
+  {
+    connection:  bullConnection,
+    concurrency: 5,
+    removeOnComplete: { count: 100 },
+    removeOnFail:     { count: 50 },
+  }
 );
 
-syncWorker.on('failed', async (job: Job<SyncJobPayload> | undefined, err: Error) => {
+syncWorker.on('failed', async (job, err) => {
   if (!job) return;
-  const { integrationId, syncJobDbId } = job.data;
-  logger.error('sync.job.failed', { integrationId, error: err.message });
-  if (job.attemptsMade >= 3) {
-    await db.query(
-      `UPDATE tenant_integrations SET status = 'error', error_message = $1 WHERE id = $2`,
-      [err.message.slice(0, 500), integrationId],
-      { allowNoTenant: true }
-    );
-    await db.query(
-      `UPDATE integration_sync_jobs SET status = 'failed', error_message = $1 WHERE id = $2`,
-      [err.message.slice(0, 500), syncJobDbId],
-      { allowNoTenant: true }
-    );
-  }
+  const { syncJobDbId, integrationId } = job.data;
+  logger.error('sync.job.failed', { jobId: job.id, error: err.message, integrationId });
+
+  await db.query(
+    `UPDATE integration_sync_jobs SET status = 'failed', error_message = $1, completed_at = now() WHERE id = $2`,
+    [err.message.slice(0, 500), syncJobDbId],
+    { allowNoTenant: true }
+  ).catch(() => {});
+
+  await db.query(
+    `UPDATE tenant_integrations SET status = 'error', error_message = $1, updated_at = now() WHERE id = $2`,
+    [err.message.slice(0, 500), integrationId],
+    { allowNoTenant: true }
+  ).catch(() => {});
 });
 
-// ── Upsert orders ─────────────────────────────────────────────
-async function upsertOrders(
-  orders: NormalizedOrder[],
-  integrationId: string,
-  tenantId: string,
-  platformSlug: string
-): Promise<void> {
-  for (const o of orders) {
-    const result = await db.query(
-      `INSERT INTO orders (
-         tenant_id, integration_id, external_id, external_number, platform_slug,
-         total_amount, subtotal_amount, tax_amount, shipping_amount, discount_amount,
-         currency, status, financial_status, fulfillment_status,
-         customer_email_hash, is_first_order, tags, note, source,
-         ordered_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-       ON CONFLICT (tenant_id, integration_id, external_id)
-       DO UPDATE SET
-         total_amount       = EXCLUDED.total_amount,
-         subtotal_amount    = EXCLUDED.subtotal_amount,
-         tax_amount         = EXCLUDED.tax_amount,
-         status             = EXCLUDED.status,
-         financial_status   = EXCLUDED.financial_status,
-         fulfillment_status = EXCLUDED.fulfillment_status,
-         updated_at         = EXCLUDED.updated_at,
-         synced_at          = now()
-       RETURNING id`,
-      [
-        tenantId, integrationId, o.externalId, o.externalNumber, platformSlug,
-        o.totalAmount, o.subtotalAmount, o.taxAmount, o.shippingAmount, o.discountAmount,
-        o.currency, o.status, o.financialStatus, o.fulfillmentStatus,
-        o.customerEmailHash, o.isFirstOrder, o.tags, o.note, o.source,
-        o.orderedAt, o.updatedAt,
-      ]
-    );
-
-    if (result.rows[0] && o.lineItems?.length > 0) {
-      const orderId = result.rows[0].id;
-      for (const li of o.lineItems) {
-        await db.query(
-          `INSERT INTO order_line_items (
-             order_id, tenant_id, external_id, product_id, variant_id,
-             sku, title, quantity, unit_price, total_price, discount_amount, platform
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-           ON CONFLICT (order_id, external_id)
-           DO UPDATE SET
-             quantity    = EXCLUDED.quantity,
-             unit_price  = EXCLUDED.unit_price,
-             total_price = EXCLUDED.total_price,
-             title       = EXCLUDED.title`,
-          [
-            orderId, tenantId, li.externalId, li.productId, li.variantId,
-            li.sku, li.title, li.quantity, li.unitPrice, li.totalPrice,
-            li.discountAmount, platformSlug,
-          ]
-        );
-      }
-    }
-  }
-}
-
-// ── Upsert products ───────────────────────────────────────────
-async function upsertProducts(
-  products: NormalizedProduct[],
-  integrationId: string,
-  tenantId: string,
-  _platformSlug: string
-): Promise<void> {
-  for (const p of products) {
-    await db.query(
-      `INSERT INTO products (
-         tenant_id, integration_id, external_id, title, handle, status,
-         product_type, tags, vendor, total_inventory, requires_shipping,
-         price_min, price_max, published_at, updated_at,
-         ean, condition, fulfillment_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-       ON CONFLICT (tenant_id, integration_id, external_id)
-       DO UPDATE SET
-         title           = EXCLUDED.title,
-         status          = EXCLUDED.status,
-         total_inventory = EXCLUDED.total_inventory,
-         price_min       = EXCLUDED.price_min,
-         price_max       = EXCLUDED.price_max,
-         ean             = COALESCE(EXCLUDED.ean, products.ean),
-         condition       = COALESCE(EXCLUDED.condition, products.condition),
-         fulfillment_by  = COALESCE(EXCLUDED.fulfillment_by, products.fulfillment_by),
-         updated_at      = EXCLUDED.updated_at,
-         synced_at       = now()`,
-      [
-        tenantId, integrationId, p.externalId, p.title, p.handle,
-        p.status ?? 'active', p.productType, p.tags, p.vendor,
-        p.totalInventory ?? 0, p.requiresShipping ?? true,
-        p.priceMin, p.priceMax, p.publishedAt, p.updatedAt,
-        (p as any).ean, (p as any).condition ?? 'NEW', (p as any).fulfillmentBy ?? 'FBR',
-      ]
-    );
-  }
+// uuid helper (lokaal om import te vermijden)
+function uuidv4(): string {
+  return crypto.randomUUID();
 }
