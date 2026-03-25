@@ -1,12 +1,37 @@
+// saas-platform/src/modules/onboarding/api/onboarding.routes.ts
+//
+// SECURITY UPDATE: Zod validatie op complete-step endpoint
+
 import { Router, Request, Response, NextFunction } from 'express';
-import { OnboardingService } from '../service/onboarding.service';
+import { z } from 'zod';
+import { OnboardingService, OnboardingStep } from '../service/onboarding.service';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
-import { OnboardingStep } from '../service/onboarding.service';
 
 const router = Router();
 const onboardingService = new OnboardingService();
 
 router.use(tenantMiddleware());
+
+const VALID_STEPS: OnboardingStep[] = [
+  'connect_store',
+  'invite_team',
+  'setup_billing',
+  'complete_profile',
+  'explore_dashboard',
+];
+
+const CompleteStepSchema = z.object({
+  step: z.enum(VALID_STEPS as [OnboardingStep, ...OnboardingStep[]]),
+});
+
+function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    const messages = result.error.errors.map(e => e.message).join(', ');
+    throw Object.assign(new Error(messages), { httpStatus: 400 });
+  }
+  return result.data;
+}
 
 // GET /api/onboarding/status
 router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
@@ -19,12 +44,8 @@ router.get('/status', async (req: Request, res: Response, next: NextFunction) =>
 // POST /api/onboarding/complete-step
 router.post('/complete-step', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { step } = req.body as { step: OnboardingStep };
-    if (!step) {
-      res.status(400).json({ error: 'step is verplicht' });
-      return;
-    }
-    const status = await onboardingService.completeStep(step);
+    const { step } = validate(CompleteStepSchema, req.body);
+    const status   = await onboardingService.completeStep(step);
     res.json(status);
   } catch (err) { next(err); }
 });
