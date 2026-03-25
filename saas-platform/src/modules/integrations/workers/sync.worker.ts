@@ -183,7 +183,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
           });
 
           for (const order of result.items) {
-            await db.query(
+            const orderResult = await db.query(
               `INSERT INTO orders
                  (id, tenant_id, integration_id, external_id, external_number, platform_slug,
                   total_amount, subtotal_amount, tax_amount, shipping_amount, discount_amount,
@@ -200,7 +200,8 @@ export const syncWorker = new Worker<SyncJobPayload>(
                  financial_status   = EXCLUDED.financial_status,
                  fulfillment_status = EXCLUDED.fulfillment_status,
                  updated_at         = now(),
-                 synced_at          = now()`,
+                 synced_at          = now()
+               RETURNING id`,
               [
                 uuidv4(),
                 tenantId,
@@ -226,6 +227,30 @@ export const syncWorker = new Worker<SyncJobPayload>(
               ],
               { allowNoTenant: true }
             );
+
+            const orderId = orderResult.rows[0]?.id;
+            if (orderId && order.lineItems?.length > 0) {
+              for (const li of order.lineItems) {
+                await db.query(
+                  `INSERT INTO order_line_items (
+                     order_id, tenant_id, external_id, product_id, variant_id,
+                     sku, title, quantity, unit_price, total_price, discount_amount, platform
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                   ON CONFLICT (order_id, external_id)
+                   DO UPDATE SET
+                     quantity    = EXCLUDED.quantity,
+                     unit_price  = EXCLUDED.unit_price,
+                     total_price = EXCLUDED.total_price,
+                     title       = EXCLUDED.title`,
+                  [
+                    orderId, tenantId, li.externalId, li.productId || null, li.variantId || null,
+                    li.sku || null, li.title, li.quantity, li.unitPrice, li.totalPrice,
+                    li.discountAmount, platformSlug,
+                  ],
+                  { allowNoTenant: true }
+                );
+              }
+            }
             totalOrders++;
           }
 
