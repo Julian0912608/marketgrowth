@@ -29,8 +29,16 @@ const SocialContentSchema = z.object({
   platform:      z.enum(['instagram', 'tiktok']),
   tone:          z.enum(['educational', 'inspirational', 'data-driven', 'behind-the-scenes']),
   topic:         z.string().min(1).max(200),
+  format:        z.enum(['single', 'carousel', 'video_script']).optional().default('single'),
   customContext: z.string().max(500).optional(),
-  count:         z.number().int().min(1).max(5).optional().default(3),
+  count:         z.number().int().min(1).max(7).optional().default(3),
+});
+
+const GenerateImageSchema = z.object({
+  prompt:     z.string().min(1).max(1000),
+  slideTitle: z.string().max(200).optional(),
+  slideBody:  z.string().max(500).optional(),
+  index:      z.number().int().min(0).max(20).optional().default(0),
 });
 
 const VideoScriptSchema = z.object({
@@ -231,7 +239,7 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
       return;
     }
 
-    const { platform, tone, topic, customContext, count } = validate(SocialContentSchema, req.body);
+    const { platform, tone, topic, format, customContext, count } = validate(SocialContentSchema, req.body);
 
     const [ordersResult, adsResult, integrationsResult] = await Promise.all([
       db.query(
@@ -291,13 +299,26 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
 - Platforms: ${platforms || 'not specified'}
 ${customContext ? `\nExtra context: ${customContext}` : ''}`.trim();
 
+    const formatGuide: Record<string, string> = {
+      'single':       'Single image post with a strong hook, caption, CTA and hashtags. Include an image_prompt field describing the ideal visual.',
+      'carousel':     `Carousel post with ${count} slides. Return slides array: [{headline, body, visual_hint}] plus caption, cta, hashtags, image_prompt.`,
+      'video_script': 'Video script (30-60 seconds). Return hook, script (full spoken text), cta, hashtags. No image needed.',
+    };
+
+    const outputFormat: Record<string, string> = {
+      'single':       '[{"hook":"...","caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}]',
+      'carousel':     '[{"slides":[{"headline":"...","body":"...","visual_hint":"..."}],"caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}]',
+      'video_script': '[{"hook":"...","script":"...","cta":"...","hashtags":["..."]}]',
+    };
+
     const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} unique posts for ${platform}.
 TOPIC: ${topicGuide[topic] || topic}
 TONE: ${toneGuide[tone] || tone}
+FORMAT: ${formatGuide[format] || formatGuide['single']}
 PLATFORM STYLE: ${platformGuide[platform]}
 ${storeContext}
 Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown:
-[{"hook":"...","caption":"...","cta":"...","hashtags":["..."]}]`;
+${outputFormat[format] || outputFormat['single']}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -402,6 +423,30 @@ Return ONLY valid JSON (no markdown):
     }
 
     res.json(parsed);
+  } catch (err) { next(err); }
+});
+
+
+// ── POST /api/ai/generate-image ───────────────────────────────
+// Nano Banana (Gemini) image generation
+router.post('/generate-image', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+    const { prompt, slideTitle, slideBody, index } = validate(GenerateImageSchema, req.body);
+    const { generateAdCreative } = require('../services/nano-banana.service');
+
+    const result = await generateAdCreative({
+      product: {
+        title:    slideTitle || prompt.slice(0, 60),
+        platform: 'instagram',
+      },
+      format:   'single',
+      platform: 'instagram',
+      style:    'minimal',
+    });
+
+    logger.info('ai.generate-image.complete', { tenantId, index });
+    res.json({ imageUrl: result.imageUrl });
   } catch (err) { next(err); }
 });
 
