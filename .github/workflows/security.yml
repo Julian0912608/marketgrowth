@@ -1,7 +1,4 @@
 # .github/workflows/security.yml
-#
-# Security scan die bij elke push en pull request draait.
-# Controleert op kwetsbare npm packages.
 
 name: Security Scan
 
@@ -11,7 +8,6 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Elke maandag om 09:00 UTC — pikt nieuwe CVEs op
     - cron: '0 9 * * 1'
 
 jobs:
@@ -26,19 +22,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: saas-platform/package-lock.json
+          node-version: '24'
 
       - name: Install dependencies
         working-directory: saas-platform
-        run: npm ci --prefer-offline
+        run: npm install
 
       - name: Run security audit
         working-directory: saas-platform
         run: npm audit --audit-level=high
-        # Faalt de build bij HIGH of CRITICAL kwetsbaarheden
-        # LOW en MODERATE worden gerapporteerd maar blokkeren niet
 
       - name: Check for known vulnerable packages
         working-directory: saas-platform
