@@ -1,9 +1,13 @@
 // saas-platform/src/modules/integrations/workers/sync.scheduler.ts
+//
+// SECURITY UPDATE: api_key en api_secret worden nu gedecrypteerd
+// via decryptToken() voordat ze gebruikt worden voor de Bol.com API.
 
 import { db }        from '../../../infrastructure/database/connection';
 import { logger }    from '../../../shared/logging/logger';
 import { syncQueue } from './sync.worker';
 import { syncBolcomAdvertisingData } from '../connectors/bolcom-advertising.connector';
+import { decryptToken } from '../../../shared/crypto/token-encryption';
 import { PlatformSlug, IntegrationCredentials } from '../types/integration.types';
 
 const SCHEDULER_INTERVAL_MS = 15 * 60 * 1000; // 15 minuten
@@ -99,7 +103,6 @@ async function scheduleAdvertisingSync(): Promise<void> {
   let totalSynced = 0;
 
   try {
-    // Haal alle actieve bolcom_ads integraties op voor tenants met actief abonnement
     const rows = await db.query(
       `SELECT ti.id AS integration_id, ti.tenant_id,
               ic.api_key, ic.api_secret
@@ -118,8 +121,20 @@ async function scheduleAdvertisingSync(): Promise<void> {
 
     for (const row of rows.rows) {
       try {
-        // Token ophalen
-        const encoded  = Buffer.from(`${row.api_key}:${row.api_secret}`).toString('base64');
+        // ✅ DECRYPTED: api_key en api_secret worden gedecrypteerd voor gebruik
+        const clientId     = decryptToken(row.api_key)    ?? '';
+        const clientSecret = decryptToken(row.api_secret) ?? '';
+
+        if (!clientId || !clientSecret) {
+          logger.warn('scheduler.advertising.missing_credentials', {
+            integrationId: row.integration_id,
+            tenantId:      row.tenant_id,
+          });
+          continue;
+        }
+
+        // Token ophalen met gedecrypte credentials
+        const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
         const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
           method:  'POST',
           headers: {
@@ -142,13 +157,12 @@ async function scheduleAdvertisingSync(): Promise<void> {
         const creds: IntegrationCredentials = {
           integrationId: row.integration_id,
           platform:      'bolcom',
-          apiKey:        row.api_key,
-          apiSecret:     row.api_secret,
+          apiKey:        clientId,
+          apiSecret:     clientSecret,
         };
 
         const result = await syncBolcomAdvertisingData(creds, row.tenant_id, access_token);
 
-        // next_sync_at bijwerken naar over 1 uur
         await db.query(
           `UPDATE tenant_integrations
            SET next_sync_at = now() + INTERVAL '1 hour',
@@ -220,18 +234,15 @@ async function main(): Promise<void> {
     batchSize:          BATCH_SIZE,
   });
 
-  // Direct uitvoeren bij opstarten
   await scheduleIncrementalSyncs();
   await scheduleAdvertisingSync();
   await cleanupStaleJobs();
 
-  // Reguliere sync: elke 15 minuten
   setInterval(async () => {
     await scheduleIncrementalSyncs();
     await cleanupStaleJobs();
   }, SCHEDULER_INTERVAL_MS);
 
-  // Advertising sync: elk uur
   setInterval(async () => {
     await scheduleAdvertisingSync();
   }, ADV_INTERVAL_MS);
