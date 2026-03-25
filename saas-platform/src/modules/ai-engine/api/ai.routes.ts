@@ -356,9 +356,12 @@ router.post('/video-script', async (req: Request, res: Response, next: NextFunct
       'founder-story':  'First-person voice. Tell the story of discovering this insight. Authentic, relatable, real.',
     };
 
+    const safeIndex = index ?? 0;
+    const safeTotal = total ?? 1;
+
     const prompt = `You are a viral video script writer for MarketGrow — an AI analytics platform for ecommerce entrepreneurs.
 
-Write ${total > 1 ? `script ${index + 1} of ${total} — make it COMPLETELY different from the others. ` : 'a '}${format.label} video script (${format.words} spoken words ±10%) using the "${angle.label}" angle.
+Write ${safeTotal > 1 ? `script ${safeIndex + 1} of ${safeTotal} — make it COMPLETELY different from the others. ` : 'a '}${format.label} video script (${format.words} spoken words ±10%) using the "${angle.label}" angle.
 
 ANGLE: ${angleGuide[angle.id] ?? angle.label}
 
