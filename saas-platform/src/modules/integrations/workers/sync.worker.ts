@@ -245,30 +245,36 @@ export const syncWorker = new Worker<SyncJobPayload>(
 
           for (const product of result.items) {
             await db.query(
-              `INSERT INTO products
-                 (id, tenant_id, integration_id, external_id, title, status,
-                  total_inventory, price_min, price_max, updated_at_source, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
+              `INSERT INTO products (
+                 tenant_id, integration_id, external_id, title, handle, status,
+                 product_type, tags, vendor, total_inventory, requires_shipping,
+                 price_min, price_max, published_at, updated_at,
+                 ean, condition, fulfillment_by
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                ON CONFLICT (tenant_id, integration_id, external_id)
                DO UPDATE SET
-                 title            = EXCLUDED.title,
-                 status           = EXCLUDED.status,
-                 total_inventory  = EXCLUDED.total_inventory,
-                 price_min        = EXCLUDED.price_min,
-                 price_max        = EXCLUDED.price_max,
-                 updated_at_source = EXCLUDED.updated_at_source,
-                 updated_at       = now()`,
+                 title           = EXCLUDED.title,
+                 status          = EXCLUDED.status,
+                 total_inventory = EXCLUDED.total_inventory,
+                 price_min       = EXCLUDED.price_min,
+                 price_max       = EXCLUDED.price_max,
+                 ean             = COALESCE(EXCLUDED.ean, products.ean),
+                 condition       = COALESCE(EXCLUDED.condition, products.condition),
+                 fulfillment_by  = COALESCE(EXCLUDED.fulfillment_by, products.fulfillment_by),
+                 updated_at      = now(),
+                 synced_at       = now()`,
               [
-                uuidv4(),
-                tenantId,
-                integrationId,
-                product.externalId,
-                product.title,
-                product.status,
-                product.totalInventory ?? null,
-                product.priceMin ?? null,
-                product.priceMax ?? null,
-                product.updatedAt,
+                tenantId, integrationId, product.externalId,
+                product.title, (product as any).handle ?? null,
+                product.status ?? 'active', (product as any).productType ?? null,
+                product.tags ? JSON.stringify(product.tags) : null,
+                (product as any).vendor ?? null,
+                product.totalInventory ?? 0, product.requiresShipping ?? true,
+                product.priceMin ?? null, product.priceMax ?? null,
+                (product as any).publishedAt ?? null, product.updatedAt,
+                (product as any).ean ?? null,
+                (product as any).condition ?? 'NEW',
+                (product as any).fulfillmentBy ?? 'FBR',
               ],
               { allowNoTenant: true }
             );
