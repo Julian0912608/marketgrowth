@@ -37,7 +37,7 @@ const SocialContentSchema = z.object({
 const GenerateImageSchema = z.object({
   prompt:     z.string().min(1).max(1000),
   slideTitle: z.string().max(200).optional(),
-  slideBody:  z.string().max(500).optional(),
+  slideBody:  z.string().max(2000).optional(),
   index:      z.number().int().min(0).max(20).optional().default(0),
 });
 
