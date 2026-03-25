@@ -1,9 +1,9 @@
 // saas-platform/src/modules/integrations/api/integration.routes.ts
 //
-// SECURITY UPDATE: Bol.com Advertising credentials worden nu
-// versleuteld opgeslagen (connect) en gedecrypteerd bij gebruik (sync).
+// SECURITY UPDATE: Zod validatie op alle POST endpoints
 
 import { Router, Request, Response, NextFunction } from 'express';
+import { z }                                        from 'zod';
 import { v4 as uuidv4 }                            from 'uuid';
 import { IntegrationService }                       from '../service/integration.service';
 import { tenantMiddleware }                         from '../../../shared/middleware/tenant.middleware';
@@ -15,6 +15,49 @@ import { encryptToken, decryptToken }               from '../../../shared/crypto
 
 const router             = Router();
 const integrationService = new IntegrationService();
+
+// ── Zod schemas ───────────────────────────────────────────────
+
+const PLATFORM_SLUGS = [
+  'shopify','woocommerce','lightspeed','bigcommerce',
+  'bolcom','magento','amazon','etsy',
+] as const;
+
+const ConnectSchema = z.object({
+  platformSlug: z.enum(PLATFORM_SLUGS),
+  shopDomain:   z.string().max(253).optional(),
+  apiKey:       z.string().max(500).optional(),
+  apiSecret:    z.string().max(500).optional(),
+  storeUrl:     z.string().url().max(500).optional(),
+});
+
+const ShopifyInstallSchema = z.object({
+  shopDomain: z.string().min(1).max(253),
+});
+
+const BolcomConnectSchema = z.object({
+  clientId:     z.string().min(1).max(200),
+  clientSecret: z.string().min(1).max(200),
+});
+
+const SyncSchema = z.object({
+  jobType: z.enum(['full_sync', 'incremental']).optional().default('incremental'),
+});
+
+// ── Validate helper ───────────────────────────────────────────
+function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    const messages = result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+    throw Object.assign(new Error(messages), { httpStatus: 400 });
+  }
+  return result.data;
+}
+
+// ── UUID param guard ──────────────────────────────────────────
+function validateUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
 
 // Webhooks en OAuth callbacks slaan auth over
 router.use((req, res, next) => {
@@ -49,7 +92,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
 // ── POST /api/integrations/connect ───────────────────────────
 router.post('/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const result = await integrationService.connect(req.body);
+    const input  = validate(ConnectSchema, req.body);
+    const result = await integrationService.connect(input);
     if (result.authUrl) {
       res.json({ status: 'oauth_required', authUrl: result.authUrl });
       return;
@@ -61,15 +105,8 @@ router.post('/connect', async (req: Request, res: Response, next: NextFunction) 
 // ── POST /api/integrations/shopify/install ───────────────────
 router.post('/shopify/install', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { shopDomain } = req.body;
-    if (!shopDomain) {
-      res.status(400).json({ error: 'shopDomain is verplicht' });
-      return;
-    }
-    const result = await integrationService.connect({
-      platformSlug: 'shopify',
-      shopDomain,
-    });
+    const { shopDomain } = validate(ShopifyInstallSchema, req.body);
+    const result = await integrationService.connect({ platformSlug: 'shopify', shopDomain });
     res.json({ installUrl: result.authUrl, status: result.status });
   } catch (err) { next(err); }
 });
@@ -84,6 +121,14 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
       res.status(400).json({ error: 'Missende code of state parameter' });
       return;
     }
+    if (typeof code !== 'string' || code.length > 512) {
+      res.status(400).json({ error: 'Ongeldige code parameter' });
+      return;
+    }
+    if (typeof state !== 'string' || state.length > 128) {
+      res.status(400).json({ error: 'Ongeldige state parameter' });
+      return;
+    }
 
     const result      = await integrationService.handleOAuthCallback(platform, code, state);
     const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
@@ -95,18 +140,11 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 });
 
 // ── POST /api/integrations/advertising/bolcom/connect ────────
-// LET OP: staat VOOR /:id/* routes zodat Express 'advertising' niet als :id pakt
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId } = getTenantContext();
-    const { clientId, clientSecret } = req.body as { clientId: string; clientSecret: string };
+    const { tenantId }               = getTenantContext();
+    const { clientId, clientSecret } = validate(BolcomConnectSchema, req.body);
 
-    if (!clientId || !clientSecret) {
-      res.status(400).json({ error: 'Client ID en Client Secret zijn verplicht' });
-      return;
-    }
-
-    // Test verbinding door token op te halen (plain text credentials voor de API call)
     const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
     const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method: 'POST',
@@ -142,7 +180,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
     );
     const actualId = existing.rows[0]?.id || integrationId;
 
-    // ✅ ENCRYPTED: clientId en clientSecret worden versleuteld opgeslagen
     await db.query(
       `INSERT INTO integration_credentials (integration_id, api_key, api_secret, updated_at, encrypted_at)
        VALUES ($1, $2, $3, now(), now())
@@ -152,15 +189,10 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
          api_secret   = EXCLUDED.api_secret,
          updated_at   = now(),
          encrypted_at = now()`,
-      [
-        actualId,
-        encryptToken(clientId),
-        encryptToken(clientSecret),
-      ],
+      [actualId, encryptToken(clientId), encryptToken(clientSecret)],
       { allowNoTenant: true }
     );
 
-    // Initiële sync uitvoeren met plain text credentials (net opgehaald, nog in geheugen)
     const creds: IntegrationCredentials = {
       integrationId: actualId,
       platform:      'bolcom',
@@ -179,7 +211,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
 });
 
 // ── POST /api/integrations/advertising/bolcom/sync ───────────
-// LET OP: staat VOOR /:id/* routes
 router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -201,16 +232,14 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
 
     const { id: integrationId, api_key: storedApiKey, api_secret: storedApiSecret } = result.rows[0];
 
-    // ✅ DECRYPTED: credentials gedecrypteerd voor gebruik
-    const clientId     = decryptToken(storedApiKey)     ?? '';
-    const clientSecret = decryptToken(storedApiSecret)  ?? '';
+    const clientId     = decryptToken(storedApiKey)    ?? '';
+    const clientSecret = decryptToken(storedApiSecret) ?? '';
 
     if (!clientId || !clientSecret) {
       res.status(500).json({ error: 'Credentials konden niet worden opgehaald' });
       return;
     }
 
-    // Fresh token ophalen met gedecrypte credentials
     const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
     const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method: 'POST',
@@ -255,10 +284,13 @@ router.post('/advertising/bolcom/sync', async (req: Request, res: Response, next
 });
 
 // ── POST /api/integrations/:id/sync ──────────────────────────
-// LET OP: altijd NA de /advertising/* routes
 router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { jobType = 'incremental' } = req.body as { jobType?: 'full_sync' | 'incremental' };
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig integration ID' });
+      return;
+    }
+    const { jobType } = validate(SyncSchema, req.body);
     const result = await integrationService.triggerSync(req.params.id, jobType);
     res.json(result);
   } catch (err) { next(err); }
@@ -267,6 +299,10 @@ router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction)
 // ── GET /api/integrations/:id/sync-status ────────────────────
 router.get('/:id/sync-status', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig integration ID' });
+      return;
+    }
     const status = await integrationService.getSyncStatus(req.params.id);
     res.json(status);
   } catch (err) { next(err); }
@@ -275,9 +311,18 @@ router.get('/:id/sync-status', async (req: Request, res: Response, next: NextFun
 // ── DELETE /api/integrations/:id ─────────────────────────────
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig integration ID' });
+      return;
+    }
     await integrationService.disconnect(req.params.id);
     res.json({ success: true });
   } catch (err) { next(err); }
+});
+
+// ── POST /api/integrations/webhook/:platform ─────────────────
+router.post('/webhook/:platform', async (_req: Request, res: Response) => {
+  res.sendStatus(200);
 });
 
 export { router as integrationRouter };
