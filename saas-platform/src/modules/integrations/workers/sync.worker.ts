@@ -185,24 +185,43 @@ export const syncWorker = new Worker<SyncJobPayload>(
           for (const order of result.items) {
             await db.query(
               `INSERT INTO orders
-                 (id, tenant_id, integration_id, external_id, status, total_price, currency,
-                  customer_email_hash, ordered_at, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
+                 (id, tenant_id, integration_id, external_id, external_number, platform_slug,
+                  total_amount, subtotal_amount, tax_amount, shipping_amount, discount_amount,
+                  currency, status, financial_status, fulfillment_status,
+                  customer_email_hash, is_first_order, tags, note, source,
+                  ordered_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,now())
                ON CONFLICT (tenant_id, integration_id, external_id)
                DO UPDATE SET
-                 status      = EXCLUDED.status,
-                 total_price = EXCLUDED.total_price,
-                 ordered_at  = EXCLUDED.ordered_at,
-                 updated_at  = now()`,
+                 total_amount       = EXCLUDED.total_amount,
+                 subtotal_amount    = EXCLUDED.subtotal_amount,
+                 tax_amount         = EXCLUDED.tax_amount,
+                 status             = EXCLUDED.status,
+                 financial_status   = EXCLUDED.financial_status,
+                 fulfillment_status = EXCLUDED.fulfillment_status,
+                 updated_at         = now(),
+                 synced_at          = now()`,
               [
                 uuidv4(),
                 tenantId,
                 integrationId,
                 order.externalId,
-                order.status,
+                order.externalNumber || null,
+                platformSlug,
                 order.totalAmount,
+                order.subtotalAmount,
+                order.taxAmount,
+                order.shippingAmount,
+                order.discountAmount,
                 order.currency,
+                order.status,
+                order.financialStatus || null,
+                order.fulfillmentStatus || null,
                 order.customerEmailHash || null,
+                order.isFirstOrder || null,
+                order.tags ? JSON.stringify(order.tags) : null,
+                order.note || null,
+                order.source || null,
                 order.orderedAt,
               ],
               { allowNoTenant: true }
