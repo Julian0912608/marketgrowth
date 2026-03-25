@@ -13,11 +13,11 @@ const onboardingService = new OnboardingService();
 router.use(tenantMiddleware());
 
 const VALID_STEPS: OnboardingStep[] = [
-  'connect_store',
-  'invite_team',
-  'setup_billing',
-  'complete_profile',
-  'explore_dashboard',
+  'account_created',
+  'plan_selected',
+  'payment_completed',
+  'shop_connected',
+  'completed',
 ];
 
 const CompleteStepSchema = z.object({
