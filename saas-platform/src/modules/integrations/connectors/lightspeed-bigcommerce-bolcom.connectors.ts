@@ -250,8 +250,8 @@ export class BigCommerceConnector implements IPlatformConnector {
 // Auth:    Client Credentials via login.bol.com/token
 // Token:   Gecached 240 sec in Redis (token geldig 299 sec)
 // Orders:  Full sync via Shipments API (FBR + FBB)
-//          Incremental via change-interval-minute parameter (FBR + FBB)
-// Prijzen: Via /retailer/orders/{orderId} detail call
+//          Incremental via change-interval-minute parameter
+// Prijzen: Via /retailer/orders/{orderId} detail (niet in shipment list)
 // Producten: Async Offers export (POST → poll → CSV)
 // 429:     Retry met Retry-After header
 // ============================================================
@@ -296,7 +296,7 @@ export class BolcomConnector implements IPlatformConnector {
     return this.fetchViaOrders(token, options.updatedAfter, page);
   }
 
-  // ── Full sync: via Shipments API (FBR + FBB) ──────────────
+  // Full sync: via Shipments API (FBR + FBB apart)
   private async fetchViaShipments(token: string, page: number): Promise<PaginatedResult<NormalizedOrder>> {
     const [fbrData, fbbData] = await Promise.all([
       this.apiGet(token, '/retailer/shipments?fulfilment-method=FBR&page=' + page)
@@ -320,83 +320,52 @@ export class BolcomConnector implements IPlatformConnector {
       seenOrderIds.add(orderId);
 
       try {
-        const detail = await this.apiGet(token, '/retailer/orders/' + orderId) as Record<string, unknown>;
-        orders.push(this.normalizeOrderDetail(detail));
+        const detail     = await this.apiGet(token, '/retailer/orders/' + orderId) as Record<string, unknown>;
+        const normalized = this.normalizeOrderDetail(detail);
+        // ✅ FIX: alleen opslaan als we een geldige orderPlacedDateTime hebben
+        if (normalized.orderedAt && !isNaN(normalized.orderedAt.getTime())) {
+          orders.push(normalized);
+        }
       } catch {
-        orders.push(this.normalizeShipment(s, orderId));
+        const normalized = this.normalizeShipment(s, orderId);
+        // ✅ FIX: alleen opslaan als we een geldige datum hebben (niet new Date() als fallback)
+        if (normalized.orderedAt && !isNaN(normalized.orderedAt.getTime())) {
+          orders.push(normalized);
+        }
       }
     }
 
     return { items: orders, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
-  // ── Incremental sync: via Orders API (FBR + FBB) ──────────
-  // FIX: haalt nu zowel FBR als FBB op, en doet detail calls voor correcte prijzen
+  // Incremental sync: via Orders API met change-interval-minute
   private async fetchViaOrders(token: string, updatedAfter: Date | undefined, page: number): Promise<PaginatedResult<NormalizedOrder>> {
     const minutesAgo    = updatedAfter
       ? Math.ceil((Date.now() - updatedAfter.getTime()) / 60000)
       : 120;
     const cappedMinutes = Math.min(minutesAgo, 2880); // max 48u
 
-    // FIX 1: haal zowel FBR als FBB op parallel
-    const [fbrData, fbbData] = await Promise.all([
-      this.apiGet(
-        token,
-        '/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=' + cappedMinutes + '&page=' + page
-      ).catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
-      this.apiGet(
-        token,
-        '/retailer/orders?status=ALL&fulfilment-method=FBB&change-interval-minute=' + cappedMinutes + '&page=' + page
-      ).catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
-    ]);
+    const data = await this.apiGet(
+      token,
+      '/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=' + cappedMinutes + '&page=' + page
+    ) as { orders?: Record<string, unknown>[] };
 
-    const allRawOrders = [...(fbrData.orders || []), ...(fbbData.orders || [])];
-
-    // FIX 2: deduplicate op orderId
-    const seenIds = new Set<string>();
-    const uniqueOrders = allRawOrders.filter(o => {
-      const id = String((o as Record<string, unknown>).orderId || '');
-      if (!id || seenIds.has(id)) return false;
-      seenIds.add(id);
-      return true;
-    });
-
-    // FIX 3: detail call per order zodat prijzen correct zijn
-    // normalizeOrderSummary geeft unitPrice=0 terug omdat de lijst geen prijzen bevat
-    const items: NormalizedOrder[] = [];
-    for (const o of uniqueOrders) {
-      const orderId = String((o as Record<string, unknown>).orderId || '');
-      try {
-        const detail = await this.apiGet(token, '/retailer/orders/' + orderId) as Record<string, unknown>;
-        items.push(this.normalizeOrderDetail(detail));
-      } catch {
-        // Fallback naar summary als detail call mislukt (bijv. rate limit)
-        items.push(this.normalizeOrderSummary(o as Record<string, unknown>));
-      }
-    }
-
-    const hasNextPage = (fbrData.orders || []).length === 50 || (fbbData.orders || []).length === 50;
-    return { items, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
+    const rawOrders = data.orders || [];
+    const items = rawOrders.map(o => this.normalizeOrderSummary(o));
+    return { items, hasNextPage: rawOrders.length === 50, nextPage: rawOrders.length === 50 ? page + 1 : undefined };
   }
 
   async fetchProducts(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedProduct>> {
     const token = await this.getAccessToken(creds);
     try {
-      // Start async export
-      const exportRes = await this.apiPost(token, '/retailer/offers/export', {
-        format: 'CSV',
-      }) as { processStatusId?: string };
-
+      const exportRes = await this.apiPost(token, '/retailer/offers/export', { format: 'CSV' }) as { processStatusId?: string };
       const processId = exportRes.processStatusId;
       if (!processId) return { items: [], hasNextPage: false };
 
-      // Poll tot klaar (max 10x, 3 sec interval)
       let reportId: string | null = null;
       for (let i = 0; i < 10; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        const status = await this.apiGet(token, '/shared/process-status/' + processId) as {
-          status?: string; entityId?: string;
-        };
+        const status = await this.apiGet(token, '/shared/process-status/' + processId) as { status?: string; entityId?: string };
         if (status.status === 'SUCCESS' && status.entityId) {
           reportId = status.entityId;
           break;
@@ -406,8 +375,7 @@ export class BolcomConnector implements IPlatformConnector {
 
       if (!reportId) return { items: [], hasNextPage: false };
 
-      // Download CSV
-      const csv = await this.apiGetCsv(token, '/retailer/offers/export/' + reportId);
+      const csv   = await this.apiGetCsv(token, '/retailer/offers/export/' + reportId);
       const items = this.parseCsvOffers(csv);
       return { items, hasNextPage: false };
     } catch {
@@ -426,18 +394,14 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // ── Token ophalen met caching ──────────────────────────────
-  // Token is 299 sec geldig. We cachen 240 sec (60 sec buffer).
-  // Bol.com heeft strikte rate limits op de auth endpoint.
   private async getAccessToken(creds: IntegrationCredentials): Promise<string> {
     const cacheKey = 'bolcom:token:' + creds.integrationId;
 
-    // 1. Check in-memory cache
     const mem = tokenMemoryCache[cacheKey];
     if (mem && mem.expiresAt > Date.now()) {
       return mem.token;
     }
 
-    // 2. Check Redis cache (als beschikbaar)
     try {
       const { cache } = await import('../../../infrastructure/cache/redis');
       const cached = await cache.get(cacheKey);
@@ -449,7 +413,6 @@ export class BolcomConnector implements IPlatformConnector {
       // Redis niet beschikbaar — doorgaan
     }
 
-    // 3. Nieuwe token ophalen
     const encoded = Buffer.from((creds.apiKey || '') + ':' + (creds.apiSecret || '')).toString('base64');
     const res = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
       method:  'POST',
@@ -466,18 +429,16 @@ export class BolcomConnector implements IPlatformConnector {
     }
 
     const d = await res.json() as { access_token: string; expires_in?: number };
-    const token = d.access_token;
-    const ttlMs = ((d.expires_in || 299) - 60) * 1000;
+    const token  = d.access_token;
+    const ttlMs  = ((d.expires_in || 299) - 60) * 1000;
 
-    // Sla op in memory cache
     tokenMemoryCache[cacheKey] = { token, expiresAt: Date.now() + ttlMs };
 
-    // Sla op in Redis cache
     try {
       const { cache } = await import('../../../infrastructure/cache/redis');
       await cache.set(cacheKey, token, Math.floor(ttlMs / 1000));
     } catch {
-      // Redis niet beschikbaar — alleen memory cache
+      // Redis niet beschikbaar
     }
 
     return token;
@@ -502,6 +463,11 @@ export class BolcomConnector implements IPlatformConnector {
     });
 
     const totalAmount = lineItems.reduce((acc, li) => acc + li.totalPrice, 0);
+
+    // ✅ FIX: gebruik orderPlacedDateTime — als die er niet is, retourneer een ongeldige datum
+    // zodat de caller hem kan filteren
+    const orderedAtRaw = o.orderPlacedDateTime ? new Date(String(o.orderPlacedDateTime)) : new Date(0);
+
     return {
       externalId:        String(o.orderId || ''),
       externalNumber:    String(o.orderId || ''),
@@ -515,21 +481,21 @@ export class BolcomConnector implements IPlatformConnector {
       financialStatus:   'paid',
       fulfillmentStatus: 'fulfilled',
       lineItems,
-      orderedAt:         o.orderPlacedDateTime ? new Date(String(o.orderPlacedDateTime)) : new Date(),
+      orderedAt:         orderedAtRaw,
       updatedAt:         new Date(),
     };
   }
 
-  // ── Normaliseer shipment (fallback bij full sync) ──────────
+  // ── Normaliseer shipment (fallback als order detail faalt) ─
   private normalizeShipment(s: Record<string, unknown>, orderId: string): NormalizedOrder {
     const items = (s.shipmentItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = items.map(item => {
       const unitPrice  = parsePrice(item.unitPrice || item.offerPrice || item.sellingPrice);
       const quantity   = safeInt(item.quantity || item.quantityShipped || 1, 1);
       const product    = item.product as Record<string, unknown> | undefined;
-      const finalPrice = unitPrice > 0
-        ? unitPrice
-        : parsePrice((item as any).offerPrice || (item as any).bundleItemPrice || 0);
+      const finalPrice = unitPrice > 0 ? unitPrice : parsePrice(
+        (item as any).offerPrice || (item as any).bundleItemPrice || 0
+      );
       return {
         externalId:     String(item.orderItemId || item.shipmentItemId || ''),
         sku:            String(item.ean || ''),
@@ -543,7 +509,16 @@ export class BolcomConnector implements IPlatformConnector {
 
     const validItems  = lineItems.filter(li => li.unitPrice > 0 || li.title.length > 13);
     const totalAmount = validItems.reduce((acc, li) => acc + li.totalPrice, 0);
-    const shipDate    = s.shipmentDate || s.orderPlacedDateTime;
+
+    // ✅ FIX: gebruik orderPlacedDateTime als eerste keus, shipmentDate als tweede
+    // Geef new Date(0) terug als er geen datum is — caller filtert dit eruit
+    const orderPlaced = s.orderPlacedDateTime
+      ? new Date(String(s.orderPlacedDateTime))
+      : null;
+    const shipDate = s.shipmentDate
+      ? new Date(String(s.shipmentDate))
+      : null;
+    const orderedAt = orderPlaced ?? shipDate ?? new Date(0);
 
     return {
       externalId:        orderId,
@@ -558,13 +533,12 @@ export class BolcomConnector implements IPlatformConnector {
       financialStatus:   'paid',
       fulfillmentStatus: 'fulfilled',
       lineItems,
-      orderedAt:         shipDate ? new Date(String(shipDate)) : new Date(),
+      orderedAt,
       updatedAt:         new Date(),
     };
   }
 
-  // ── Normaliseer order summary (fallback bij incremental) ───
-  // Wordt alleen gebruikt als de detail call mislukt (rate limit / netwerk)
+  // ── Normaliseer order summary (incremental) ────────────────
   private normalizeOrderSummary(o: Record<string, unknown>): NormalizedOrder {
     const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = orderItems.map(item => {
@@ -596,7 +570,9 @@ export class BolcomConnector implements IPlatformConnector {
       financialStatus:   'paid',
       fulfillmentStatus: 'fulfilled',
       lineItems,
-      orderedAt:         o.orderPlacedDateTime ? new Date(String(o.orderPlacedDateTime)) : new Date(),
+      orderedAt:         o.orderPlacedDateTime
+        ? new Date(String(o.orderPlacedDateTime))
+        : new Date(0),
       updatedAt:         new Date(),
     };
   }
