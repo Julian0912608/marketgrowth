@@ -314,11 +314,11 @@ ${customContext ? `\nExtra context: ${customContext}` : ''}`.trim();
     const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} unique posts for ${platform}.
 TOPIC: ${topicGuide[topic] || topic}
 TONE: ${toneGuide[tone] || tone}
-FORMAT: ${formatGuide[format] || formatGuide['single']}
+FORMAT: ${formatGuide[format ?? 'single'] || formatGuide['single']}
 PLATFORM STYLE: ${platformGuide[platform]}
 ${storeContext}
 Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown:
-${outputFormat[format] || outputFormat['single']}`;
+${outputFormat[format ?? 'single'] || outputFormat['single']}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
