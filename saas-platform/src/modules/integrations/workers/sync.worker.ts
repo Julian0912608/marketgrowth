@@ -200,7 +200,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
                 integrationId,
                 order.externalId,
                 order.status,
-                order.totalPrice,
+                order.totalAmount,
                 order.currency,
                 order.customerEmailHash || null,
                 order.orderedAt,
