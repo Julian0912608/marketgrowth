@@ -1,3 +1,10 @@
+// ============================================================
+// src/modules/integrations/service/integration.service.ts
+//
+// SECURITY UPDATE: Alle credentials worden nu versleuteld
+// opgeslagen via AES-256-GCM (token-encryption.ts).
+// ============================================================
+
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../../../infrastructure/database/connection';
@@ -6,6 +13,7 @@ import { logger } from '../../../shared/logging/logger';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { syncQueue } from '../workers/sync.worker';
 import { getConnector } from '../connectors/connector.factory';
+import { encryptToken, decryptToken } from '../../../shared/crypto/token-encryption';
 import {
   PlatformSlug,
   ConnectIntegrationRequest,
@@ -31,12 +39,10 @@ const PLATFORM_NAMES: Record<PlatformSlug, string> = {
   magento:     'Magento',
   amazon:      'Amazon',
   etsy:        'Etsy',
-  google_ads: 'Google Ads',
 };
 
 const OAUTH_PLATFORMS: PlatformSlug[] = ['shopify', 'amazon', 'etsy'];
 
-// Volledige Shopify scope lijst — moet overeenkomen met Shopify Partner app config
 const SHOPIFY_SCOPES = 'read_analytics,read_customers,read_inventory,read_marketing_events,read_orders,read_products,read_reports';
 
 export class IntegrationService {
@@ -184,7 +190,6 @@ export class IntegrationService {
       throw new Error('Onbekend OAuth platform: ' + platformSlug);
     }
 
-    // Test de verbinding
     const connector = getConnector(platformSlug);
     const tempCreds: IntegrationCredentials = {
       integrationId,
@@ -196,7 +201,6 @@ export class IntegrationService {
     const testResult = await connector.testConnection(tempCreds);
     if (!testResult.success) throw new Error('Verbindingstest mislukt: ' + testResult.error);
 
-    // Sla integratie op
     await db.query(
       `INSERT INTO tenant_integrations
          (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
@@ -207,17 +211,24 @@ export class IntegrationService {
       { allowNoTenant: true }
     );
 
-    // Sla credentials op
+    // ✅ ENCRYPTED: access_token en refresh_token worden versleuteld opgeslagen
     await db.query(
-      `INSERT INTO integration_credentials (integration_id, access_token, refresh_token, updated_at)
-       VALUES ($1, $2, $3, now())
+      `INSERT INTO integration_credentials (integration_id, access_token, refresh_token, updated_at, encrypted_at)
+       VALUES ($1, $2, $3, now(), now())
        ON CONFLICT (integration_id)
-       DO UPDATE SET access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token, updated_at = now()`,
-      [integrationId, accessToken, refreshToken || null],
+       DO UPDATE SET
+         access_token  = EXCLUDED.access_token,
+         refresh_token = EXCLUDED.refresh_token,
+         updated_at    = now(),
+         encrypted_at  = now()`,
+      [
+        integrationId,
+        encryptToken(accessToken),
+        encryptToken(refreshToken || null),
+      ],
       { allowNoTenant: true }
     );
 
-    // Start initiële full sync
     const syncJobDbId = uuidv4();
     await syncQueue.add('sync:' + platformSlug + ':' + integrationId + ':initial', {
       integrationId,
@@ -264,10 +275,16 @@ export class IntegrationService {
       { allowNoTenant: true }
     );
 
+    // ✅ ENCRYPTED: api_key en api_secret worden versleuteld opgeslagen
     await db.query(
-      `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at)
-       VALUES ($1, $2, $3, $4, now())`,
-      [integrationId, input.apiKey || null, input.apiSecret || null, input.storeUrl || null],
+      `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at, encrypted_at)
+       VALUES ($1, $2, $3, $4, now(), now())`,
+      [
+        integrationId,
+        encryptToken(input.apiKey || null),
+        encryptToken(input.apiSecret || null),
+        input.storeUrl || null,
+      ],
       { allowNoTenant: true }
     );
 
