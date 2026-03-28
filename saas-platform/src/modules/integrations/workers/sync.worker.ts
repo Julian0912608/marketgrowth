@@ -10,7 +10,6 @@
 
 import { Queue, Worker, Job } from 'bullmq';
 import { db }                from '../../../infrastructure/database/connection';
-import { redis }             from '../../../infrastructure/cache/redis';
 import { logger }            from '../../../shared/logging/logger';
 import { getConnector }      from '../connectors/connector.factory';
 import { runWithTenantContext } from '../../../shared/middleware/tenant-context';
@@ -21,6 +20,10 @@ import {
   PlatformSlug,
   IntegrationCredentials,
 } from '../types/integration.types';
+
+// Raw redis voor incr/decr/expire/del
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
 
 export interface SyncJobPayload {
   integrationId: string;
@@ -78,10 +81,10 @@ const MAX_CONCURRENT_PER_TENANT = 2;
 async function acquireTenantSlot(tenantId: string): Promise<boolean> {
   const key = `sync:concurrent:${tenantId}`;
   try {
-    const current = await (redis as any).incr(key);
-    if (current === 1) await (redis as any).expire(key, 3600);
+    const current = await rawRedis.incr(key);
+    if (current === 1) await rawRedis.expire(key, 3600);
     if (current > MAX_CONCURRENT_PER_TENANT) {
-      await (redis as any).decr(key);
+      await rawRedis.decr(key);
       return false;
     }
     return true;
@@ -93,8 +96,8 @@ async function acquireTenantSlot(tenantId: string): Promise<boolean> {
 async function releaseTenantSlot(tenantId: string): Promise<void> {
   const key = `sync:concurrent:${tenantId}`;
   try {
-    const val = await (redis as any).decr(key);
-    if (val <= 0) await (redis as any).del(key);
+    const val = await rawRedis.decr(key);
+    if (val <= 0) await rawRedis.del(key);
   } catch {}
 }
 
@@ -103,8 +106,8 @@ async function acquireRateLimit(platformSlug: string, integrationId: string): Pr
   const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
   const limit = getRateLimit(platformSlug);
   try {
-    const current = await (redis as any).incr(key);
-    if (current === 1) await (redis as any).expire(key, 1);
+    const current = await rawRedis.incr(key);
+    if (current === 1) await rawRedis.expire(key, 1);
     if (current > limit) await new Promise(r => setTimeout(r, 1000));
   } catch {}
 }
