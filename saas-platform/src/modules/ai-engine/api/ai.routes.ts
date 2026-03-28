@@ -525,9 +525,9 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
          COUNT(DISTINCT o.id)::int            AS orders_30d,
          AVG(oli.unit_price)                  AS avg_price,
          MAX(p.ean)                           AS ean,
-         MAX(p.id)::text                      AS product_id,
+         MAX(p.id::text)                      AS product_id,
          MAX(p.image_url)                     AS image_url,
-         MAX(p.price_min)                     AS price_min
+         MAX(p.price_min::text)               AS price_min
        FROM order_line_items oli
        JOIN orders o ON o.id = oli.order_id
        JOIN tenant_integrations ti
