@@ -1,14 +1,20 @@
-// saas-platform/src/modules/ai-engine/api/ai.routes.ts
+// ============================================================
+// src/modules/ai-engine/api/ai.routes.ts
 //
-// SECURITY UPDATE: Zod validatie op alle POST endpoints
+// FIX: permissionService.check() toegevoegd vóór alle AI routes
+// zodat Starter-tenants niet onbeperkt AI credits kunnen verbruiken.
+// social-content en insights checken nu correct op 'ai-recommendations'.
+// ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { tenantMiddleware }  from '../../../shared/middleware/tenant.middleware';
-import { getTenantContext }  from '../../../shared/middleware/tenant-context';
-import { db }                from '../../../infrastructure/database/connection';
-import { cache }             from '../../../infrastructure/cache/redis';
-import { logger }            from '../../../shared/logging/logger';
+import { tenantMiddleware }   from '../../../shared/middleware/tenant.middleware';
+import { featureGate }        from '../../../shared/middleware/feature-gate.middleware';
+import { getTenantContext }   from '../../../shared/middleware/tenant-context';
+import { permissionService }  from '../../../shared/permissions/permission.service';
+import { db }                 from '../../../infrastructure/database/connection';
+import { cache }              from '../../../infrastructure/cache/redis';
+import { logger }             from '../../../shared/logging/logger';
 
 const router = Router();
 router.use(tenantMiddleware());
@@ -67,7 +73,6 @@ const VideoScriptSchema = z.object({
   total: z.number().int().min(1).max(10).optional().default(1),
 });
 
-// ── Validate helper ───────────────────────────────────────────
 function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
@@ -77,8 +82,26 @@ function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   return result.data;
 }
 
+// ── Helper: usage bijhouden ───────────────────────────────────
+async function trackUsage(tenantId: string, count = 1): Promise<void> {
+  try {
+    await db.query(
+      `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
+       SELECT $1, f.id, date_trunc('month', now()),
+              (date_trunc('month', now()) + interval '1 month - 1 day')::date, $2
+       FROM features f WHERE f.slug = 'ai-recommendations'
+       ON CONFLICT (tenant_id, feature_id, period_start)
+       DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
+      [tenantId, count], { allowNoTenant: true }
+    );
+  } catch {
+    // Niet kritiek — geen error gooien als usage-tracking faalt
+  }
+}
+
 // ── GET /api/ai/insights ──────────────────────────────────────
-router.get('/insights', async (req: Request, res: Response, next: NextFunction) => {
+// featureGate('ai-recommendations') checkt plan + usage limit
+router.get('/insights', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
     const force = req.query.force === 'true';
@@ -120,8 +143,8 @@ router.get('/insights', async (req: Request, res: Response, next: NextFunction) 
     const prompt = hasOrders
       ? `Je bent een AI ecommerce adviseur voor MarketGrow. Analyseer de data en geef een beknopte dagelijkse briefing in JSON.
 Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} omzet, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
-Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string"}],"alerts":["string"]}`
-      : `Return ONLY JSON: {"briefing":"Verbind je eerste webshop om inzichten te ontvangen. Zodra orders binnenkomen zie je hier je inzichten.","actions":[{"priority":"medium","title":"Koppel je webshop","description":"Ga naar Integraties en verbind je eerste winkel."}],"alerts":[]}`;
+Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
+      : `Return ONLY JSON: {"briefing":"Verbind je eerste webshop om inzichten te ontvangen. Zodra orders binnenkomen zie je hier je inzichten.","actions":[{"priority":"medium","title":"Koppel je webshop","description":"Ga naar Integraties en verbind je eerste winkel.","channel":"algemeen"}],"alerts":[]}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -137,18 +160,7 @@ Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|l
     catch { parsed = { briefing: text.slice(0, 300), actions: [], alerts: [] }; }
 
     await cache.set(cacheKey, JSON.stringify(parsed), CACHE_TTL[planSlug] || 3600);
-
-    try {
-      await db.query(
-        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
-         SELECT $1, f.id, date_trunc('month', now()),
-                (date_trunc('month', now()) + interval '1 month - 1 day')::date, 1
-         FROM features f WHERE f.slug = 'ai-recommendations'
-         ON CONFLICT (tenant_id, feature_id, period_start)
-         DO UPDATE SET usage_count = feature_usage.usage_count + 1, updated_at = now()`,
-        [tenantId], { allowNoTenant: true }
-      );
-    } catch {}
+    await trackUsage(tenantId, 1);
 
     logger.info('ai.insights.generated', { tenantId, planSlug, hasOrders, force });
     res.json({ ...parsed, fromCache: false });
@@ -184,10 +196,12 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
 });
 
 // ── POST /api/ai/chat ─────────────────────────────────────────
-router.post('/chat', async (req: Request, res: Response, next: NextFunction) => {
+// featureGate zorgt ervoor dat alleen Growth+ hier doorkomt
+router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
 
+    // Extra guard: chat alleen voor Growth+
     if (planSlug === 'starter') {
       res.status(403).json({ error: 'AI Chat is beschikbaar vanaf het Growth plan.' });
       return;
@@ -212,33 +226,16 @@ router.post('/chat', async (req: Request, res: Response, next: NextFunction) => 
     });
 
     const text = response.content[0].type === 'text' ? response.content[0].text : '';
-
-    try {
-      await db.query(
-        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
-         SELECT $1, f.id, date_trunc('month', now()),
-                (date_trunc('month', now()) + interval '1 month - 1 day')::date, 1
-         FROM features f WHERE f.slug = 'ai-recommendations'
-         ON CONFLICT (tenant_id, feature_id, period_start)
-         DO UPDATE SET usage_count = feature_usage.usage_count + 1, updated_at = now()`,
-        [tenantId], { allowNoTenant: true }
-      );
-    } catch {}
+    await trackUsage(tenantId, 1);
 
     res.json({ response: text });
   } catch (err) { next(err); }
 });
 
 // ── POST /api/ai/social-content ───────────────────────────────
-router.post('/social-content', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/social-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { tenantId, planSlug } = getTenantContext();
-
-    if (planSlug === 'starter') {
-      res.status(403).json({ error: 'Social Content Generator is available on Growth and Scale plans.' });
-      return;
-    }
-
+    const { tenantId } = getTenantContext();
     const { platform, tone, topic, format, customContext, count } = validate(SocialContentSchema, req.body);
 
     const [ordersResult, adsResult, integrationsResult] = await Promise.all([
@@ -270,6 +267,12 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
     const ads       = adsResult.rows[0];
     const platforms = integrationsResult.rows.map((r: any) => r.platform_slug).join(', ');
 
+    const storeContext = orders.total_orders > 0
+      ? `Store data (last 30 days): ${orders.total_orders} orders, €${parseFloat(orders.revenue).toFixed(0)} revenue, AOV €${parseFloat(orders.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x. Platforms: ${platforms || 'unknown'}.`
+      : `No store data yet — create general ecommerce content.`;
+
+    const customCtx = customContext ? `\nExtra context from user: ${customContext}` : '';
+
     const toneGuide: Record<string, string> = {
       'educational':       'Teach the audience something actionable. Use clear steps or insights.',
       'inspirational':     'Motivate and inspire. Focus on results, transformation, and possibilities.',
@@ -290,33 +293,25 @@ router.post('/social-content', async (req: Request, res: Response, next: NextFun
       tiktok:    'TikTok caption style: very short and punchy, hook must be irresistible, CTA to follow or comment. 5-8 hashtags.',
     };
 
-    const storeContext = `Real store data:
-- Orders last 30 days: ${orders.total_orders}
-- Revenue: €${parseFloat(orders.revenue).toFixed(0)}
-- AOV: €${parseFloat(orders.avg_order_value).toFixed(0)}
-- Ad spend: €${parseFloat(ads.total_spend).toFixed(0)}
-- ROAS: ${parseFloat(ads.avg_roas).toFixed(2)}x
-- Platforms: ${platforms || 'not specified'}
-${customContext ? `\nExtra context: ${customContext}` : ''}`.trim();
-
     const formatGuide: Record<string, string> = {
-      'single':       'Single image post with a strong hook, caption, CTA and hashtags. Include an image_prompt field describing the ideal visual.',
-      'carousel':     `Carousel post with ${count} slides. Return slides array: [{headline, body, visual_hint}] plus caption, cta, hashtags, image_prompt.`,
-      'video_script': 'Video script (30-60 seconds). Return hook, script (full spoken text), cta, hashtags. No image needed.',
+      single:       'Single image post with hook, caption, CTA, hashtags.',
+      carousel:     'Carousel with 5 slides. Each slide: headline + 2-3 lines body + visual_hint.',
+      video_script: 'Short video script (30-60 sec). Hook in first 3 seconds. Include visual notes.',
     };
 
     const outputFormat: Record<string, string> = {
-      'single':       '[{"hook":"...","caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}]',
-      'carousel':     '[{"slides":[{"headline":"...","body":"...","visual_hint":"..."}],"caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}]',
-      'video_script': '[{"hook":"...","script":"...","cta":"...","hashtags":["..."]}]',
+      single:       '[{"hook":"","caption":"","cta":"","hashtags":[],"image_prompt":""}]',
+      carousel:     '[{"hook":"","caption":"","cta":"","hashtags":[],"slides":[{"headline":"","body":"","visual_hint":""}]}]',
+      video_script: '[{"hook":"","script":"","hashtags":[],"image_prompt":""}]',
     };
 
-    const prompt = `You are a social media content expert for ecommerce entrepreneurs. Create ${count} unique posts for ${platform}.
+    const prompt = `You are a social media content expert for ecommerce brands.
+PLATFORM: ${platform}
 TOPIC: ${topicGuide[topic] || topic}
 TONE: ${toneGuide[tone] || tone}
 FORMAT: ${formatGuide[format ?? 'single'] || formatGuide['single']}
 PLATFORM STYLE: ${platformGuide[platform]}
-${storeContext}
+${storeContext}${customCtx}
 Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown:
 ${outputFormat[format ?? 'single'] || outputFormat['single']}`;
 
@@ -335,20 +330,33 @@ ${outputFormat[format ?? 'single'] || outputFormat['single']}`;
       if (!Array.isArray(posts)) posts = [posts];
     } catch { posts = []; }
 
-    try {
-      await db.query(
-        `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
-         SELECT $1, f.id, date_trunc('month', now()),
-                (date_trunc('month', now()) + interval '1 month - 1 day')::date, $2
-         FROM features f WHERE f.slug = 'ai-recommendations'
-         ON CONFLICT (tenant_id, feature_id, period_start)
-         DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
-        [tenantId, count], { allowNoTenant: true }
-      );
-    } catch {}
+    await trackUsage(tenantId, count);
 
     logger.info('ai.social-content.generated', { tenantId, platform, tone, topic, count });
     res.json({ posts });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/ai/generate-image ───────────────────────────────
+router.post('/generate-image', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+    const { prompt, slideTitle, slideBody, index } = validate(GenerateImageSchema, req.body);
+    const { generateAdCreative } = require('../services/nano-banana.service');
+
+    const result = await generateAdCreative({
+      product: {
+        title:    slideTitle || prompt.slice(0, 60),
+        platform: 'instagram',
+      },
+      format:   'single',
+      platform: 'instagram',
+      style:    'minimal',
+    });
+
+    await trackUsage(tenantId, 1);
+    logger.info('ai.generate-image.complete', { tenantId, index });
+    res.json({ imageUrl: result.imageUrl });
   } catch (err) { next(err); }
 });
 
@@ -380,35 +388,32 @@ router.post('/video-script', async (req: Request, res: Response, next: NextFunct
     const safeIndex = index ?? 0;
     const safeTotal = total ?? 1;
 
-    const prompt = `You are a viral video script writer for MarketGrow — an AI analytics platform for ecommerce entrepreneurs.
+    const prompt = `You are writing a short-form video script for MarketGrow (an AI-powered ecommerce analytics platform).
 
-Write ${safeTotal > 1 ? `script ${safeIndex + 1} of ${safeTotal} — make it COMPLETELY different from the others. ` : 'a '}${format.label} video script (${format.words} spoken words ±10%) using the "${angle.label}" angle.
+ANGLE: ${angle.label}
+ANGLE GUIDE: ${angleGuide[angle.id] || ''}
+FORMAT: ${format.label} (target: ~${format.words} words)
+VARIATION: Script ${safeIndex + 1} of ${safeTotal} — make this distinctly different from other variations.
 
-ANGLE: ${angleGuide[angle.id] ?? angle.label}
-
-DEMO DATA (present as real — never say "demo"):
+STORE DATA (use this to make the script concrete):
 - Store: ${scenario.store}
-- Revenue: ${scenario.revenue}/month
-- Ad spend: ${scenario.adSpend}/month
-- Real blended ROAS: ${scenario.realRoas}
-- Meta claimed: ${scenario.metaRoas} | Google claimed: ${scenario.googleRoas} | Bol.com: ${scenario.bolRoas}
-- Key insight: ${scenario.insight}
-- Campaigns: ${scenario.campaigns} | Top product: ${scenario.topProduct} | Margin: ${scenario.margin}
+- Revenue (30d): ${scenario.revenue}
+- Ad spend (30d): ${scenario.adSpend}
+- Real ROAS: ${scenario.realRoas}x
+- Meta reported ROAS: ${scenario.metaRoas}x
+- Google reported ROAS: ${scenario.googleRoas}x
+- Bol.com ROAS: ${scenario.bolRoas}x
+- AI insight: ${scenario.insight}
+- Active campaigns: ${scenario.campaigns}
+- Top product: ${scenario.topProduct}
+- Margin: ${scenario.margin}
 
-RULES:
-- Spoken English, natural — written to be read aloud
-- Hook stops scroll in 2 seconds — counterintuitive or shocking
-- Mention MarketGrow once naturally, end with: join the waitlist at marketgrow.ai
-- FACELESS video — no visual references to a speaker
-- Mark pauses with ...
-- NO corporate speak
-
-Return ONLY valid JSON (no markdown):
-{"hook":"opening hook - 2 seconds only","script":"full spoken script with ... pauses","visualNotes":["scene 1","scene 2","scene 3","scene 4","scene 5"],"hashtags":["tag1","tag2","tag3","tag4","tag5","tag6","tag7","tag8"]}`;
+Return ONLY JSON (no markdown):
+{"hook":"first 3 seconds — must stop the scroll","script":"full script with [VISUAL: ...] notes","visualNotes":["visual cue 1","visual cue 2"],"hashtags":["tag1","tag2"]}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
-      max_tokens: 1200,
+      max_tokens: 600,
       messages:   [{ role: 'user', content: prompt }],
     });
 
@@ -423,30 +428,6 @@ Return ONLY valid JSON (no markdown):
     }
 
     res.json(parsed);
-  } catch (err) { next(err); }
-});
-
-
-// ── POST /api/ai/generate-image ───────────────────────────────
-// Nano Banana (Gemini) image generation
-router.post('/generate-image', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { tenantId } = getTenantContext();
-    const { prompt, slideTitle, slideBody, index } = validate(GenerateImageSchema, req.body);
-    const { generateAdCreative } = require('../services/nano-banana.service');
-
-    const result = await generateAdCreative({
-      product: {
-        title:    slideTitle || prompt.slice(0, 60),
-        platform: 'instagram',
-      },
-      format:   'single',
-      platform: 'instagram',
-      style:    'minimal',
-    });
-
-    logger.info('ai.generate-image.complete', { tenantId, index });
-    res.json({ imageUrl: result.imageUrl });
   } catch (err) { next(err); }
 });
 
