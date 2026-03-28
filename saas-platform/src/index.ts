@@ -167,12 +167,6 @@ try {
 } catch (e: any) { console.error('  aiRouter FAILED:', e.message); }
 
 try {
-  const { productContentRouter } = require('./modules/ai-engine/api/product-content.routes');
-  app.use('/api/ai', productContentRouter);
-  console.log('  productContentRouter OK');
-} catch (e: any) { console.error('  productContentRouter FAILED:', e.message); }
-
-try {
   const { adminRouter } = require('./modules/admin/api/admin.routes');
   app.use('/api/admin', adminRouter);
   console.log('  adminRouter OK');
