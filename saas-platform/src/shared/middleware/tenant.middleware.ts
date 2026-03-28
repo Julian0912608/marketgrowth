@@ -11,9 +11,16 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { runWithTenantContext } from './tenant-context';
 import { db } from '../../infrastructure/database/connection';
-import { cache, redis } from '../../infrastructure/cache/redis';
+import { cache } from '../../infrastructure/cache/redis';
 import { logger } from '../logging/logger';
 import { PlanSlug } from '../types/tenant';
+
+// Haal de raw ioredis client op voor incr/expire (niet beschikbaar via cache wrapper)
+function getRawRedis() {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { redis } = require('../../infrastructure/cache/redis');
+  return redis as any;
+}
 
 const PLAN_CACHE_TTL = 300; // 5 minuten — kort genoeg voor snelle upgrades
 
@@ -62,8 +69,9 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
 async function checkTenantRateLimit(tenantId: string): Promise<boolean> {
   const key = `ratelimit:tenant:${tenantId}`;
   try {
-    const current = await (redis as any).incr(key);
-    if (current === 1) await (redis as any).expire(key, 60);
+    const r = getRawRedis();
+    const current = await r.incr(key);
+    if (current === 1) await r.expire(key, 60);
     return current <= 300;
   } catch {
     return true;
