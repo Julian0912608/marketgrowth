@@ -79,6 +79,8 @@ app.use(cors({
 
 // ── Body parsers ──────────────────────────────────────────────
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
+// 10mb voor /api/ai routes (foto uploads als base64)
+app.use('/api/ai', express.json({ limit: '10mb' }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
@@ -165,6 +167,12 @@ try {
 } catch (e: any) { console.error('  aiRouter FAILED:', e.message); }
 
 try {
+  const { productContentRouter } = require('./modules/ai-engine/api/product-content.routes');
+  app.use('/api/ai', productContentRouter);
+  console.log('  productContentRouter OK');
+} catch (e: any) { console.error('  productContentRouter FAILED:', e.message); }
+
+try {
   const { adminRouter } = require('./modules/admin/api/admin.routes');
   app.use('/api/admin', adminRouter);
   console.log('  adminRouter OK');
@@ -188,6 +196,13 @@ try {
   });
 } catch (e: any) { console.error('  emailWorker FAILED:', e.message); }
 
+// ── Sync scheduler (elke 15 min incrementele sync) ───────────
+try {
+  const { startSyncScheduler } = require('./modules/integrations/workers/startup-sync');
+  startSyncScheduler();
+  console.log('  syncScheduler OK — incremental sync every 15 minutes');
+} catch (e: any) { console.error('  syncScheduler FAILED:', e.message); }
+
 // ── 404 + error handler ───────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: 'not_found' });
@@ -199,6 +214,18 @@ const PORT = parseInt(process.env.PORT ?? '3001', 10);
 app.listen(PORT, '0.0.0.0', () => {
   logger.info('server.started', { port: PORT, env: process.env.NODE_ENV });
   console.log(`Server running on port ${PORT}`);
+
+  // Full sync na opstarten — 10s delay zodat DB connectie stabiel is
+  setTimeout(() => {
+    try {
+      const { startupFullSync } = require('./modules/integrations/workers/startup-sync');
+      startupFullSync().then(() => {
+        console.log('  startupFullSync OK');
+      }).catch((e: any) => {
+        console.error('  startupFullSync FAILED:', e.message);
+      });
+    } catch (e: any) { console.error('  startupFullSync FAILED:', e.message); }
+  }, 10_000);
 });
 
 export default app;
