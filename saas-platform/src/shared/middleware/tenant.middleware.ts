@@ -11,7 +11,7 @@ import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { runWithTenantContext } from './tenant-context';
 import { db } from '../../infrastructure/database/connection';
-import { redis } from '../../infrastructure/cache/redis';
+import { cache, redis } from '../../infrastructure/cache/redis';
 import { logger } from '../logging/logger';
 
 const PLAN_CACHE_TTL = 300; // 5 minuten — kort genoeg voor snelle upgrades
@@ -20,7 +20,7 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
   const cacheKey = `perm:plan:${tenantId}`;
 
   try {
-    const cached = await redis.get(cacheKey);
+    const cached = await cache.get(cacheKey);
     if (cached) return cached;
   } catch {
     // Redis niet beschikbaar — val terug op DB
@@ -42,9 +42,9 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
     const planSlug = result.rows[0]?.plan_slug ?? 'starter';
 
     try {
-      await redis.set(cacheKey, planSlug, 'EX', PLAN_CACHE_TTL);
+      await cache.set(cacheKey, planSlug, PLAN_CACHE_TTL);
     } catch {
-      // Redis set mislukt — geen probleem, gewoon niet cachen
+      // Cache set mislukt — geen probleem
     }
 
     return planSlug;
@@ -53,7 +53,7 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
       tenantId,
       error: (err as Error).message,
     });
-    return 'starter'; // safe fallback
+    return 'starter';
   }
 }
 
@@ -61,11 +61,11 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
 async function checkTenantRateLimit(tenantId: string): Promise<boolean> {
   const key = `ratelimit:tenant:${tenantId}`;
   try {
-    const current = await redis.incr(key);
-    if (current === 1) await redis.expire(key, 60);
+    const current = await (redis as any).incr(key);
+    if (current === 1) await (redis as any).expire(key, 60);
     return current <= 300;
   } catch {
-    return true; // Redis down → doorlaten
+    return true;
   }
 }
 
