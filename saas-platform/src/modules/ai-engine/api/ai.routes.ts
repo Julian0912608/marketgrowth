@@ -441,21 +441,65 @@ Return ONLY JSON (no markdown):
   } catch (err) { next(err); }
 });
 
+// ── Bol.com catalog enrichment ────────────────────────────────
+// Haalt producttitel + afbeelding op via de open Bol.com catalog API
+// Slaat het resultaat op in de DB zodat volgende calls direct klaar zijn
+async function enrichBolcomProduct(productId: string, ean: string): Promise<{ title: string | null; imageUrl: string | null }> {
+  try {
+    const res = await fetch(
+      `https://api.bol.com/catalog/v4/products?ean=${encodeURIComponent(ean)}&country=NL&language=nl`,
+      { headers: { 'Accept': 'application/json' } }
+    );
+    if (!res.ok) return { title: null, imageUrl: null };
+
+    const data = await res.json() as {
+      products?: { title?: string; images?: { url?: string; urlLarge?: string }[] }[]
+    };
+
+    const product = data.products?.[0];
+    if (!product) return { title: null, imageUrl: null };
+
+    const title    = product.title ?? null;
+    const imageUrl = product.images?.[0]?.urlLarge ?? product.images?.[0]?.url ?? null;
+
+    // Sla op in DB voor volgende keer
+    if (title || imageUrl) {
+      await db.query(
+        `UPDATE products SET
+           product_title = COALESCE($2, product_title),
+           image_url     = COALESCE($3, image_url),
+           updated_at    = now()
+         WHERE id = $1`,
+        [productId, title, imageUrl],
+        { allowNoTenant: true }
+      ).catch(() => {}); // niet kritiek als dit faalt
+    }
+
+    return { title, imageUrl };
+  } catch {
+    return { title: null, imageUrl: null };
+  }
+}
+
 // ── GET /api/ai/products ──────────────────────────────────────
 // Haalt producten op voor de Content Studio product-selector
+// Voor Bol.com producten zonder titel: verrijkt via catalog API
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
     const { search, limit = '20' } = req.query as Record<string, string>;
 
-    const searchFilter = search ? `AND (p.title ILIKE $3 OR p.ean ILIKE $3)` : '';
+    const searchFilter = search
+      ? `AND (p.title ILIKE $3 OR p.ean ILIKE $3 OR p.product_title ILIKE $3)`
+      : '';
     const params: any[] = [tenantId, parseInt(limit)];
     if (search) params.push(`%${search}%`);
 
     const result = await db.query(
       `SELECT
-         p.id, p.title, p.status, p.price_min, p.price_max,
-         p.total_inventory, p.ean, p.condition, p.fulfillment_by,
+         p.id, p.title, p.product_title, p.image_url, p.status,
+         p.price_min, p.price_max, p.total_inventory,
+         p.ean, p.condition, p.fulfillment_by,
          ti.shop_name, ti.platform_slug AS platform,
          COALESCE(SUM(li.total_price), 0)    AS revenue_30d,
          COALESCE(SUM(li.quantity), 0)        AS units_30d,
@@ -478,11 +522,24 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
       { allowNoTenant: true }
     );
 
-    res.json({
-      products: result.rows.map((p: any) => ({
+    // Verrijk Bol.com producten zonder echte titel asynchroon
+    const products = await Promise.all(result.rows.map(async (p: any) => {
+      let displayTitle = p.product_title || p.title;
+      let imageUrl     = p.image_url;
+
+      // Als titel nog EAN lijkt (alleen cijfers) en er een EAN is: verrijk via catalog
+      const titleIsEan = /^\d{8,14}$/.test((displayTitle || '').trim());
+      if (titleIsEan && p.ean && p.platform === 'bolcom' && !p.image_url) {
+        const enriched = await enrichBolcomProduct(p.id, p.ean);
+        if (enriched.title) displayTitle = enriched.title;
+        if (enriched.imageUrl) imageUrl = enriched.imageUrl;
+      }
+
+      return {
         id:            p.id,
-        title:         p.title,
+        title:         displayTitle || p.ean || 'Onbekend product',
         ean:           p.ean,
+        imageUrl,
         priceMin:      p.price_min ? parseFloat(p.price_min) : null,
         priceMax:      p.price_max ? parseFloat(p.price_max) : null,
         inventory:     parseInt(p.total_inventory ?? 0),
@@ -492,8 +549,10 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
         revenue30d:    parseFloat(p.revenue_30d ?? 0),
         units30d:      parseInt(p.units_30d ?? 0),
         orders30d:     parseInt(p.orders_30d ?? 0),
-      })),
-    });
+      };
+    }));
+
+    res.json({ products });
   } catch (err) { next(err); }
 });
 
