@@ -339,22 +339,31 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // Incremental sync: via Orders API met change-interval-minute
+  // Bol.com accepteert maximaal 60 minuten voor change-interval-minute.
+  // Als de sync langer dan 60 minuten geleden was, gebruik de shipments API.
   private async fetchViaOrders(token: string, updatedAfter: Date | undefined, page: number): Promise<PaginatedResult<NormalizedOrder>> {
-    const minutesAgo    = updatedAfter
+    const minutesAgo = updatedAfter
       ? Math.ceil((Date.now() - updatedAfter.getTime()) / 60000)
-      : 120;
-    const cappedMinutes = Math.min(minutesAgo, 2880); // max 48u
-
+      : 30;
+ 
+    // Bol.com geeft een 400 als change-interval-minute > 60.
+    // Val terug op de shipments API als de gap te groot is.
+    if (minutesAgo > 60) {
+      return this.fetchViaShipments(token, page);
+    }
+ 
+    const cappedMinutes = Math.max(1, Math.min(minutesAgo, 60));
+ 
     const data = await this.apiGet(
       token,
       '/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=' + cappedMinutes + '&page=' + page
     ) as { orders?: Record<string, unknown>[] };
-
+ 
     const rawOrders = data.orders || [];
     const items = rawOrders.map(o => this.normalizeOrderSummary(o));
     return { items, hasNextPage: rawOrders.length === 50, nextPage: rawOrders.length === 50 ? page + 1 : undefined };
   }
-
+ 
   async fetchProducts(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedProduct>> {
     const token = await this.getAccessToken(creds);
     try {
