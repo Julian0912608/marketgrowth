@@ -169,16 +169,22 @@ analyticsRouter.get('/top-products', async (req: Request, res: Response, next: N
     const params: any[] = [tenantId, since, until, parseInt(limit, 10)];
     const platformFilter = platform ? ` AND o.platform_slug = $${params.push(platform)}` : '';
 
-    const result = await db.query(
+     const result = await db.query(
       `SELECT
          oli.title,
          oli.sku,
          o.platform_slug                  AS platform,
          SUM(oli.quantity)::int           AS total_sold,
          SUM(oli.total_price)             AS total_revenue,
-         AVG(oli.unit_price)              AS avg_price
+         AVG(oli.unit_price)              AS avg_price,
+         MAX(p.external_id)               AS offer_id,
+         MAX(p.ean)                       AS ean
        FROM order_line_items oli
        JOIN orders o ON o.id = oli.order_id
+       LEFT JOIN products p
+         ON p.tenant_id = $1
+         AND p.ean IS NOT NULL
+         AND p.ean = oli.sku
        WHERE oli.tenant_id = $1
          AND o.ordered_at >= $2 AND o.ordered_at <= $3
          AND o.status NOT IN ('cancelled', 'refunded')
@@ -188,7 +194,7 @@ analyticsRouter.get('/top-products', async (req: Request, res: Response, next: N
        LIMIT $4`,
       params
     );
-
+ 
     res.json({ products: result.rows, period });
   } catch (err) { next(err); }
 });
