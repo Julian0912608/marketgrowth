@@ -13,10 +13,11 @@ import { runWithTenantContext } from './tenant-context';
 import { db } from '../../infrastructure/database/connection';
 import { cache, redis } from '../../infrastructure/cache/redis';
 import { logger } from '../logging/logger';
+import { PlanSlug } from '../types/tenant';
 
 const PLAN_CACHE_TTL = 300; // 5 minuten — kort genoeg voor snelle upgrades
 
-async function getLivePlanSlug(tenantId: string): Promise<string> {
+async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
   const cacheKey = `perm:plan:${tenantId}`;
 
   try {
@@ -39,7 +40,7 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
       { allowNoTenant: true }
     );
 
-    const planSlug = result.rows[0]?.plan_slug ?? 'starter';
+    const planSlug = (result.rows[0]?.plan_slug ?? 'starter') as PlanSlug;
 
     try {
       await cache.set(cacheKey, planSlug, PLAN_CACHE_TTL);
@@ -53,11 +54,7 @@ async function getLivePlanSlug(tenantId: string): Promise<string> {
       tenantId,
       error: (err as Error).message,
     });
-    return 'starter';
-  }
-}
-
-// Per-tenant rate limiting: max 300 req/min
+    return 'starter' as PlanSlug;: max 300 req/min
 async function checkTenantRateLimit(tenantId: string): Promise<boolean> {
   const key = `ratelimit:tenant:${tenantId}`;
   try {
