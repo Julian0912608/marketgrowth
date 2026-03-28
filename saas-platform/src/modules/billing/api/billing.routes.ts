@@ -49,15 +49,6 @@ async function sendEmail(to: string, subject: string, html: string): Promise<voi
     logger.error('email.send.error', { to, error: (err as Error).message });
   }
 }
-const APP_URL = process.env.APP_URL ?? process.env.FRONTEND_URL ?? 'https://marketgrow.ai';
-
-const PLAN_PRICE_IDS: Record<string, string> = {
-  starter: process.env.STRIPE_PRICE_STARTER ?? '',
-  growth:  process.env.STRIPE_PRICE_GROWTH  ?? '',
-  scale:   process.env.STRIPE_PRICE_SCALE   ?? '',
-};
-
-// ── Helpers ───────────────────────────────────────────────────
 
 async function invalidatePlanCache(tenantId: string): Promise<void> {
   try {
