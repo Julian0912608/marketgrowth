@@ -505,81 +505,69 @@ async function getBolcomTitleFromOrders(tenantId: string, externalId: string, ea
 }
 
 // ── GET /api/ai/products ──────────────────────────────────────
+// Gebruikt order_line_items als bron — die hebben de echte Bol.com titels
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
     const { search, limit = '20' } = req.query as Record<string, string>;
 
-    const searchFilter = search
-      ? `AND (p.title ILIKE $3 OR p.ean ILIKE $3 OR p.product_title ILIKE $3)`
-      : '';
+    const searchFilter = search ? `AND oli.title ILIKE $3` : '';
     const params: any[] = [tenantId, parseInt(limit)];
     if (search) params.push(`%${search}%`);
 
     const result = await db.query(
       `SELECT
-         p.id, p.external_id, p.title, p.product_title, p.image_url, p.status,
-         p.price_min, p.price_max, p.total_inventory,
-         p.ean, p.condition, p.fulfillment_by,
-         ti.shop_name, ti.platform_slug AS platform,
-         COALESCE(SUM(li.total_price), 0)    AS revenue_30d,
-         COALESCE(SUM(li.quantity), 0)        AS units_30d,
-         COALESCE(COUNT(DISTINCT o.id), 0)    AS orders_30d
-       FROM products p
-       JOIN tenant_integrations ti ON ti.id = p.integration_id
-       LEFT JOIN order_line_items li ON li.product_id = p.external_id
-         AND li.tenant_id = $1
-       LEFT JOIN orders o ON o.id = li.order_id
-         AND o.ordered_at >= now() - INTERVAL '30 days'
-         AND o.status NOT IN ('cancelled', 'refunded')
-       WHERE p.tenant_id = $1
-         AND p.status = 'active'
+         oli.title,
+         o.platform_slug                      AS platform,
+         ti.shop_name,
+         SUM(oli.total_price)                 AS revenue_30d,
+         SUM(oli.quantity)::int               AS units_30d,
+         COUNT(DISTINCT o.id)::int            AS orders_30d,
+         AVG(oli.unit_price)                  AS avg_price,
+         MAX(p.ean)                           AS ean,
+         MAX(p.id)::text                      AS product_id,
+         MAX(p.image_url)                     AS image_url,
+         MAX(p.price_min)                     AS price_min
+       FROM order_line_items oli
+       JOIN orders o ON o.id = oli.order_id
+       JOIN tenant_integrations ti
+         ON ti.tenant_id = $1
          AND ti.status = 'active'
+         AND ti.platform_slug = o.platform_slug
+       LEFT JOIN products p
+         ON p.tenant_id = $1
+         AND p.ean IS NOT NULL
+         AND p.ean = oli.sku
+       WHERE oli.tenant_id = $1
+         AND o.ordered_at >= now() - INTERVAL '90 days'
+         AND o.status NOT IN ('cancelled', 'refunded')
+         AND oli.title IS NOT NULL
+         AND oli.title != ''
+         AND oli.title !~ '^[0-9]{8,14}$'
          ${searchFilter}
-       GROUP BY p.id, ti.shop_name, ti.platform_slug
-       ORDER BY revenue_30d DESC, p.title ASC
+       GROUP BY oli.title, o.platform_slug, ti.shop_name
+       ORDER BY revenue_30d DESC
        LIMIT $2`,
       params,
       { allowNoTenant: true }
     );
 
-    // Verrijk producten zonder echte titel
-    const products = await Promise.all(result.rows.map(async (p: any) => {
-      let displayTitle = p.product_title || p.title;
-      let imageUrl     = p.image_url ?? null;
-
-      // Detecteer of titel alleen een EAN/getal is
-      const titleIsEan = !displayTitle || /^\d{8,14}$/.test(displayTitle.trim());
-
-      if (titleIsEan && p.ean) {
-        const orderTitle = await getBolcomTitleFromOrders(tenantId, p.external_id || p.ean, p.ean);
-        if (orderTitle) {
-          displayTitle = orderTitle;
-          await db.query(
-            `UPDATE products SET product_title = $2, updated_at = now() WHERE id = $1`,
-            [p.id, orderTitle], { allowNoTenant: true }
-          ).catch(() => {});
-        }
-      }
-
-      return {
-        id:            p.id,
-        title:         displayTitle || p.ean || 'Onbekend product',
-        ean:           p.ean,
-        imageUrl,
-        priceMin:      p.price_min ? parseFloat(p.price_min) : null,
-        priceMax:      p.price_max ? parseFloat(p.price_max) : null,
-        inventory:     parseInt(p.total_inventory ?? 0),
-        platform:      p.platform,
-        shopName:      p.shop_name,
-        fulfillmentBy: p.fulfillment_by,
-        revenue30d:    parseFloat(p.revenue_30d ?? 0),
-        units30d:      parseInt(p.units_30d ?? 0),
-        orders30d:     parseInt(p.orders_30d ?? 0),
-      };
-    }));
-
-    res.json({ products });
+    res.json({
+      products: result.rows.map((p: any) => ({
+        id:        p.product_id || p.title.slice(0, 36),
+        title:     p.title,
+        ean:       p.ean ?? null,
+        imageUrl:  p.image_url ?? null,
+        priceMin:  p.price_min ? parseFloat(p.price_min) : (p.avg_price ? parseFloat(p.avg_price) : null),
+        priceMax:  null,
+        inventory: 0,
+        platform:  p.platform,
+        shopName:  p.shop_name,
+        revenue30d: parseFloat(p.revenue_30d ?? 0),
+        units30d:   parseInt(p.units_30d ?? 0),
+        orders30d:  parseInt(p.orders_30d ?? 0),
+      })),
+    });
   } catch (err) { next(err); }
 });
 
