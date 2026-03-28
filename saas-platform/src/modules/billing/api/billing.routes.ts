@@ -19,15 +19,36 @@ import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
 import { permissionService } from '../../../shared/permissions/permission.service';
 import { logger }          from '../../../shared/logging/logger';
-import { Resend }          from 'resend';
 
 const router = Router();
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? '', {
   apiVersion: '2023-10-16',
 });
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const RESEND_KEY = process.env.RESEND_API_KEY ?? '';
+const APP_URL    = process.env.APP_URL ?? process.env.FRONTEND_URL ?? 'https://marketgrow.ai';
+
+const PLAN_PRICE_IDS: Record<string, string> = {
+  starter: process.env.STRIPE_PRICE_STARTER ?? '',
+  growth:  process.env.STRIPE_PRICE_GROWTH  ?? '',
+  scale:   process.env.STRIPE_PRICE_SCALE   ?? '',
+};
+
+// ── Email via fetch (geen resend package nodig) ───────────────
+async function sendEmail(to: string, subject: string, html: string): Promise<void> {
+  if (!RESEND_KEY) return;
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ from: 'MarketGrow <hello@marketgrow.ai>', to: [to], subject, html }),
+    });
+    if (!res.ok) logger.warn('email.send.failed', { to, status: res.status });
+  } catch (err) {
+    logger.error('email.send.error', { to, error: (err as Error).message });
+  }
+}
 const APP_URL = process.env.APP_URL ?? process.env.FRONTEND_URL ?? 'https://marketgrow.ai';
 
 const PLAN_PRICE_IDS: Record<string, string> = {
@@ -48,31 +69,21 @@ async function invalidatePlanCache(tenantId: string): Promise<void> {
 }
 
 async function sendWelcomeEmail(email: string, firstName: string, planSlug: string): Promise<void> {
-  try {
-    await resend.emails.send({
-      from:    'MarketGrow <hello@marketgrow.ai>',
-      to:      email,
-      subject: 'Welcome to MarketGrow — your 14-day trial has started',
-      html:    `<p>Hi ${firstName},</p><p>Your ${planSlug} trial is active. Connect your first store to get started.</p><p><a href="${APP_URL}/dashboard/integrations">Connect your store →</a></p>`,
-    });
-  } catch (err) {
-    logger.error('email.welcome.failed', { email, error: (err as Error).message });
-  }
+  await sendEmail(
+    email,
+    'Welcome to MarketGrow — your 14-day trial has started',
+    `<p>Hi ${firstName},</p><p>Your ${planSlug} trial is active. Connect your first store to get started.</p><p><a href="${APP_URL}/dashboard/integrations">Connect your store →</a></p>`
+  );
 }
 
 async function sendAdminSignupNotification(tenantId: string, planSlug: string): Promise<void> {
-  try {
-    const adminEmail = process.env.ADMIN_EMAIL ?? 'admin@marketgrow.ai';
-    await resend.emails.send({
-      from:    'MarketGrow System <system@marketgrow.ai>',
-      to:      adminEmail,
-      subject: `New signup — ${planSlug} plan`,
-      html:    `<p>New tenant signed up. Tenant ID: ${tenantId} | Plan: ${planSlug}</p>`,
-    });
-    logger.info('email.admin_signup.sent', { tenantId, planSlug });
-  } catch (err) {
-    logger.error('email.admin_signup.failed', { tenantId, error: (err as Error).message });
-  }
+  const adminEmail = process.env.ADMIN_EMAIL ?? 'hello@marketgrow.ai';
+  await sendEmail(
+    adminEmail,
+    `New signup — ${planSlug} plan`,
+    `<p>New tenant signed up.</p><p>Tenant ID: ${tenantId}<br>Plan: ${planSlug}</p>`
+  );
+  logger.info('email.admin_signup.sent', { tenantId, planSlug });
 }
 
 // ── POST /api/billing/checkout ────────────────────────────────
