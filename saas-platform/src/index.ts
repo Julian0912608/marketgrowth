@@ -23,7 +23,7 @@ import { errorHandler }  from './shared/middleware/error-handler';
 import { requestLogger } from './shared/middleware/request-logger.middleware';
 import { logger }        from './shared/logging/logger';
 import { db }            from './infrastructure/database/connection';
-import { redis }         from './infrastructure/cache/redis';
+import { cache }         from './infrastructure/cache/redis';
 
 // ── Startup checks ────────────────────────────────────────────
 console.log('=== ENV CHECK ===');
@@ -104,8 +104,8 @@ app.get('/health', async (_req, res) => {
   }
 
   try {
-    const t0 = Date.now();
-    await redis.ping();
+    const t0  = Date.now();
+    await cache.get('health:ping');
     redisOk = true;
     redisMs = Date.now() - t0;
   } catch (err: any) {
