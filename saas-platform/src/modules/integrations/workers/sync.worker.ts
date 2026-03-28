@@ -77,23 +77,23 @@ const MAX_CONCURRENT_PER_TENANT = 2;
 async function acquireTenantSlot(tenantId: string): Promise<boolean> {
   const key = `sync:concurrent:${tenantId}`;
   try {
-    const current = await redis.incr(key);
-    if (current === 1) await redis.expire(key, 3600); // max 1u per job
+    const current = await (redis as any).incr(key);
+    if (current === 1) await (redis as any).expire(key, 3600);
     if (current > MAX_CONCURRENT_PER_TENANT) {
-      await redis.decr(key);
+      await (redis as any).decr(key);
       return false;
     }
     return true;
   } catch {
-    return true; // Redis down → doorlaten
+    return true;
   }
 }
 
 async function releaseTenantSlot(tenantId: string): Promise<void> {
   const key = `sync:concurrent:${tenantId}`;
   try {
-    const val = await redis.decr(key);
-    if (val <= 0) await redis.del(key);
+    const val = await (redis as any).decr(key);
+    if (val <= 0) await (redis as any).del(key);
   } catch {}
 }
 
@@ -102,8 +102,8 @@ async function acquireRateLimit(platformSlug: string, integrationId: string): Pr
   const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
   const limit = getRateLimit(platformSlug);
   try {
-    const current = await redis.incr(key);
-    if (current === 1) await redis.expire(key, 1);
+    const current = await (redis as any).incr(key);
+    if (current === 1) await (redis as any).expire(key, 1);
     if (current > limit) await new Promise(r => setTimeout(r, 1000));
   } catch {}
 }
