@@ -442,23 +442,63 @@ Return ONLY JSON (no markdown):
 });
 
 // ── Bol.com producttitel opzoeken via order line items ────────
-// Betrouwbaarder dan de externe catalog API — titels zitten al in onze DB
-async function getBolcomTitleFromOrders(tenantId: string, ean: string): Promise<string | null> {
+// sku is NULL voor Bol.com — zoek via product_id (= external_id van het product)
+async function getBolcomTitleFromOrders(tenantId: string, externalId: string, ean: string): Promise<string | null> {
   try {
+    // Stap 1: zoek via product_id (= external_id)
     const result = await db.query<{ title: string }>(
       `SELECT li.title
        FROM order_line_items li
        WHERE li.tenant_id = $1
-         AND li.sku = $2
+         AND li.product_id = $2
          AND li.title IS NOT NULL
          AND li.title != ''
          AND li.title !~ '^[0-9]{8,14}$'
        ORDER BY li.id DESC
        LIMIT 1`,
-      [tenantId, ean],
+      [tenantId, externalId],
       { allowNoTenant: true }
     );
-    return result.rows[0]?.title ?? null;
+    if (result.rows[0]?.title) return result.rows[0].title;
+
+    // Stap 2: fallback via sku (voor platforms die sku wel vullen)
+    if (ean) {
+      const result2 = await db.query<{ title: string }>(
+        `SELECT li.title
+         FROM order_line_items li
+         WHERE li.tenant_id = $1
+           AND li.sku = $2
+           AND li.title IS NOT NULL
+           AND li.title != ''
+           AND li.title !~ '^[0-9]{8,14}$'
+         ORDER BY li.id DESC
+         LIMIT 1`,
+        [tenantId, ean],
+        { allowNoTenant: true }
+      );
+      if (result2.rows[0]?.title) return result2.rows[0].title;
+    }
+
+    // Stap 3: fallback — zoek op EAN in de title van andere line items
+    // (soms staat EAN in de title van een ander product met dezelfde EAN)
+    if (ean) {
+      const result3 = await db.query<{ title: string }>(
+        `SELECT li.title
+         FROM order_line_items li
+         WHERE li.tenant_id = $1
+           AND li.title IS NOT NULL
+           AND li.title != ''
+           AND li.title !~ '^[0-9]{8,14}$'
+         ORDER BY li.id DESC
+         LIMIT 1`,
+        [tenantId],
+        { allowNoTenant: true }
+      );
+      // Geef de meest recente echte titel terug als fallback
+      if (result3.rows[0]?.title) return null; // liever niets dan verkeerde titel
+    }
+
+    return null;
   } catch {
     return null;
   }
@@ -478,7 +518,7 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
 
     const result = await db.query(
       `SELECT
-         p.id, p.title, p.product_title, p.image_url, p.status,
+         p.id, p.external_id, p.title, p.product_title, p.image_url, p.status,
          p.price_min, p.price_max, p.total_inventory,
          p.ean, p.condition, p.fulfillment_by,
          ti.shop_name, ti.platform_slug AS platform,
@@ -512,11 +552,9 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
       const titleIsEan = !displayTitle || /^\d{8,14}$/.test(displayTitle.trim());
 
       if (titleIsEan && p.ean) {
-        // Stap 1: zoek in eigen order history (snelste, geen externe API)
-        const orderTitle = await getBolcomTitleFromOrders(tenantId, p.ean);
+        const orderTitle = await getBolcomTitleFromOrders(tenantId, p.external_id || p.ean, p.ean);
         if (orderTitle) {
           displayTitle = orderTitle;
-          // Sla op zodat volgende keer direct klaarstaat
           await db.query(
             `UPDATE products SET product_title = $2, updated_at = now() WHERE id = $1`,
             [p.id, orderTitle], { allowNoTenant: true }
