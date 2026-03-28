@@ -119,10 +119,57 @@ router.post('/accept', async (req: Request, res: Response, next: NextFunction) =
 
     // Controleer of email al bestaat
     const existing = await db.query(
-      `SELECT id FROM users WHERE email = $1`,
+      `SELECT id, status FROM users WHERE email = $1`,
       [invite.email.toLowerCase()],
       { allowNoTenant: true }
     );
+
+    // Als de user bestaat maar deleted is, herstel het account
+    if (existing.rows.length > 0 && existing.rows[0].status === 'deleted') {
+      const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      const userId = existing.rows[0].id;
+      await db.query(
+        `UPDATE users SET
+           password_hash = $1, first_name = $2, last_name = $3,
+           role = $4, status = 'active', updated_at = now()
+         WHERE id = $5`,
+        [passwordHash, firstName, lastName, invite.role, userId],
+        { allowNoTenant: true }
+      );
+      // Markeer invite als geaccepteerd
+      await db.query(
+        `UPDATE team_invites SET accepted_at = now(), accepted_by = $1 WHERE id = $2`,
+        [userId, invite.id],
+        { allowNoTenant: true }
+      );
+      // Maak tokens aan en stuur terug
+      const planResult = await db.query<{ slug: string }>(
+        `SELECT p.slug FROM tenant_subscriptions ts
+         JOIN plans p ON p.id = ts.plan_id
+         WHERE ts.tenant_id = $1 AND ts.status IN ('active','trialing')
+         ORDER BY ts.created_at DESC LIMIT 1`,
+        [invite.tenant_id], { allowNoTenant: true }
+      );
+      const planSlug = planResult.rows[0]?.slug ?? 'starter';
+      const accessToken = jwt.sign(
+        { sub: userId, tenantId: invite.tenant_id, email: invite.email, planSlug, firstName, lastName, role: invite.role, type: 'access' },
+        JWT_SECRET(), { expiresIn: ACCESS_TTL }
+      );
+      const refreshToken = jwt.sign(
+        { sub: userId, tenantId: invite.tenant_id, type: 'refresh' },
+        JWT_SECRET(), { expiresIn: REFRESH_TTL }
+      );
+      const refreshHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+      await db.query(
+        `INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, revoked)
+         VALUES ($1, $2, $3, $4, false)`,
+        [userId, invite.tenant_id, refreshHash, new Date(Date.now() + REFRESH_TTL_MS)],
+        { allowNoTenant: true }
+      );
+      setRefreshCookie(res, refreshToken);
+      res.json({ accessToken, user: { userId, email: invite.email, firstName, lastName, role: invite.role, planSlug } });
+      return;
+    }
 
     if (existing.rows.length > 0) {
       res.status(409).json({ error: 'Er bestaat al een account met dit e-mailadres.' });
@@ -234,9 +281,9 @@ router.post('/invite', async (req: Request, res: Response, next: NextFunction) =
     const { tenantId } = getTenantContext();
     const { email, role } = validate(InviteSchema, req.body);
 
-    // Check of gebruiker al bestaat in dit team
+    // Check of gebruiker al actief bestaat in dit team
     const existingUser = await db.query(
-      `SELECT id FROM users WHERE tenant_id = $1 AND email = $2`,
+      `SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND status != 'deleted'`,
       [tenantId, email.toLowerCase()]
     );
     if (existingUser.rows.length > 0) {
