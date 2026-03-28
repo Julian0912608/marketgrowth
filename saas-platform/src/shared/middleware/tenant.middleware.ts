@@ -22,7 +22,7 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
 
   try {
     const cached = await cache.get(cacheKey);
-    if (cached) return cached;
+    if (cached) return cached as PlanSlug;
   } catch {
     // Redis niet beschikbaar — val terug op DB
   }
@@ -54,7 +54,11 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
       tenantId,
       error: (err as Error).message,
     });
-    return 'starter' as PlanSlug;: max 300 req/min
+    return 'starter' as PlanSlug;
+  }
+}
+
+// Per-tenant rate limiting: max 300 req/min
 async function checkTenantRateLimit(tenantId: string): Promise<boolean> {
   const key = `ratelimit:tenant:${tenantId}`;
   try {
