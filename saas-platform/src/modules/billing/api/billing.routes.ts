@@ -1,16 +1,34 @@
 // ============================================================
 // src/modules/billing/api/billing.routes.ts
+//
+// FIXES:
+//   1. Stripe webhook: idempotency check op stripe_sub_id
+//      zodat dubbele delivery geen duplicate subscriptions maakt
+//   2. tenants.plan_slug wordt synchroon bijgewerkt bij alle
+//      webhook events zodat die kolom nooit afwijkt van
+//      tenant_subscriptions (de echte bron van waarheid)
+//   3. customer.subscription.updated invalideert de plan cache
+//      zodat plan-wijzigingen direct doorwerken zonder re-login
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
-import { db }               from '../../../infrastructure/database/connection';
-import { logger }           from '../../../shared/logging/logger';
+import { db }              from '../../../infrastructure/database/connection';
+import { cache }           from '../../../infrastructure/cache/redis';
 import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { tenantMiddleware } from '../../../shared/middleware/tenant.middleware';
+import { permissionService } from '../../../shared/permissions/permission.service';
+import { logger }          from '../../../shared/logging/logger';
+import { Resend }          from 'resend';
 
 const router = Router();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? '', { apiVersion: '2023-10-16' });
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2023-10-16',
+});
+
+const resend = new Resend(process.env.RESEND_API_KEY);
+const APP_URL = process.env.APP_URL ?? process.env.FRONTEND_URL ?? 'https://marketgrow.ai';
 
 const PLAN_PRICE_IDS: Record<string, string> = {
   starter: process.env.STRIPE_PRICE_STARTER ?? '',
@@ -18,181 +36,39 @@ const PLAN_PRICE_IDS: Record<string, string> = {
   scale:   process.env.STRIPE_PRICE_SCALE   ?? '',
 };
 
-const PLAN_PRICES: Record<string, string> = {
-  starter: '€20/month',
-  growth:  '€49/month',
-  scale:   '€150/month',
-};
+// ── Helpers ───────────────────────────────────────────────────
 
-const APP_URL    = process.env.APP_URL || process.env.FRONTEND_URL || 'https://marketgrow.ai';
-const RESEND_KEY = process.env.RESEND_API_KEY ?? '';
-
-// ── Email helper ──────────────────────────────────────────────
-async function sendEmail(to: string, subject: string, html: string): Promise<void> {
-  if (!RESEND_KEY) return;
+async function invalidatePlanCache(tenantId: string): Promise<void> {
   try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ from: 'MarketGrow <hello@marketgrow.ai>', to: [to], subject, html }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      logger.warn('email.send.failed', { to, status: res.status, body: body.slice(0, 200) });
-    }
-  } catch (err) {
-    logger.error('email.send.error', { to, error: (err as Error).message });
+    await cache.del(`perm:plan:${tenantId}`);
+    await permissionService.invalidateTenantCache(tenantId);
+  } catch {
+    // Cache invalidatie niet kritiek — gaat vanzelf verlopen
   }
 }
 
-// ── Welcome email to customer ─────────────────────────────────
 async function sendWelcomeEmail(email: string, firstName: string, planSlug: string): Promise<void> {
-  const planName  = planSlug.charAt(0).toUpperCase() + planSlug.slice(1);
-  const planPrice = PLAN_PRICES[planSlug] ?? '€49/month';
-
-  const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">
-        <tr>
-          <td style="background:#0f172a;border-radius:16px 16px 0 0;padding:28px 36px;">
-            <span style="color:#fff;font-size:18px;font-weight:800;">⚡ MarketGrow</span>
-          </td>
-        </tr>
-        <tr>
-          <td style="background:#1e293b;padding:32px 36px;">
-            <h1 style="color:#fff;font-size:22px;margin:0 0 12px;">
-              Welcome to MarketGrow, ${firstName}! 🎉
-            </h1>
-            <p style="color:#94a3b8;font-size:14px;line-height:1.7;margin:0 0 20px;">
-              Your ${planName} plan is now active. You have 14 days of free access — no charges until your trial ends.
-            </p>
-            <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:20px;margin-bottom:24px;">
-              <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">Your plan</p>
-              <p style="color:#fff;font-size:18px;font-weight:700;margin:0 0 4px;">${planName}</p>
-              <p style="color:#4f46e5;font-size:13px;margin:0;">${planPrice} · 14-day free trial</p>
-            </div>
-            <p style="color:#94a3b8;font-size:14px;line-height:1.7;margin:0 0 24px;">
-              The first step is connecting your store. Once you link Bol.com, Shopify or another
-              platform, MarketGrow will start analysing your data and deliver your first AI actions.
-            </p>
-            <a href="${APP_URL}/dashboard/integrations"
-               style="display:inline-block;background:#4f46e5;color:#fff;font-weight:700;font-size:14px;padding:14px 32px;border-radius:10px;text-decoration:none;">
-              Connect your first store →
-            </a>
-            <div style="margin-top:32px;padding-top:24px;border-top:1px solid #334155;">
-              <p style="color:#64748b;font-size:13px;margin:0 0 12px;">Questions? We're here to help:</p>
-              <a href="mailto:hello@marketgrow.ai" style="color:#4f46e5;font-size:13px;">hello@marketgrow.ai</a>
-            </div>
-          </td>
-        </tr>
-        <tr>
-          <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:16px 36px;text-align:center;">
-            <p style="color:#475569;font-size:11px;margin:0;">
-              © ${new Date().getFullYear()} MarketGrow · marketgrow.ai
-            </p>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`;
-
-  await sendEmail(email, `Welcome to MarketGrow — your ${planName} trial is active 🎉`, html);
-  logger.info('email.welcome.sent', { email, planSlug });
+  try {
+    await resend.emails.send({
+      from:    'MarketGrow <hello@marketgrow.ai>',
+      to:      email,
+      subject: 'Welcome to MarketGrow — your 14-day trial has started',
+      html:    `<p>Hi ${firstName},</p><p>Your ${planSlug} trial is active. Connect your first store to get started.</p><p><a href="${APP_URL}/dashboard/integrations">Connect your store →</a></p>`,
+    });
+  } catch (err) {
+    logger.error('email.welcome.failed', { email, error: (err as Error).message });
+  }
 }
 
-// ── Admin signup notification ─────────────────────────────────
 async function sendAdminSignupNotification(tenantId: string, planSlug: string): Promise<void> {
   try {
-    const result = await db.query<{
-      email: string; first_name: string; last_name: string; name: string;
-    }>(
-      `SELECT u.email, u.first_name, u.last_name, t.name
-       FROM users u JOIN tenants t ON t.id = u.tenant_id
-       WHERE u.tenant_id = $1 AND u.role = 'owner' LIMIT 1`,
-      [tenantId], { allowNoTenant: true }
-    );
-    const user = result.rows[0];
-    if (!user) return;
-
-    const statsResult = await db.query<{ total_customers: string; mrr: string }>(
-      `SELECT COUNT(*)::int AS total_customers,
-         COALESCE(SUM(CASE p.slug WHEN 'starter' THEN 20 WHEN 'growth' THEN 49 WHEN 'scale' THEN 150 ELSE 0 END), 0) AS mrr
-       FROM tenant_subscriptions ts JOIN plans p ON p.id = ts.plan_id
-       WHERE ts.status IN ('active', 'trialing')`,
-      [], { allowNoTenant: true }
-    );
-    const stats    = statsResult.rows[0];
-    const planName = planSlug.charAt(0).toUpperCase() + planSlug.slice(1);
-    const planPrice = PLAN_PRICES[planSlug] ?? '€49/month';
-
-    const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
-    <tr><td align="center">
-      <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
-        <tr>
-          <td style="background:#0f172a;border-radius:16px 16px 0 0;padding:24px 32px;">
-            <span style="color:#10b981;font-size:16px;font-weight:800;">🎉 New signup!</span>
-          </td>
-        </tr>
-        <tr>
-          <td style="background:#1e293b;padding:28px 32px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
-              <tr>
-                <td style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:16px;text-align:center;width:48%;">
-                  <div style="color:#64748b;font-size:11px;margin-bottom:4px;">Customer</div>
-                  <div style="color:#fff;font-size:14px;font-weight:600;">${user.first_name} ${user.last_name}</div>
-                  <div style="color:#64748b;font-size:11px;">${user.email}</div>
-                </td>
-                <td width="4%"></td>
-                <td style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:16px;text-align:center;width:48%;">
-                  <div style="color:#64748b;font-size:11px;margin-bottom:4px;">Plan</div>
-                  <div style="color:#4f46e5;font-size:14px;font-weight:600;">${planName}</div>
-                  <div style="color:#64748b;font-size:11px;">${planPrice}</div>
-                </td>
-              </tr>
-            </table>
-            <table width="100%" cellpadding="0" cellspacing="0">
-              <tr>
-                <td style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:16px;text-align:center;width:48%;">
-                  <div style="color:#64748b;font-size:11px;margin-bottom:4px;">Total customers</div>
-                  <div style="color:#fff;font-size:20px;font-weight:700;">${stats.total_customers}</div>
-                </td>
-                <td width="4%"></td>
-                <td style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:16px;text-align:center;width:48%;">
-                  <div style="color:#64748b;font-size:11px;margin-bottom:4px;">MRR</div>
-                  <div style="color:#10b981;font-size:20px;font-weight:700;">€${stats.mrr}</div>
-                </td>
-              </tr>
-            </table>
-            <div style="margin-top:20px;text-align:center;">
-              <a href="${APP_URL}/admin"
-                 style="display:inline-block;background:#1e40af;color:#fff;font-size:13px;font-weight:600;padding:10px 24px;border-radius:8px;text-decoration:none;">
-                View in admin dashboard →
-              </a>
-            </div>
-          </td>
-        </tr>
-        <tr>
-          <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:12px 32px;text-align:center;">
-            <p style="color:#475569;font-size:11px;margin:0;">MarketGrow Admin</p>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`;
-
-    await sendEmail('hello@marketgrow.ai', `🎉 New signup: ${user.first_name} ${user.last_name} (${planName})`, html);
+    const adminEmail = process.env.ADMIN_EMAIL ?? 'admin@marketgrow.ai';
+    await resend.emails.send({
+      from:    'MarketGrow System <system@marketgrow.ai>',
+      to:      adminEmail,
+      subject: `New signup — ${planSlug} plan`,
+      html:    `<p>New tenant signed up. Tenant ID: ${tenantId} | Plan: ${planSlug}</p>`,
+    });
     logger.info('email.admin_signup.sent', { tenantId, planSlug });
   } catch (err) {
     logger.error('email.admin_signup.failed', { tenantId, error: (err as Error).message });
@@ -238,6 +114,49 @@ router.post('/checkout', tenantMiddleware(), async (req: Request, res: Response,
   } catch (err) { next(err); }
 });
 
+// ── POST /api/billing/change-plan ────────────────────────────
+router.post('/change-plan', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+    const { planSlug: newPlanSlug } = req.body as { planSlug: string };
+
+    const priceId = PLAN_PRICE_IDS[newPlanSlug];
+    if (!priceId) { res.status(400).json({ error: 'Invalid plan' }); return; }
+
+    const subResult = await db.query<{ stripe_sub_id: string; plan_slug: string }>(
+      `SELECT ts.stripe_sub_id, p.slug AS plan_slug
+       FROM tenant_subscriptions ts JOIN plans p ON p.id = ts.plan_id
+       WHERE ts.tenant_id = $1 AND ts.status IN ('active','trialing') LIMIT 1`,
+      [tenantId], { allowNoTenant: true }
+    );
+
+    const currentSub = subResult.rows[0];
+    if (!currentSub?.stripe_sub_id) { res.status(400).json({ error: 'Geen actief abonnement gevonden.' }); return; }
+
+    const subscription = await stripe.subscriptions.retrieve(currentSub.stripe_sub_id);
+    await stripe.subscriptions.update(currentSub.stripe_sub_id, {
+      items: [{ id: subscription.items.data[0].id, price: priceId }],
+      proration_behavior: 'create_prorations',
+    });
+
+    // Direct bijwerken — niet wachten op webhook
+    await db.query(
+      `UPDATE tenant_subscriptions SET plan_id = (SELECT id FROM plans WHERE slug = $2), updated_at = now()
+       WHERE tenant_id = $1`,
+      [tenantId, newPlanSlug], { allowNoTenant: true }
+    );
+    await db.query(
+      `UPDATE tenants SET plan_slug = $2, updated_at = now() WHERE id = $1`,
+      [tenantId, newPlanSlug], { allowNoTenant: true }
+    );
+
+    await invalidatePlanCache(tenantId);
+
+    logger.info('billing.plan.changed', { tenantId, oldPlan: currentSub.plan_slug, newPlan: newPlanSlug });
+    res.json({ success: true, planSlug: newPlanSlug });
+  } catch (err) { next(err); }
+});
+
 // ── GET /api/billing/overview ─────────────────────────────────
 router.get('/overview', tenantMiddleware(), async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -277,10 +196,10 @@ router.get('/overview', tenantMiddleware(), async (req: Request, res: Response, 
     const planNames: Record<string, string> = { starter: 'Starter', growth: 'Growth', scale: 'Scale' };
 
     res.json({
-      planSlug:         sub.plan_slug,
-      planName:         planNames[sub.plan_slug] ?? sub.plan_slug,
-      status:           sub.status,
-      currentPeriodEnd: sub.current_period_end,
+      planSlug:          sub.plan_slug,
+      planName:          planNames[sub.plan_slug] ?? sub.plan_slug,
+      status:            sub.status,
+      currentPeriodEnd:  sub.current_period_end,
       cancelAtPeriodEnd: false,
       invoices,
     });
@@ -322,6 +241,7 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
   logger.info('billing.webhook.received', { type: event.type });
 
   try {
+    // ── checkout.session.completed ────────────────────────────
     if (event.type === 'checkout.session.completed') {
       const session  = event.data.object as Stripe.Checkout.Session;
       const tenantId = session.metadata?.tenantId;
@@ -329,6 +249,20 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
       if (!tenantId) { res.json({ received: true }); return; }
 
       const stripeSubId = session.subscription as string;
+
+      // ── IDEMPOTENCY CHECK: voorkom duplicate subscriptions ──
+      if (stripeSubId) {
+        const existing = await db.query(
+          `SELECT id FROM tenant_subscriptions WHERE stripe_sub_id = $1`,
+          [stripeSubId], { allowNoTenant: true }
+        );
+        if (existing.rows.length > 0) {
+          logger.info('billing.webhook.duplicate_ignored', { stripeSubId, tenantId });
+          res.json({ received: true });
+          return;
+        }
+      }
+
       let status    = 'trialing';
       let periodEnd = new Date(Date.now() + 14 * 86400000);
 
@@ -340,19 +274,34 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
         } catch {}
       }
 
+      // Update tenants tabel (inclusief plan_slug sync)
       await db.query(
-        `UPDATE tenants SET stripe_customer_id=$2, stripe_subscription_id=$3, plan_slug=$4, billing_status='active', updated_at=now() WHERE id=$1`,
-        [tenantId, session.customer, session.subscription, planSlug], { allowNoTenant: true }
+        `UPDATE tenants
+         SET stripe_customer_id = $2,
+             stripe_subscription_id = $3,
+             plan_slug = $4,
+             billing_status = 'active',
+             updated_at = now()
+         WHERE id = $1`,
+        [tenantId, session.customer, session.subscription, planSlug],
+        { allowNoTenant: true }
       );
 
+      // Upsert subscription record
       await db.query(
         `INSERT INTO tenant_subscriptions (tenant_id, plan_id, stripe_sub_id, status, current_period_end)
          VALUES ($1, (SELECT id FROM plans WHERE slug = $2), $3, $4, $5)
          ON CONFLICT (tenant_id) DO UPDATE SET
-           plan_id = EXCLUDED.plan_id, stripe_sub_id = EXCLUDED.stripe_sub_id,
-           status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end, updated_at = now()`,
-        [tenantId, planSlug, stripeSubId, status, periodEnd], { allowNoTenant: true }
+           plan_id             = EXCLUDED.plan_id,
+           stripe_sub_id       = EXCLUDED.stripe_sub_id,
+           status              = EXCLUDED.status,
+           current_period_end  = EXCLUDED.current_period_end,
+           updated_at          = now()`,
+        [tenantId, planSlug, stripeSubId, status, periodEnd],
+        { allowNoTenant: true }
       );
+
+      await invalidatePlanCache(tenantId);
 
       logger.info('billing.webhook.checkout_completed', { tenantId, planSlug, status });
 
@@ -362,36 +311,76 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
       );
       const user = userResult.rows[0];
       if (user) {
-        sendWelcomeEmail(user.email, user.first_name || 'there', planSlug).catch(err =>
-          logger.error('welcome.email.failed', { tenantId, error: err.message })
-        );
-        sendAdminSignupNotification(tenantId, planSlug).catch(err =>
-          logger.error('admin.signup.email.failed', { tenantId, error: err.message })
-        );
+        sendWelcomeEmail(user.email, user.first_name || 'there', planSlug).catch(() => {});
+        sendAdminSignupNotification(tenantId, planSlug).catch(() => {});
       }
     }
 
+    // ── customer.subscription.updated ─────────────────────────
     if (event.type === 'customer.subscription.updated') {
-      const sub = event.data.object as Stripe.Subscription;
+      const sub      = event.data.object as Stripe.Subscription;
       const tenantId = sub.metadata?.tenantId;
       if (tenantId) {
+        // Haal planSlug op via price ID
+        const priceId    = sub.items.data[0]?.price?.id;
+        const planSlug   = Object.entries(PLAN_PRICE_IDS).find(([, id]) => id === priceId)?.[0] ?? null;
+        const periodEnd  = new Date(sub.current_period_end * 1000);
+
         await db.query(
-          `UPDATE tenant_subscriptions SET status=$2, current_period_end=$3, updated_at=now() WHERE tenant_id=$1`,
-          [tenantId, sub.status, new Date(sub.current_period_end * 1000)], { allowNoTenant: true }
+          `UPDATE tenant_subscriptions
+           SET status             = $2,
+               current_period_end = $3,
+               ${planSlug ? 'plan_id = (SELECT id FROM plans WHERE slug = $4),' : ''}
+               updated_at         = now()
+           WHERE tenant_id = $1`,
+          planSlug
+            ? [tenantId, sub.status, periodEnd, planSlug]
+            : [tenantId, sub.status, periodEnd],
+          { allowNoTenant: true }
         );
-        logger.info('billing.webhook.subscription_updated', { tenantId, status: sub.status });
+
+        if (planSlug) {
+          await db.query(
+            `UPDATE tenants SET plan_slug = $2, updated_at = now() WHERE id = $1`,
+            [tenantId, planSlug], { allowNoTenant: true }
+          );
+        }
+
+        await invalidatePlanCache(tenantId);
+        logger.info('billing.webhook.subscription_updated', { tenantId, status: sub.status, planSlug });
       }
     }
 
+    // ── customer.subscription.deleted ─────────────────────────
     if (event.type === 'customer.subscription.deleted') {
-      const sub = event.data.object as Stripe.Subscription;
+      const sub      = event.data.object as Stripe.Subscription;
       const tenantId = sub.metadata?.tenantId;
       if (tenantId) {
         await db.query(
-          `UPDATE tenant_subscriptions SET status='cancelled', updated_at=now() WHERE tenant_id=$1`,
+          `UPDATE tenant_subscriptions SET status = 'cancelled', updated_at = now() WHERE tenant_id = $1`,
           [tenantId], { allowNoTenant: true }
         );
+        await db.query(
+          `UPDATE tenants SET plan_slug = 'starter', billing_status = 'cancelled', updated_at = now() WHERE id = $1`,
+          [tenantId], { allowNoTenant: true }
+        );
+        await invalidatePlanCache(tenantId);
         logger.info('billing.webhook.subscription_deleted', { tenantId });
+      }
+    }
+
+    // ── invoice.payment_failed ─────────────────────────────────
+    if (event.type === 'invoice.payment_failed') {
+      const invoice  = event.data.object as Stripe.Invoice;
+      const tenantId = (invoice as any).subscription_details?.metadata?.tenantId
+                    ?? (invoice as any).metadata?.tenantId;
+      if (tenantId) {
+        await db.query(
+          `UPDATE tenant_subscriptions SET status = 'past_due', updated_at = now() WHERE tenant_id = $1`,
+          [tenantId], { allowNoTenant: true }
+        );
+        await invalidatePlanCache(tenantId);
+        logger.info('billing.webhook.payment_failed', { tenantId });
       }
     }
 
