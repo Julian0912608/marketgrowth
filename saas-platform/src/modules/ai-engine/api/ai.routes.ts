@@ -673,4 +673,117 @@ ${format === 'carousel'
   } catch (err) { next(err); }
 });
 
+// ── POST /api/ai/product-content-from-image ───────────────────
+// Genereert marketing content op basis van een geüploade productfoto
+const ImageUploadSchema = z.object({
+  imageBase64:   z.string().min(100).max(10_000_000), // max ~7.5MB base64
+  platform:      z.enum(['instagram', 'tiktok', 'facebook', 'pinterest']),
+  format:        z.enum(['single', 'carousel', 'story']),
+  tone:          z.enum(['lifestyle', 'promotional', 'educational', 'ugc']),
+  language:      z.enum(['nl', 'en']).default('nl'),
+  generateImage: z.boolean().default(false), // default false — ze hebben al een foto
+});
+
+router.post('/product-content-from-image', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+    const { imageBase64, platform, format, tone, language, generateImage } = validate(ImageUploadSchema, req.body);
+
+    const langGuide = language === 'nl' ? 'Write in Dutch.' : 'Write in English.';
+
+    const toneGuide: Record<string, string> = {
+      lifestyle:    'Lifestyle — aspirationeel, warm, laat zien hoe het product in het dagelijks leven past.',
+      promotional:  'Promotioneel — sales-gericht, urgentie, duidelijke CTA om nu te kopen.',
+      educational:  'Educatief — informerend, vertrouwen opbouwen, features en voordelen uitleggen.',
+      ugc:          'UGC-stijl — authentiek, eerste persoon, alsof een echte klant het deelt.',
+    };
+
+    const formatGuide: Record<string, string> = {
+      single:   'Single post: hook + caption (3-4 regels) + CTA + hashtags.',
+      carousel: '5-slide carousel: slide 1 = koptekst, slides 2-4 = voordelen, slide 5 = CTA.',
+      story:    'Story: ultra korte hook (max 8 woorden) + 1 key voordeel + CTA knoptekst.',
+    };
+
+    const platformGuide: Record<string, string> = {
+      instagram: '15-20 hashtags. Emojis toegestaan. Sterke visuele hook.',
+      tiktok:    '5-8 hashtags. Kort en pakkend. Hook werkt in eerste 2 seconden.',
+      facebook:  '3-5 hashtags. Langere beschrijvingen werken hier goed.',
+      pinterest: '5-10 hashtags. Beschrijf het visueel. Keywords voor zoekopdrachten.',
+    };
+
+    const prompt = `You are a product marketing expert. Analyze the product photo and create social media content.
+
+CHANNEL: ${platform}
+FORMAT: ${formatGuide[format]}
+TONE: ${toneGuide[tone]}
+PLATFORM STYLE: ${platformGuide[platform]}
+LANGUAGE: ${langGuide}
+
+Look at the product in the image and:
+1. Identify what the product is
+2. Create compelling marketing content for it
+3. Provide an image_prompt describing the ideal enhanced version of this photo for marketing
+
+Return ONLY valid JSON (no markdown):
+${format === 'carousel'
+  ? '{"productName":"...","slides":[{"headline":"...","body":"...","visual_hint":"..."}],"caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}'
+  : '{"productName":"...","hook":"...","caption":"...","cta":"...","hashtags":["..."],"image_prompt":"..."}'
+}`;
+
+    // Gebruik Claude vision om de foto te analyseren en content te maken
+    const response = await anthropic.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type:       'base64',
+              media_type: 'image/jpeg',
+              data:       imageBase64,
+            },
+          },
+          { type: 'text', text: prompt },
+        ],
+      }],
+    });
+
+    const text  = response.content[0].type === 'text' ? response.content[0].text : '{}';
+    const clean = text.replace(/```json|```/g, '').trim();
+
+    let content;
+    try { content = JSON.parse(clean); }
+    catch { content = { hook: '', caption: text, cta: '', hashtags: [], image_prompt: 'product photo' }; }
+
+    // Optioneel: genereer een AI-verbeterd beeld
+    let imageUrl: string | null = null;
+    if (generateImage && content.image_prompt) {
+      try {
+        const { generateAdCreative } = require('../services/nano-banana.service');
+        const imageResult = await generateAdCreative({
+          product: { title: content.productName || 'product', platform },
+          format:  format === 'story' ? 'story' : 'single',
+          platform,
+          style:   tone === 'lifestyle' ? 'lifestyle' : 'minimal',
+          customPrompt: content.image_prompt,
+        });
+        imageUrl = imageResult.imageUrl ?? null;
+      } catch (imgErr) {
+        logger.warn('ai.image-upload.generate_failed', { tenantId, error: (imgErr as Error).message });
+      }
+    }
+
+    await trackUsage(tenantId, 1);
+    logger.info('ai.product-content-from-image.generated', { tenantId, platform, format, tone });
+
+    res.json({
+      ...content,
+      imageUrl,
+      product: { title: content.productName || 'Geüpload product', price: '' },
+    });
+  } catch (err) { next(err); }
+});
+
 export { router as aiRouter };
