@@ -441,49 +441,30 @@ Return ONLY JSON (no markdown):
   } catch (err) { next(err); }
 });
 
-// ── Bol.com catalog enrichment ────────────────────────────────
-// Haalt producttitel + afbeelding op via de open Bol.com catalog API
-// Slaat het resultaat op in de DB zodat volgende calls direct klaar zijn
-async function enrichBolcomProduct(productId: string, ean: string): Promise<{ title: string | null; imageUrl: string | null }> {
+// ── Bol.com producttitel opzoeken via order line items ────────
+// Betrouwbaarder dan de externe catalog API — titels zitten al in onze DB
+async function getBolcomTitleFromOrders(tenantId: string, ean: string): Promise<string | null> {
   try {
-    const res = await fetch(
-      `https://api.bol.com/catalog/v4/products?ean=${encodeURIComponent(ean)}&country=NL&language=nl`,
-      { headers: { 'Accept': 'application/json' } }
+    const result = await db.query<{ title: string }>(
+      `SELECT li.title
+       FROM order_line_items li
+       WHERE li.tenant_id = $1
+         AND li.sku = $2
+         AND li.title IS NOT NULL
+         AND li.title != ''
+         AND li.title !~ '^[0-9]{8,14}$'
+       ORDER BY li.id DESC
+       LIMIT 1`,
+      [tenantId, ean],
+      { allowNoTenant: true }
     );
-    if (!res.ok) return { title: null, imageUrl: null };
-
-    const data = await res.json() as {
-      products?: { title?: string; images?: { url?: string; urlLarge?: string }[] }[]
-    };
-
-    const product = data.products?.[0];
-    if (!product) return { title: null, imageUrl: null };
-
-    const title    = product.title ?? null;
-    const imageUrl = product.images?.[0]?.urlLarge ?? product.images?.[0]?.url ?? null;
-
-    // Sla op in DB voor volgende keer
-    if (title || imageUrl) {
-      await db.query(
-        `UPDATE products SET
-           product_title = COALESCE($2, product_title),
-           image_url     = COALESCE($3, image_url),
-           updated_at    = now()
-         WHERE id = $1`,
-        [productId, title, imageUrl],
-        { allowNoTenant: true }
-      ).catch(() => {}); // niet kritiek als dit faalt
-    }
-
-    return { title, imageUrl };
+    return result.rows[0]?.title ?? null;
   } catch {
-    return { title: null, imageUrl: null };
+    return null;
   }
 }
 
 // ── GET /api/ai/products ──────────────────────────────────────
-// Haalt producten op voor de Content Studio product-selector
-// Voor Bol.com producten zonder titel: verrijkt via catalog API
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -522,17 +503,25 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
       { allowNoTenant: true }
     );
 
-    // Verrijk Bol.com producten zonder echte titel asynchroon
+    // Verrijk producten zonder echte titel
     const products = await Promise.all(result.rows.map(async (p: any) => {
       let displayTitle = p.product_title || p.title;
-      let imageUrl     = p.image_url;
+      let imageUrl     = p.image_url ?? null;
 
-      // Als titel nog EAN lijkt (alleen cijfers) en er een EAN is: verrijk via catalog
-      const titleIsEan = /^\d{8,14}$/.test((displayTitle || '').trim());
-      if (titleIsEan && p.ean && p.platform === 'bolcom' && !p.image_url) {
-        const enriched = await enrichBolcomProduct(p.id, p.ean);
-        if (enriched.title) displayTitle = enriched.title;
-        if (enriched.imageUrl) imageUrl = enriched.imageUrl;
+      // Detecteer of titel alleen een EAN/getal is
+      const titleIsEan = !displayTitle || /^\d{8,14}$/.test(displayTitle.trim());
+
+      if (titleIsEan && p.ean) {
+        // Stap 1: zoek in eigen order history (snelste, geen externe API)
+        const orderTitle = await getBolcomTitleFromOrders(tenantId, p.ean);
+        if (orderTitle) {
+          displayTitle = orderTitle;
+          // Sla op zodat volgende keer direct klaarstaat
+          await db.query(
+            `UPDATE products SET product_title = $2, updated_at = now() WHERE id = $1`,
+            [p.id, orderTitle], { allowNoTenant: true }
+          ).catch(() => {});
+        }
       }
 
       return {
