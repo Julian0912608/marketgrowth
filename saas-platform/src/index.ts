@@ -170,6 +170,12 @@ try {
   console.log('  adminRouter OK');
 } catch (e: any) { console.error('  adminRouter FAILED:', e.message); }
 
+try {
+  const { teamRouter } = require('./modules/team/api/team.routes');
+  app.use('/api/team', teamRouter);
+  console.log('  teamRouter OK');
+} catch (e: any) { console.error('  teamRouter FAILED:', e.message); }
+
 console.log('All routers loaded.');
 
 // ── Email worker ──────────────────────────────────────────────
