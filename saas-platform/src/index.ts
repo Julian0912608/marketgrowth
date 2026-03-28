@@ -1,5 +1,8 @@
 // ============================================================
 // saas-platform/src/index.ts
+//
+// FIX: Health check uitgebreid met DB + Redis ping
+// zodat Railway automatisch kan herstarten bij outage.
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -19,6 +22,8 @@ import cookieParser from 'cookie-parser';
 import { errorHandler }  from './shared/middleware/error-handler';
 import { requestLogger } from './shared/middleware/request-logger.middleware';
 import { logger }        from './shared/logging/logger';
+import { db }            from './infrastructure/database/connection';
+import { redis }         from './infrastructure/cache/redis';
 
 // ── Startup checks ────────────────────────────────────────────
 console.log('=== ENV CHECK ===');
@@ -79,9 +84,45 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 app.use(requestLogger);
 
-// ── Health check ──────────────────────────────────────────────
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// ── Health check (uitgebreid met DB + Redis ping) ─────────────
+app.get('/health', async (_req, res) => {
+  const start = Date.now();
+
+  // DB check
+  let dbOk    = false;
+  let dbMs    = 0;
+  let redisOk = false;
+  let redisMs = 0;
+
+  try {
+    const t0 = Date.now();
+    await db.query('SELECT 1', [], { allowNoTenant: true });
+    dbOk = true;
+    dbMs = Date.now() - t0;
+  } catch (err: any) {
+    logger.error('health.db.failed', { error: err.message });
+  }
+
+  try {
+    const t0 = Date.now();
+    await redis.ping();
+    redisOk = true;
+    redisMs = Date.now() - t0;
+  } catch (err: any) {
+    logger.error('health.redis.failed', { error: err.message });
+  }
+
+  const allOk = dbOk && redisOk;
+  const pool  = db.stats();
+
+  res.status(allOk ? 200 : 503).json({
+    status:    allOk ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    latencyMs: Date.now() - start,
+    db:    { ok: dbOk,    latencyMs: dbMs },
+    redis: { ok: redisOk, latencyMs: redisMs },
+    pool:  { total: pool.total, idle: pool.idle, waiting: pool.waiting },
+  });
 });
 
 // ── Routers ───────────────────────────────────────────────────
@@ -123,6 +164,12 @@ try {
   console.log('  aiRouter OK');
 } catch (e: any) { console.error('  aiRouter FAILED:', e.message); }
 
+try {
+  const { adminRouter } = require('./modules/admin/api/admin.routes');
+  app.use('/api/admin', adminRouter);
+  console.log('  adminRouter OK');
+} catch (e: any) { console.error('  adminRouter FAILED:', e.message); }
+
 console.log('All routers loaded.');
 
 // ── Email worker ──────────────────────────────────────────────
@@ -142,13 +189,10 @@ app.use((_req, res) => {
 app.use(errorHandler());
 
 // ── Start ─────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT ?? '3000', 10);
+const PORT = parseInt(process.env.PORT ?? '3001', 10);
 app.listen(PORT, '0.0.0.0', () => {
-  logger.info('server.started', {
-    port: PORT,
-    env:  process.env.NODE_ENV ?? 'development',
-    encryptionKeySet: !!process.env.ENCRYPTION_KEY,
-  });
+  logger.info('server.started', { port: PORT, env: process.env.NODE_ENV });
+  console.log(`Server running on port ${PORT}`);
 });
 
 export default app;
