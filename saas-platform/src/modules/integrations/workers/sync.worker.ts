@@ -16,6 +16,7 @@ import { getConnector }      from '../connectors/connector.factory';
 import { runWithTenantContext } from '../../../shared/middleware/tenant-context';
 import { decryptToken }      from '../../../shared/crypto/token-encryption';
 import { v4 as uuidv4 }      from 'uuid';
+import { PlanSlug }          from '../../../shared/types/tenant';
 import {
   PlatformSlug,
   IntegrationCredentials,
@@ -218,7 +219,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
       const connector = getConnector(platformSlug as PlatformSlug);
 
       await runWithTenantContext(
-        { tenantId, tenantSlug: '', userId: 'sync-worker', planSlug: planSlug ?? 'starter', traceId: uuidv4(), requestStartedAt: new Date() },
+        { tenantId, tenantSlug: '', userId: 'sync-worker', planSlug: (planSlug ?? 'starter') as PlanSlug, traceId: uuidv4(), requestStartedAt: new Date() },
         async () => {
           const lastSyncRow = jobType === 'incremental'
             ? await db.query(
