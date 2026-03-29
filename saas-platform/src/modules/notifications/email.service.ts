@@ -1,7 +1,7 @@
 // ============================================================
 // saas-platform/src/modules/notifications/email.service.ts
 //
-// UPDATE: All emails are now in English
+// UPDATE: Revenue wordt nu expliciet als excl. BTW getoond
 // ============================================================
 
 import { db }     from '../../infrastructure/database/connection';
@@ -23,6 +23,7 @@ interface TenantBriefingData {
 }
 
 function buildEmailHtml(data: TenantBriefingData): string {
+  // Revenue uit DB is al total_amount - tax_amount (excl. BTW)
   const revenueFormatted = new Intl.NumberFormat('en-GB', {
     style: 'currency', currency: 'EUR', minimumFractionDigits: 2,
   }).format(data.revenue7d);
@@ -73,21 +74,21 @@ function buildEmailHtml(data: TenantBriefingData): string {
             </td>
           </tr>
 
-          <!-- KPI Stats -->
+          <!-- Stats -->
           <tr>
             <td style="background:#1e293b;padding:0 40px 32px;">
               <table width="100%" cellpadding="0" cellspacing="0">
                 <tr>
                   <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:20px;text-align:center;">
-                    <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Revenue (7d)</div>
-                    <div style="color:#10b981;font-size:28px;font-weight:800;font-family:Georgia,serif;">${revenueFormatted}</div>
-                    <div style="color:#64748b;font-size:11px;margin-top:4px;">excl. VAT</div>
+                    <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">Revenue excl. VAT (7d)</p>
+                    <p style="color:#10b981;font-size:28px;font-weight:800;margin:0 0 4px;font-family:Georgia,serif;">${revenueFormatted}</p>
+                    <p style="color:#475569;font-size:11px;margin:0;">excluding VAT</p>
                   </td>
                   <td width="4%"></td>
                   <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:20px;text-align:center;">
-                    <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Orders (7d)</div>
-                    <div style="color:#3b82f6;font-size:28px;font-weight:800;font-family:Georgia,serif;">${data.orders7d}</div>
-                    <div style="color:#64748b;font-size:11px;margin-top:4px;">last 7 days</div>
+                    <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">Orders (7d)</p>
+                    <p style="color:#3b82f6;font-size:28px;font-weight:800;margin:0 0 4px;font-family:Georgia,serif;">${data.orders7d}</p>
+                    <p style="color:#475569;font-size:11px;margin:0;">&nbsp;</p>
                   </td>
                 </tr>
               </table>
@@ -95,43 +96,40 @@ function buildEmailHtml(data: TenantBriefingData): string {
           </tr>
 
           ${data.topProduct ? `
-          <!-- Top Product -->
+          <!-- Top product -->
           <tr>
-            <td style="background:#1e293b;padding:0 40px 32px;">
-              <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:20px;">
-                <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">🏆 Top Product</div>
-                <div style="color:#fff;font-size:15px;font-weight:600;">${data.topProduct}</div>
+            <td style="background:#1e293b;padding:0 40px 24px;">
+              <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px 20px;">
+                <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 6px;">Top product this week</p>
+                <p style="color:#fff;font-size:15px;font-weight:600;margin:0;">${data.topProduct}</p>
               </div>
             </td>
           </tr>` : ''}
 
           ${data.aiInsight ? `
-          <!-- AI Insight -->
+          <!-- AI insight -->
           <tr>
             <td style="background:#1e293b;padding:0 40px 32px;">
-              <div style="background:linear-gradient(135deg,#1e1b4b,#312e81);border:1px solid #4338ca;border-radius:12px;padding:20px;">
-                <div style="color:#a5b4fc;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">⚡ AI Insight</div>
-                <div style="color:#e0e7ff;font-size:14px;line-height:1.6;">${data.aiInsight}</div>
+              <div style="background:#1e1b4b;border:1px solid #3730a3;border-radius:12px;padding:16px 20px;">
+                <p style="color:#818cf8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">⚡ AI insight</p>
+                <p style="color:#c7d2fe;font-size:14px;line-height:1.6;margin:0;">${data.aiInsight}</p>
               </div>
             </td>
           </tr>` : ''}
 
           <!-- CTA -->
           <tr>
-            <td style="background:#1e293b;padding:0 40px 32px;text-align:center;">
-              <a href="https://app.marketgrow.ai/dashboard"
+            <td style="background:#1e293b;padding:0 40px 40px;text-align:center;">
+              <a href="${process.env.APP_URL || 'https://marketgrow.ai'}/dashboard/ai-insights"
                  style="display:inline-block;background:#4f46e5;color:#fff;font-weight:700;font-size:14px;padding:14px 32px;border-radius:10px;text-decoration:none;">
-                View full dashboard →
+                View today's AI actions
               </a>
             </td>
           </tr>
 
           <!-- Footer -->
           <tr>
-            <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:24px 40px;text-align:center;">
-              <p style="color:#475569;font-size:12px;margin:0 0 8px;">
-                You're receiving this because you have an active MarketGrow account.
-              </p>
+            <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:20px 40px;text-align:center;">
               <p style="color:#334155;font-size:11px;margin:0;">
                 © ${new Date().getFullYear()} MarketGrow · marketgrow.ai
               </p>
@@ -203,6 +201,7 @@ export async function sendDailyBriefings(): Promise<void> {
     try {
       const [statsResult, topProductResult, aiResult] = await Promise.all([
         db.query(
+          // total_amount - tax_amount = excl. BTW
           `SELECT
              COALESCE(SUM(total_amount - tax_amount), 0) AS revenue,
              COUNT(*)::int AS orders
