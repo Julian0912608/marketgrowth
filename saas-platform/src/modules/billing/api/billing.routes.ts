@@ -37,7 +37,7 @@ const PLAN_PRICE_IDS: Record<string, string> = {
 // ── Timestamp helper — voorkomt PostgreSQL crash ──────────────
 // Stripe geeft current_period_end als Unix integer (seconden).
 // Forceer parseInt zodat floats of strings geen issue geven.
-function stripeTimestampToDate(ts: number | null | undefined): Date {
+function stripeTimestampTo(ts: number | null | undefined):  {
   if (!ts) return new Date(Date.now() + 30 * 24 * 3600 * 1000); // fallback: +30 dagen
   return new Date(parseInt(String(ts), 10) * 1000);
 }
@@ -278,7 +278,7 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
         try {
           const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
           status    = stripeSub.status;
-          periodEnd = new Date(stripeSub.current_period_end * 1000);
+          periodEnd = stripeTimestampToDate(sub.current_period_end);
         } catch {}
       }
 
@@ -332,7 +332,7 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
         // Haal planSlug op via price ID
         const priceId    = sub.items.data[0]?.price?.id;
         const planSlug   = Object.entries(PLAN_PRICE_IDS).find(([, id]) => id === priceId)?.[0] ?? null;
-        const periodEnd  = new Date(sub.current_period_end * 1000);
+        const periodEnd  = stripeTimestampToDate(sub.current_period_end);
 
         await db.query(
           `UPDATE tenant_subscriptions
