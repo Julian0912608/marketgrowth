@@ -1,6 +1,9 @@
 // ============================================================
 // src/modules/analytics/api/analytics.routes.ts
-// Uitgebreid met: 24h periode, custom date range (from/to)
+//
+// FIX: parsePeriod voor '24h' (Today) gebruikt nu Amsterdam
+// middernacht als startpunt zodat vandaag = de huidige kalenderdag
+// in Amsterdam-tijd, niet de laatste 24 uur in UTC.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -12,6 +15,11 @@ export const analyticsRouter = Router();
 analyticsRouter.use(tenantMiddleware());
 
 // ── Periode helper ────────────────────────────────────────────
+// FIX: '24h' (Today) geeft nu de huidige dag in Amsterdam-tijd
+// terug (00:00 t/m nu), niet de laatste 24 uur in UTC.
+// Amsterdam is UTC+1 in winter, UTC+2 in zomer.
+// We gebruiken Intl.DateTimeFormat om de lokale datum te bepalen
+// en zetten die om naar UTC voor de DB query.
 function parsePeriod(period: string, from?: string, to?: string): { since: Date; until: Date; days: number } {
   if (from && to) {
     const since = new Date(from + 'T00:00:00.000Z');
@@ -19,12 +27,38 @@ function parsePeriod(period: string, from?: string, to?: string): { since: Date;
     const days  = Math.ceil((until.getTime() - since.getTime()) / 86400000);
     return { since, until, days };
   }
+
   const now = new Date();
+
+  if (period === '24h') {
+    // Bepaal het begin van vandaag in Amsterdam-tijd
+    // door de locale date string te parsen en terug te zetten naar UTC
+    const amsterdamFormatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Amsterdam',
+      year:  'numeric',
+      month: '2-digit',
+      day:   '2-digit',
+    });
+    const todayAmsterdam = amsterdamFormatter.format(now); // 'YYYY-MM-DD'
+
+    // Amsterdam middernacht in UTC
+    // Zet de datum om: '2026-03-29' + bepaal de UTC offset voor Amsterdam op die dag
+    const midnightAmsterdam = new Date(`${todayAmsterdam}T00:00:00`);
+    // Gebruik de timezone offset via toLocaleString truc
+    const utcMidnight = new Date(
+      new Date(`${todayAmsterdam}T00:00:00`).toLocaleString('en-US', { timeZone: 'Europe/Amsterdam' })
+    );
+    // Correcte berekening: Amsterdam middernacht = today 00:00 local → UTC
+    const offsetMs = midnightAmsterdam.getTime() - utcMidnight.getTime();
+    const since = new Date(midnightAmsterdam.getTime() + offsetMs);
+
+    return { since, until: now, days: 1 };
+  }
+
   switch (period) {
-    case '24h':  return { since: new Date(now.getTime() - 86400000),      until: now, days: 1 };
-    case '7d':   return { since: new Date(now.getTime() - 7  * 86400000), until: now, days: 7 };
-    case '90d':  return { since: new Date(now.getTime() - 90 * 86400000), until: now, days: 90 };
-    default:     return { since: new Date(now.getTime() - 30 * 86400000), until: now, days: 30 };
+    case '7d':  return { since: new Date(now.getTime() - 7  * 86400000), until: now, days: 7  };
+    case '90d': return { since: new Date(now.getTime() - 90 * 86400000), until: now, days: 90 };
+    default:    return { since: new Date(now.getTime() - 30 * 86400000), until: now, days: 30 };
   }
 }
 
@@ -54,7 +88,6 @@ analyticsRouter.get('/overview', async (req: Request, res: Response, next: NextF
       params
     );
 
-    // Vorige periode voor vergelijking
     const prevSince = new Date(since.getTime() - days * 86400000);
     const prevUntil = since;
     const prevParams: any[] = [tenantId, prevSince, prevUntil];
@@ -103,17 +136,16 @@ analyticsRouter.get('/daily', async (req: Request, res: Response, next: NextFunc
     const params: any[] = [tenantId, since, until];
     const platformFilter = platform ? ` AND platform = $${params.push(platform)}` : '';
 
-    // Voor 24h gebruiken we uurlijkse granulariteit
     const is24h = period === '24h' && !from;
     const groupBy = is24h
-      ? `DATE_TRUNC('hour', ordered_at)`
-      : `DATE(ordered_at)`;
+      ? `DATE_TRUNC('hour', ordered_at AT TIME ZONE 'Europe/Amsterdam')`
+      : `DATE(ordered_at AT TIME ZONE 'Europe/Amsterdam')`;
 
     const result = await db.query(
       `SELECT
-         ${groupBy}          AS date,
+         ${groupBy}             AS date,
          platform,
-         COUNT(*)::int       AS orders_count,
+         COUNT(*)::int          AS orders_count,
          COALESCE(SUM(total),0) AS revenue,
          COALESCE(AVG(total),0) AS avg_order_value
        FROM unified_orders
@@ -169,7 +201,7 @@ analyticsRouter.get('/top-products', async (req: Request, res: Response, next: N
     const params: any[] = [tenantId, since, until, parseInt(limit, 10)];
     const platformFilter = platform ? ` AND o.platform_slug = $${params.push(platform)}` : '';
 
-     const result = await db.query(
+    const result = await db.query(
       `SELECT
          oli.title,
          oli.sku,
@@ -194,7 +226,7 @@ analyticsRouter.get('/top-products', async (req: Request, res: Response, next: N
        LIMIT $4`,
       params
     );
- 
+
     res.json({ products: result.rows, period });
   } catch (err) { next(err); }
 });
@@ -265,7 +297,6 @@ analyticsRouter.get('/export', async (req: Request, res: Response, next: NextFun
       return;
     }
 
-    // CSV export
     if (rows.length === 0) { res.json({ data: [] }); return; }
     const headers = Object.keys(rows[0]).join(',');
     const csv = [headers, ...rows.map(r => Object.values(r).map(v => `"${v}"`).join(','))].join('\n');
