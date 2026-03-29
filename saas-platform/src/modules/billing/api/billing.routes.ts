@@ -34,7 +34,13 @@ const PLAN_PRICE_IDS: Record<string, string> = {
   growth:  process.env.STRIPE_PRICE_GROWTH  ?? '',
   scale:   process.env.STRIPE_PRICE_SCALE   ?? '',
 };
-
+// ── Timestamp helper — voorkomt PostgreSQL crash ──────────────
+// Stripe geeft current_period_end als Unix integer (seconden).
+// Forceer parseInt zodat floats of strings geen issue geven.
+function stripeTimestampToDate(ts: number | null | undefined): Date {
+  if (!ts) return new Date(Date.now() + 30 * 24 * 3600 * 1000); // fallback: +30 dagen
+  return new Date(parseInt(String(ts), 10) * 1000);
+}
 // ── Email via fetch (geen resend package nodig) ───────────────
 async function sendEmail(to: string, subject: string, html: string): Promise<void> {
   if (!RESEND_KEY) return;
