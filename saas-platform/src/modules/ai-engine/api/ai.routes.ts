@@ -24,8 +24,6 @@
 //      100 om overeen te komen met pricing pagina).
 //   5. AI Chat en Social Content generatie zijn Growth+ only.
 //      Starter krijgt alleen AI Insights (dagelijkse briefing).
-//   6. FIX: credits endpoint gebruikte ?? operator op null waarde
-//      waardoor Scale plan altijd limit: 100 kreeg ipv unlimited.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -77,12 +75,15 @@ async function checkIpRateLimit(req: Request): Promise<boolean> {
 }
 
 // ── Redis-backed credit pre-check ────────────────────────────
+// Snelle check VÓÓR de Anthropic API call om te voorkomen dat
+// de limiet wordt overschreden. Gebruikt een Redis counter als
+// fast-path; de DB is de bron van waarheid.
 async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<boolean> {
   const limit = PLAN_LIMITS[planSlug];
   if (limit === null) return true; // unlimited
 
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
-  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
+  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`; // YYYY-MM
 
   try {
     const used = await rawRedis.get(key);
@@ -90,8 +91,11 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
       logger.info('ai.credits.limit_reached_redis', { tenantId, planSlug, used, limit });
       return false;
     }
-  } catch {}
+  } catch {
+    // Redis niet beschikbaar — val terug op DB check
+  }
 
+  // DB check als Redis geen data heeft
   try {
     const result = await db.query(
       `SELECT COALESCE(fu.usage_count, 0) AS used
@@ -107,13 +111,18 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
     }
   } catch (err) {
     logger.warn('ai.credits.precheck_failed', { tenantId, error: (err as Error).message });
+    // Bij DB fout: laat door (liever wat overuse dan service down)
   }
 
   return true;
 }
 
 // ── Usage tracker ─────────────────────────────────────────────
+// FIX: Niet meer silent-fail. Logt warnings als tracking mislukt
+// maar blokkeert de response niet (gebruiker heeft al gekregen wat
+// hij vroeg). Werkt Redis counter bij voor snelle pre-check.
 async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promise<void> {
+  // DB tracking
   try {
     await db.query(
       `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -125,15 +134,24 @@ async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promi
       [tenantId, count], { allowNoTenant: true }
     );
   } catch (err) {
-    logger.warn('ai.usage.tracking_failed', { tenantId, count, error: (err as Error).message });
+    // Niet silent: log als warning zodat monitoring dit oppikt
+    logger.warn('ai.usage.tracking_failed', {
+      tenantId,
+      count,
+      error: (err as Error).message,
+    });
   }
 
+  // Redis counter bijwerken (best-effort, niet kritiek)
   try {
     const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
     const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
     await rawRedis.incrby(key, count);
+    // TTL van 35 dagen — ruim genoeg voor een maandperiode
     await rawRedis.expire(key, 35 * 24 * 3600);
-  } catch {}
+  } catch {
+    // Redis update mislukt — geen actie, DB is bron van waarheid
+  }
 }
 
 // ── Zod validation helper ─────────────────────────────────────
@@ -200,6 +218,7 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const { tenantId, planSlug } = getTenantContext();
     const force = req.query.force === 'true';
 
+    // Credit pre-check (skip als force=true want dan is cache omzeild)
     if (!force) {
       const cacheKey = `ai:insights:${tenantId}`;
       const cached = await cache.get(cacheKey);
@@ -209,6 +228,7 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
       }
     }
 
+    // Controleer credits vóór Anthropic API call
     const hasCredits = await checkCreditPreCheck(tenantId, planSlug);
     if (!hasCredits) {
       const limit = PLAN_LIMITS[planSlug];
@@ -278,9 +298,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
   try {
     const { tenantId, planSlug } = getTenantContext();
 
-    // FIX: ?? operator werkt niet voor null — gebruik expliciete key check
-    // zodat Scale plan (null) niet terugvalt op 100
-    const limit     = planSlug in PLAN_LIMITS ? PLAN_LIMITS[planSlug] : 100;
+    const limit = PLAN_LIMITS[planSlug] ?? 100;
     const unlimited = limit === null;
 
     const usageResult = await db.query(
@@ -304,6 +322,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
 });
 
 // ── POST /api/ai/chat ─────────────────────────────────────────
+// AI Chat is Growth+ only (Starter heeft alleen AI Insights)
 router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -350,6 +369,7 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
 });
 
 // ── POST /api/ai/social-content ───────────────────────────────
+// Social Content is Growth+ only
 router.post('/social-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -500,6 +520,7 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 });
 
 // ── POST /api/ai/video-script ─────────────────────────────────
+// Interne tool — alleen voor owner/admin
 router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
@@ -569,10 +590,10 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
 
     const result = await db.query(
       `SELECT p.id, p.title, p.sku, p.platform, p.price_min,
-              p.total_inventory, p.image_url, p.external_url,
+              p.total_inventory, p.image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold
        FROM products p
-       LEFT JOIN order_line_items li ON li.product_id = p.id
+       LEFT JOIN order_line_items li ON li.product_id = p.id::text
          AND li.tenant_id = p.tenant_id
        WHERE p.tenant_id = $1 AND p.status = 'active'
        GROUP BY p.id
@@ -614,7 +635,7 @@ router.post('/product-content', featureGate('ai-recommendations'), async (req: R
               COALESCE(SUM(li.quantity), 0) AS units_sold,
               COALESCE(SUM(li.total_price), 0) AS total_revenue
        FROM products p
-       LEFT JOIN order_line_items li ON li.product_id = p.id AND li.tenant_id = p.tenant_id
+       LEFT JOIN order_line_items li ON li.product_id = p.id::text AND li.tenant_id = p.tenant_id
        WHERE p.id = $1 AND p.tenant_id = $2
        GROUP BY p.id`,
       [productId, tenantId], { allowNoTenant: true }
@@ -656,12 +677,11 @@ Generate complete marketing content for this product. Return ONLY JSON:
     try { content = JSON.parse(clean); }
     catch { content = { error: 'Failed to parse content' }; }
 
-    await trackUsage(tenantId, 3, planSlug);
+    await trackUsage(tenantId, 3, planSlug); // product content = 3 credits (meerdere formats)
 
     logger.info('ai.product-content.generated', { tenantId, productId });
     res.json({ content, product: { id: product.id, title: product.title } });
   } catch (err) { next(err); }
 });
 
-export { router as aiRouter };
 export default router;
