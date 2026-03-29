@@ -2,7 +2,7 @@
 // src/modules/notifications/weekly.report.service.ts
 //
 // Stuurt elke maandag om 08:00 een uitgebreid weekrapport
-// met omzet, top producten, beste kanaal en AI-tip
+// FIX: Revenue labels tonen nu expliciet "excl. BTW/VAT"
 // ============================================================
 
 import { db }     from '../../infrastructure/database/connection';
@@ -33,7 +33,6 @@ function formatEur(val: number): string {
 export async function sendWeeklyReports(): Promise<void> {
   logger.info('weekly.report.start');
 
-  // Haal alle actieve tenants op
   const tenants = await db.query<{
     tenant_id:  string;
     email:      string;
@@ -57,10 +56,9 @@ export async function sendWeeklyReports(): Promise<void> {
 
   for (const tenant of tenants.rows) {
     try {
-      // Haal weekdata op
       const [statsResult, prevStatsResult, topProductsResult, byPlatformResult] = await Promise.all([
 
-        // Deze week
+        // Deze week — total_amount - tax_amount = excl. BTW
         db.query<{ revenue: string; orders: string; avg_order: string; customers: string }>(
           `SELECT
              COALESCE(SUM(total_amount - tax_amount), 0) AS revenue,
@@ -74,7 +72,7 @@ export async function sendWeeklyReports(): Promise<void> {
           [tenant.tenant_id], { allowNoTenant: true }
         ),
 
-        // Vorige week (voor vergelijking)
+        // Vorige week
         db.query<{ revenue: string; orders: string }>(
           `SELECT
              COALESCE(SUM(total_amount - tax_amount), 0) AS revenue,
@@ -88,44 +86,46 @@ export async function sendWeeklyReports(): Promise<void> {
         ),
 
         // Top 3 producten
-        db.query<{ title: string; sold: string; revenue: string; platform_slug: string }>(
-          `SELECT oli.title, SUM(oli.quantity)::int AS sold,
-                  SUM(oli.total_price) AS revenue,
-                  o.platform_slug
+        db.query<{ title: string; revenue: string; orders: string }>(
+          `SELECT oli.title,
+                  COALESCE(SUM(oli.total_price), 0) AS revenue,
+                  COUNT(*)::int                      AS orders
            FROM order_line_items oli
            JOIN orders o ON o.id = oli.order_id
            WHERE oli.tenant_id = $1
              AND o.ordered_at >= NOW() - INTERVAL '7 days'
              AND o.status NOT IN ('cancelled', 'refunded')
-           GROUP BY oli.title, o.platform_slug
-           ORDER BY revenue DESC LIMIT 3`,
+             AND oli.total_price > 0
+           GROUP BY oli.title
+           ORDER BY revenue DESC
+           LIMIT 3`,
           [tenant.tenant_id], { allowNoTenant: true }
         ),
 
-        // Omzet per platform
+        // Per platform
         db.query<{ platform: string; revenue: string; orders: string }>(
-          `SELECT platform_slug AS platform,
+          `SELECT platform,
                   COALESCE(SUM(total_amount - tax_amount), 0) AS revenue,
-                  COUNT(*)::int AS orders
+                  COUNT(*)::int                               AS orders
            FROM orders
            WHERE tenant_id = $1
              AND ordered_at >= NOW() - INTERVAL '7 days'
              AND status NOT IN ('cancelled', 'refunded')
-           GROUP BY platform_slug
+           GROUP BY platform
            ORDER BY revenue DESC`,
           [tenant.tenant_id], { allowNoTenant: true }
         ),
       ]);
 
-      const stats     = statsResult.rows[0];
-      const prevStats = prevStatsResult.rows[0];
-      const products  = topProductsResult.rows;
+      const stats    = statsResult.rows[0];
+      const prev     = prevStatsResult.rows[0];
+      const products = topProductsResult.rows;
       const platforms = byPlatformResult.rows;
 
       const revenue     = parseFloat(stats.revenue || '0');
-      const prevRevenue = parseFloat(prevStats.revenue || '0');
       const orders      = parseInt(stats.orders || '0');
-      const prevOrders  = parseInt(prevStats.orders || '0');
+      const prevRevenue = parseFloat(prev.revenue || '0');
+      const prevOrders  = parseInt(prev.orders || '0');
 
       const revenueChange = prevRevenue > 0
         ? Math.round(((revenue - prevRevenue) / prevRevenue) * 100)
@@ -172,8 +172,9 @@ export async function sendWeeklyReports(): Promise<void> {
             <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
               <tr>
                 <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px;text-align:center;">
-                  <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Omzet (7d)</div>
-                  <div style="color:#10b981;font-size:26px;font-weight:800;margin:6px 0 4px;">${formatEur(revenue)}</div>
+                  <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Omzet excl. BTW (7d)</div>
+                  <div style="color:#10b981;font-size:26px;font-weight:800;margin:6px 0 2px;">${formatEur(revenue)}</div>
+                  <div style="color:#475569;font-size:10px;margin-bottom:4px;">excl. BTW</div>
                   <div style="color:${revenueChange >= 0 ? '#10b981' : '#ef4444'};font-size:12px;">
                     ${revenueChange >= 0 ? '↑' : '↓'} ${Math.abs(revenueChange)}% vs vorige week
                   </div>
@@ -181,7 +182,7 @@ export async function sendWeeklyReports(): Promise<void> {
                 <td width="4%"></td>
                 <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px;text-align:center;">
                   <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Orders (7d)</div>
-                  <div style="color:#3b82f6;font-size:26px;font-weight:800;margin:6px 0 4px;">${orders}</div>
+                  <div style="color:#3b82f6;font-size:26px;font-weight:800;margin:6px 0 6px;">${orders}</div>
                   <div style="color:${ordersChange >= 0 ? '#10b981' : '#ef4444'};font-size:12px;">
                     ${ordersChange >= 0 ? '↑' : '↓'} ${Math.abs(ordersChange)}% vs vorige week
                   </div>
@@ -189,49 +190,51 @@ export async function sendWeeklyReports(): Promise<void> {
               </tr>
             </table>
 
-            <!-- Top producten -->
             ${products.length > 0 ? `
-            <div style="margin-bottom:28px;">
-              <p style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 12px;">Top producten deze week</p>
-              <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;border:1px solid #334155;border-radius:12px;overflow:hidden;">
-                ${products.map((p, i) => `
-                <tr style="${i > 0 ? 'border-top:1px solid #1e293b;' : ''}">
-                  <td style="padding:12px 16px;">
-                    <span style="color:#64748b;font-size:12px;margin-right:8px;">${i + 1}.</span>
-                    <span style="color:#fff;font-size:13px;">${p.title}</span>
-                    <span style="color:#475569;font-size:11px;margin-left:8px;">${PLATFORM_NAMES[p.platform_slug] ?? p.platform_slug}</span>
-                  </td>
-                  <td style="padding:12px 16px;text-align:right;">
-                    <span style="color:#10b981;font-size:13px;font-weight:600;">${formatEur(parseFloat(p.revenue))}</span>
-                    <span style="color:#475569;font-size:11px;margin-left:6px;">${p.sold}x</span>
-                  </td>
-                </tr>`).join('')}
-              </table>
+            <!-- Top producten -->
+            <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;overflow:hidden;margin-bottom:20px;">
+              <div style="padding:12px 16px;border-bottom:1px solid #1e293b;">
+                <span style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;">Top producten deze week</span>
+              </div>
+              ${products.map((p, i) => `
+                <div style="${i > 0 ? 'border-top:1px solid #1e293b;' : ''}">
+                  <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:12px 16px;color:#fff;font-size:13px;">${p.title}</td>
+                      <td style="padding:12px 16px;text-align:right;">
+                        <span style="color:#10b981;font-size:13px;font-weight:600;">${formatEur(parseFloat(p.revenue))}</span>
+                        <span style="color:#475569;font-size:11px;margin-left:6px;">${p.orders} orders</span>
+                      </td>
+                    </tr>
+                  </table>
+                </div>`).join('')}
             </div>` : ''}
 
-            <!-- Per platform -->
             ${platforms.length > 1 ? `
-            <div style="margin-bottom:28px;">
-              <p style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 12px;">Omzet per platform</p>
-              <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;border:1px solid #334155;border-radius:12px;overflow:hidden;">
-                ${platforms.map((p, i) => `
-                <tr style="${i > 0 ? 'border-top:1px solid #1e293b;' : ''}">
-                  <td style="padding:12px 16px;color:#fff;font-size:13px;">
-                    ${PLATFORM_NAMES[p.platform] ?? p.platform}
-                  </td>
-                  <td style="padding:12px 16px;text-align:right;">
-                    <span style="color:#10b981;font-size:13px;font-weight:600;">${formatEur(parseFloat(p.revenue))}</span>
-                    <span style="color:#475569;font-size:11px;margin-left:6px;">${p.orders} orders</span>
-                  </td>
-                </tr>`).join('')}
-              </table>
+            <!-- Per platform -->
+            <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;overflow:hidden;margin-bottom:20px;">
+              <div style="padding:12px 16px;border-bottom:1px solid #1e293b;">
+                <span style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;">Omzet excl. BTW per platform</span>
+              </div>
+              ${platforms.map((p, i) => `
+                <div style="${i > 0 ? 'border-top:1px solid #1e293b;' : ''}">
+                  <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:12px 16px;color:#fff;font-size:13px;">${PLATFORM_NAMES[p.platform] ?? p.platform}</td>
+                      <td style="padding:12px 16px;text-align:right;">
+                        <span style="color:#10b981;font-size:13px;font-weight:600;">${formatEur(parseFloat(p.revenue))}</span>
+                        <span style="color:#475569;font-size:11px;margin-left:6px;">${p.orders} orders</span>
+                      </td>
+                    </tr>
+                  </table>
+                </div>`).join('')}
             </div>` : ''}
 
             <!-- CTA -->
             <div style="text-align:center;padding-top:8px;">
               <a href="${APP_URL}/dashboard/ai-insights"
                  style="display:inline-block;background:#4f46e5;color:#fff;font-weight:700;font-size:14px;padding:14px 32px;border-radius:10px;text-decoration:none;">
-                Bekijk je AI acties voor deze week →
+                Bekijk je AI acties voor deze week
               </a>
             </div>
 
@@ -256,7 +259,7 @@ export async function sendWeeklyReports(): Promise<void> {
 
       await sendEmail(
         tenant.email,
-        `📊 Weekrapport — ${formatEur(revenue)} omzet · ${orders} orders`,
+        `Weekrapport: ${formatEur(revenue)} omzet excl. BTW, ${orders} orders`,
         html
       );
 
