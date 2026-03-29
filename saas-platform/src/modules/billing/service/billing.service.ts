@@ -259,7 +259,7 @@ export class BillingService {
       `UPDATE tenant_subscriptions
        SET status = $2, current_period_end = $3, updated_at = now()
        WHERE tenant_id = $1`,
-      [tenantId, subscription.status, new Date(subscription.current_period_end * 1000)],
+      [tenantId, subscription.status, stripeTimestampToDate(sub.current_period_end)],
       { allowNoTenant: true }
     );
 
