@@ -31,27 +31,17 @@ function parsePeriod(period: string, from?: string, to?: string): { since: Date;
   const now = new Date();
 
   if (period === '24h') {
-    // Bepaal het begin van vandaag in Amsterdam-tijd
-    // door de locale date string te parsen en terug te zetten naar UTC
-    const amsterdamFormatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Europe/Amsterdam',
-      year:  'numeric',
-      month: '2-digit',
-      day:   '2-digit',
-    });
-    const todayAmsterdam = amsterdamFormatter.format(now); // 'YYYY-MM-DD'
-
-    // Amsterdam middernacht in UTC
-    // Zet de datum om: '2026-03-29' + bepaal de UTC offset voor Amsterdam op die dag
-    const midnightAmsterdam = new Date(`${todayAmsterdam}T00:00:00`);
-    // Gebruik de timezone offset via toLocaleString truc
-    const utcMidnight = new Date(
-      new Date(`${todayAmsterdam}T00:00:00`).toLocaleString('en-US', { timeZone: 'Europe/Amsterdam' })
-    );
-    // Correcte berekening: Amsterdam middernacht = today 00:00 local → UTC
-    const offsetMs = midnightAmsterdam.getTime() - utcMidnight.getTime();
-    const since = new Date(midnightAmsterdam.getTime() + offsetMs);
-
+    // Gebruik UTC offset voor Amsterdam (UTC+1 winter, UTC+2 zomer)
+    // Bepaal of het zomertijd is via de offset van een Amsterdam datum
+    const amsterdamOffset = -new Date().toLocaleString('en', { timeZone: 'Europe/Amsterdam', timeZoneName: 'shortOffset' })
+      .split('GMT')[1]?.replace(':', '') || '+100';
+    const offsetHours = parseInt(amsterdamOffset) / 100;
+    const offsetMs    = offsetHours * 3600000;
+    
+    // Middernacht Amsterdam = begin van de dag in Amsterdam tijd
+    const nowAmsterdam   = now.getTime() + offsetMs;
+    const midnightUtcMs  = nowAmsterdam - (nowAmsterdam % 86400000);
+    const since          = new Date(midnightUtcMs - offsetMs);
     return { since, until: now, days: 1 };
   }
 
