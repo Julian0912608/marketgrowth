@@ -59,7 +59,6 @@ export class BillingService {
       customer:   stripeCustomerId,
       mode:       'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      // 14-dagen gratis trial
       subscription_data: {
         trial_period_days: 14,
         metadata: { tenantId, planSlug },
@@ -207,10 +206,9 @@ export class BillingService {
 
     if (!tenantId || !planSlug) return;
 
-    // Haal trial end op uit Stripe subscription
     const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
-    const status = stripeSub.status; // 'trialing' of 'active'
-    const periodEnd = new Date(stripeSub.current_period_end * 1000);
+    const status    = stripeSub.status;
+    const periodEnd = new Date(parseInt(String(stripeSub.current_period_end), 10) * 1000);
 
     await db.query(
       `INSERT INTO tenant_subscriptions (tenant_id, plan_id, stripe_sub_id, status, current_period_end)
@@ -225,7 +223,6 @@ export class BillingService {
       { allowNoTenant: true }
     );
 
-    // Onboarding stappen bijwerken
     await db.query(
       `UPDATE onboarding_progress
        SET current_step = 'shop_connected',
@@ -255,11 +252,14 @@ export class BillingService {
     const tenantId = subscription.metadata?.tenantId;
     if (!tenantId) return;
 
+    // FIX: parseInt voorkomt PostgreSQL crash bij float/string timestamps van Stripe
+    const periodEnd = new Date(parseInt(String(subscription.current_period_end), 10) * 1000);
+
     await db.query(
       `UPDATE tenant_subscriptions
        SET status = $2, current_period_end = $3, updated_at = now()
        WHERE tenant_id = $1`,
-      [tenantId, subscription.status, stripeTimestampToDate(sub.current_period_end)],
+      [tenantId, subscription.status, periodEnd],
       { allowNoTenant: true }
     );
 
@@ -279,7 +279,6 @@ export class BillingService {
       [tenantId], { allowNoTenant: true }
     );
 
-    // Terugvallen op starter plan
     await db.query(
       `UPDATE tenant_subscriptions
        SET plan_id = (SELECT id FROM plans WHERE slug = 'starter'), updated_at = now()
@@ -311,7 +310,6 @@ export class BillingService {
     const tenant = result.rows[0];
     if (!tenant) throw new Error('Tenant niet gevonden.');
 
-    // Gebruik bestaande stripe customer ID als die er is
     if (tenant.stripe_customer_id) {
       await cache.set(cacheKey, tenant.stripe_customer_id, 86400);
       return tenant.stripe_customer_id;
@@ -323,7 +321,6 @@ export class BillingService {
       metadata: { tenantId },
     });
 
-    // Sla stripe_customer_id op in tenants tabel
     await db.query(
       `UPDATE tenants SET stripe_customer_id = $2 WHERE id = $1`,
       [tenantId, customer.id], { allowNoTenant: true }
