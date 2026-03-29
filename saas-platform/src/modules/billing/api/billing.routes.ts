@@ -37,7 +37,7 @@ const PLAN_PRICE_IDS: Record<string, string> = {
 // ── Timestamp helper — voorkomt PostgreSQL crash ──────────────
 // Stripe geeft current_period_end als Unix integer (seconden).
 // Forceer parseInt zodat floats of strings geen issue geven.
-function stripeTimestampTo(ts: number | null | undefined):  {
+function stripeTimestampToDate(ts: number | null | undefined): Date {
   if (!ts) return new Date(Date.now() + 30 * 24 * 3600 * 1000); // fallback: +30 dagen
   return new Date(parseInt(String(ts), 10) * 1000);
 }
@@ -278,7 +278,7 @@ router.post('/webhook', async (req: Request, res: Response, next: NextFunction) 
         try {
           const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
           status    = stripeSub.status;
-          periodEnd = stripeTimestampToDate(sub.current_period_end);
+          periodEnd = stripeTimestampToDate(stripeSub.current_period_end);
         } catch {}
       }
 
