@@ -38,9 +38,8 @@ import { logger }            from '../../../shared/logging/logger';
 const router = Router();
 router.use(tenantMiddleware());
 
-const anthropic = require('@anthropic-ai/sdk').default
-  ? new (require('@anthropic-ai/sdk').default)()
-  : new (require('@anthropic-ai/sdk'))();
+const Anthropic = require('@anthropic-ai/sdk');
+const anthropic = new (Anthropic.default ?? Anthropic)();
 
 // ── Cache TTL per plan (seconden) ─────────────────────────────
 const CACHE_TTL: Record<string, number> = {
