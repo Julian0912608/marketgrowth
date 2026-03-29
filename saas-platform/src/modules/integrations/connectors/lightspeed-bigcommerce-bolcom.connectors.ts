@@ -295,38 +295,44 @@ export class BolcomConnector implements IPlatformConnector {
     return { items: orders, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
-  // FIX: Incremental sync via Orders API — haalt nu FBR + FBB op
-  // en haalt per order het detail op voor correcte prijs + datum.
-  // Open/pending orders worden nu ook opgeslagen.
+  // FIX: Incremental sync — haalt FBR + FBB op via Orders API
+  // én haalt altijd alle openstaande orders op zonder tijdsfilter.
+  // Zo missen open/pending orders nooit meer uit de sync.
   private async fetchViaOrders(token: string, updatedAfter: Date | undefined, page: number): Promise<PaginatedResult<NormalizedOrder>> {
     const minutesAgo = updatedAfter
       ? Math.ceil((Date.now() - updatedAfter.getTime()) / 60000)
       : 30;
 
-    // Bol.com geeft een 400 als change-interval-minute > 60.
-    // Val terug op de shipments API als de gap te groot is.
-    if (minutesAgo > 60) {
+    // Haal gewijzigde orders op via change-interval-minute (max 60 min)
+    // én haal altijd alle open orders op in parallel
+    const cappedMinutes = Math.max(1, Math.min(minutesAgo, 60));
+    const useChangeInterval = minutesAgo <= 60;
+
+    const promises: Promise<{ orders?: Record<string, unknown>[] }>[] = [
+      // Altijd: open FBR orders (geen tijdsfilter — vangt nieuwe orders)
+      this.apiGet(token, `/retailer/orders?status=OPEN&fulfilment-method=FBR&page=${page}`)
+        .catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
+      // Altijd: open FBB orders
+      this.apiGet(token, `/retailer/orders?status=OPEN&fulfilment-method=FBB&page=${page}`)
+        .catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
+    ];
+
+    if (useChangeInterval) {
+      // Ook: recent gewijzigde orders (ALL statuses, binnen tijdsvenster)
+      promises.push(
+        this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=${cappedMinutes}&page=${page}`)
+          .catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
+        this.apiGet(token, `/retailer/orders?status=ALL&fulfilment-method=FBB&change-interval-minute=${cappedMinutes}&page=${page}`)
+          .catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
+      );
+    } else {
+      // Als tijdsvenster te groot: gebruik shipments als fallback voor gewijzigde orders
       return this.fetchViaShipments(token, page);
     }
 
-    const cappedMinutes = Math.max(1, Math.min(minutesAgo, 60));
-
-    // Haal FBR + FBB orders op parallel
-    const [fbrData, fbbData] = await Promise.all([
-      this.apiGet(
-        token,
-        `/retailer/orders?status=ALL&fulfilment-method=FBR&change-interval-minute=${cappedMinutes}&page=${page}`
-      ).catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
-      this.apiGet(
-        token,
-        `/retailer/orders?status=ALL&fulfilment-method=FBB&change-interval-minute=${cappedMinutes}&page=${page}`
-      ).catch(() => ({ orders: [] })) as Promise<{ orders?: Record<string, unknown>[] }>,
-    ]);
-
-    const fbrOrders = fbrData.orders || [];
-    const fbbOrders = fbbData.orders || [];
-    const allOrders = [...fbrOrders, ...fbbOrders];
-    const hasNextPage = fbrOrders.length === 50 || fbbOrders.length === 50;
+    const results = await Promise.all(promises);
+    const allOrders = results.flatMap(r => r.orders || []);
+    const hasNextPage = results.some(r => (r.orders || []).length === 50);
 
     // Dedupleer op orderId
     const seenOrderIds = new Set<string>();
@@ -338,7 +344,6 @@ export class BolcomConnector implements IPlatformConnector {
       seenOrderIds.add(orderId);
 
       // Haal order detail op voor correcte prijs, datum en status
-      // (normalizeOrderSummary heeft geen prijs info van de API)
       try {
         const detail     = await this.apiGet(token, '/retailer/orders/' + orderId) as Record<string, unknown>;
         const normalized = this.normalizeOrderDetail(detail);
@@ -346,7 +351,6 @@ export class BolcomConnector implements IPlatformConnector {
           orders.push(normalized);
         }
       } catch {
-        // Fallback: gebruik de summary data als detail call faalt
         const normalized = this.normalizeOrderSummary(o);
         if (normalized.externalId) {
           orders.push(normalized);
