@@ -6,6 +6,10 @@
 //   2. Per-tenant concurrency guard via Redis SETNX
 //      (max 2 gelijktijdige sync jobs per tenant)
 //   3. Priority queuing: Scale=1, Growth=5, Starter=10
+//   4. FIX: updatedAfter gebruikt nu ook last_sync_at van de
+//      integratie zelf als fallback, zodat incremental sync
+//      altijd een zinvolle tijdsvenster heeft — ook als er
+//      nog geen completed full_sync is.
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
@@ -75,7 +79,6 @@ export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',      {
 export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: bullConnection });
 
 // ── Per-tenant concurrency guard ──────────────────────────────
-// Voorkomt dat één tenant alle worker slots opeist
 const MAX_CONCURRENT_PER_TENANT = 2;
 
 async function acquireTenantSlot(tenantId: string): Promise<boolean> {
@@ -124,7 +127,7 @@ function getRateLimit(platform: string): number {
 function getPriority(planSlug?: string): number {
   if (planSlug === 'scale')  return 1;
   if (planSlug === 'growth') return 5;
-  return 10; // starter
+  return 10;
 }
 
 // ── Bulk INSERT helper voor line items ────────────────────────
@@ -136,7 +139,6 @@ async function bulkInsertLineItems(
 ): Promise<void> {
   if (!lineItems || lineItems.length === 0) return;
 
-  // Bouw een bulk VALUES string: ($1,$2,...),($N+1,...)
   const colCount = 12;
   const values: any[] = [];
   const placeholders: string[] = [];
@@ -176,11 +178,9 @@ export const syncWorker = new Worker<SyncJobPayload>(
   async (job: Job<SyncJobPayload>) => {
     const { integrationId, tenantId, platformSlug, jobType, syncJobDbId, planSlug } = job.data;
 
-    // Per-tenant concurrency check
     const slotAcquired = await acquireTenantSlot(tenantId);
     if (!slotAcquired) {
       logger.warn('sync.job.throttled', { integrationId, tenantId, platformSlug });
-      // Gooi een retryable error — BullMQ zal het later opnieuw proberen
       throw Object.assign(new Error('Tenant concurrency limit bereikt — wordt opnieuw geprobeerd'), {
         retryable: true,
       });
@@ -224,18 +224,40 @@ export const syncWorker = new Worker<SyncJobPayload>(
       await runWithTenantContext(
         { tenantId, tenantSlug: '', userId: 'sync-worker', planSlug: (planSlug ?? 'starter') as PlanSlug, traceId: uuidv4(), requestStartedAt: new Date() },
         async () => {
-          const lastSyncRow = jobType === 'incremental'
-            ? await db.query(
-                `SELECT MAX(completed_at) AS last_sync_at
-                 FROM integration_sync_jobs
-                 WHERE integration_id = $1 AND status = 'completed' AND job_type = 'full_sync'`,
-                [integrationId], { allowNoTenant: true }
-              )
-            : null;
 
-          const updatedAfter = jobType === 'incremental' && lastSyncRow?.rows[0]?.last_sync_at
-            ? new Date(lastSyncRow.rows[0].last_sync_at)
-            : undefined;
+          // FIX: updatedAfter bepalen voor incremental sync.
+          // Strategie: gebruik de meest recente van:
+          //   1. MAX(completed_at) van enige completed sync job
+          //   2. last_sync_at van de integratie zelf
+          // Zo heeft de incremental sync altijd een zinvol tijdsvenster,
+          // ook als er nog geen completed full_sync is.
+          let updatedAfter: Date | undefined = undefined;
+
+          if (jobType === 'incremental') {
+            const lastSyncRow = await db.query(
+              `SELECT GREATEST(
+                 MAX(isj.completed_at),
+                 ti.last_sync_at
+               ) AS last_sync_at
+               FROM tenant_integrations ti
+               LEFT JOIN integration_sync_jobs isj
+                 ON isj.integration_id = ti.id
+                 AND isj.status = 'completed'
+               WHERE ti.id = $1
+               GROUP BY ti.last_sync_at`,
+              [integrationId], { allowNoTenant: true }
+            );
+
+            const lastSyncAt = lastSyncRow.rows[0]?.last_sync_at;
+            if (lastSyncAt) {
+              updatedAfter = new Date(lastSyncAt);
+              logger.info('sync.incremental.window', {
+                integrationId,
+                updatedAfter: updatedAfter.toISOString(),
+                minutesAgo: Math.round((Date.now() - updatedAfter.getTime()) / 60000),
+              });
+            }
+          }
 
           await acquireRateLimit(platformSlug, integrationId);
 
@@ -286,7 +308,6 @@ export const syncWorker = new Worker<SyncJobPayload>(
 
               const orderId = orderResult.rows[0]?.id;
               if (orderId && order.lineItems?.length > 0) {
-                // ── BULK INSERT (was N+1 loop) ────────────────
                 await bulkInsertLineItems(orderId, tenantId, platformSlug, order.lineItems);
               }
               totalOrders++;
@@ -361,7 +382,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
 
           await db.query(
             `UPDATE tenant_integrations
-             SET last_sync_at = now(), next_sync_at = now() + INTERVAL '1 hour',
+             SET last_sync_at = now(), next_sync_at = now() + INTERVAL '15 minutes',
                  status = 'active', error_message = null, updated_at = now()
              WHERE id = $1`,
             [integrationId],
@@ -381,7 +402,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
   },
   {
     connection:   bullConnection,
-    concurrency:  5, // 5 parallelle jobs totaal
+    concurrency:  5,
     removeOnComplete: { count: 100 },
     removeOnFail:     { count: 50 },
   }
