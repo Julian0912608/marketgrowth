@@ -1,8 +1,8 @@
 // ============================================================
 // saas-platform/src/index.ts
 //
-// FIX: Health check uitgebreid met DB + Redis ping
-// zodat Railway automatisch kan herstarten bij outage.
+// FIX: express.raw() toegevoegd voor Shopify webhook route
+// zodat HMAC verificatie correct werkt op de raw payload.
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -78,7 +78,15 @@ app.use(cors({
 }));
 
 // ── Body parsers ──────────────────────────────────────────────
+// BELANGRIJK: raw parsers moeten vóór express.json() staan,
+// anders is de payload al geparsed en werkt HMAC verificatie niet.
+
+// Stripe billing webhooks — raw body nodig voor HMAC
 app.use('/api/billing/webhook', express.raw({ type: 'application/json' }));
+
+// Shopify webhooks — raw body nodig voor HMAC verificatie
+app.use('/api/integrations/webhook/shopify', express.raw({ type: 'application/json' }));
+
 // 10mb voor /api/ai routes (foto uploads als base64)
 app.use('/api/ai', express.json({ limit: '10mb' }));
 app.use(express.json({ limit: '1mb' }));
