@@ -662,4 +662,5 @@ Generate complete marketing content for this product. Return ONLY JSON:
   } catch (err) { next(err); }
 });
 
+export { router as aiRouter };
 export default router;
