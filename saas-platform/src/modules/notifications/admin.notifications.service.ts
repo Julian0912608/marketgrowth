@@ -1,6 +1,12 @@
 // ============================================================
 // src/modules/notifications/admin.notifications.service.ts
 //
+// FIX: Verwijder JOIN op plans tabel voor MRR berekening.
+//   Gebruikt nu COALESCE(t.plan_slug, 'starter') direct
+//   en berekent MRR via hardcoded PLAN_MRR_CENTS map.
+//   Dit voorkomt dat de dagelijkse email faalt als de
+//   plans tabel nog geen monthly_price_cents kolom heeft.
+//
 // Emails naar hello@marketgrow.ai:
 // 1. Direct bij nieuwe signup
 // 2. Dagelijkse update om 18:00
@@ -13,6 +19,13 @@ const RESEND_API_KEY  = process.env.RESEND_API_KEY || '';
 const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 const ADMIN_EMAIL     = 'hello@marketgrow.ai';
 const FROM_EMAIL      = 'MarketGrow Notificaties <noreply@marketgrow.ai>';
+
+// MRR per plan in cents
+const PLAN_MRR_CENTS: Record<string, number> = {
+  starter: 2000,
+  growth:  4900,
+  scale:   15000,
+};
 
 // ── Helper: email versturen via Resend ────────────────────────
 async function sendEmail(to: string, subject: string, html: string): Promise<void> {
@@ -38,14 +51,12 @@ async function sendEmail(to: string, subject: string, html: string): Promise<voi
 
 // ============================================================
 // 1. NIEUWE SIGNUP NOTIFICATIE
-//    Aanroepen vanuit billing webhook na checkout.session.completed
 // ============================================================
 export async function sendNewSignupNotification(
   tenantId: string,
   planSlug: string
 ): Promise<void> {
   try {
-    // Haal tenant info op
     const result = await db.query<{
       name: string;
       email: string;
@@ -61,23 +72,32 @@ export async function sendNewSignupNotification(
     const tenant = result.rows[0];
     if (!tenant) return;
 
-    // Haal totaal aantal klanten + MRR op
+    // Totaal klanten + MRR zonder plans JOIN
     const statsResult = await db.query<{
       total_tenants: string;
-      total_mrr: string;
+      starter_count: string;
+      growth_count:  string;
+      scale_count:   string;
     }>(
       `SELECT
          COUNT(DISTINCT ts.tenant_id) AS total_tenants,
-         COALESCE(SUM(p.monthly_price_cents), 0) AS total_mrr
+         COUNT(CASE WHEN COALESCE(t2.plan_slug, 'starter') = 'starter' THEN 1 END) AS starter_count,
+         COUNT(CASE WHEN COALESCE(t2.plan_slug, 'starter') = 'growth'  THEN 1 END) AS growth_count,
+         COUNT(CASE WHEN COALESCE(t2.plan_slug, 'starter') = 'scale'   THEN 1 END) AS scale_count
        FROM tenant_subscriptions ts
-       JOIN plans p ON p.id = ts.plan_id
+       JOIN tenants t2 ON t2.id = ts.tenant_id
        WHERE ts.status IN ('active', 'trialing')`,
       [],
       { allowNoTenant: true }
     );
 
-    const stats      = statsResult.rows[0];
-    const totalMRR   = (parseInt(stats.total_mrr || '0') / 100).toFixed(0);
+    const stats = statsResult.rows[0];
+    const totalMRR = (
+      parseInt(stats.starter_count || '0') * PLAN_MRR_CENTS.starter +
+      parseInt(stats.growth_count  || '0') * PLAN_MRR_CENTS.growth +
+      parseInt(stats.scale_count   || '0') * PLAN_MRR_CENTS.scale
+    ) / 100;
+
     const planEmoji  = planSlug === 'scale' ? '🚀' : planSlug === 'growth' ? '📈' : '🌱';
     const planPrices: Record<string, string> = {
       starter: '€20/maand',
@@ -93,16 +113,12 @@ export async function sendNewSignupNotification(
   <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
     <tr><td align="center">
       <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">
-
-        <!-- Header -->
         <tr>
           <td style="background:#0f172a;border-radius:16px 16px 0 0;padding:28px 36px;">
             <span style="color:#fff;font-size:18px;font-weight:800;">⚡ MarketGrow</span>
             <span style="color:#64748b;font-size:13px;margin-left:12px;">Nieuwe aanmelding</span>
           </td>
         </tr>
-
-        <!-- Body -->
         <tr>
           <td style="background:#1e293b;padding:32px 36px;">
             <h1 style="color:#10b981;font-size:24px;margin:0 0 8px;">
@@ -111,8 +127,6 @@ export async function sendNewSignupNotification(
             <p style="color:#94a3b8;font-size:14px;margin:0 0 28px;">
               ${new Date().toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
             </p>
-
-            <!-- Klant info -->
             <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:20px;margin-bottom:20px;">
               <tr>
                 <td style="padding:6px 0;">
@@ -133,8 +147,6 @@ export async function sendNewSignupNotification(
                 </td>
               </tr>
             </table>
-
-            <!-- Platform stats -->
             <table width="100%" cellpadding="0" cellspacing="0">
               <tr>
                 <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px;text-align:center;">
@@ -144,14 +156,12 @@ export async function sendNewSignupNotification(
                 <td width="4%"></td>
                 <td width="48%" style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px;text-align:center;">
                   <div style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Totaal MRR</div>
-                  <div style="color:#10b981;font-size:28px;font-weight:800;margin-top:4px;">€${totalMRR}</div>
+                  <div style="color:#10b981;font-size:28px;font-weight:800;margin-top:4px;">€${totalMRR.toFixed(0)}</div>
                 </td>
               </tr>
             </table>
           </td>
         </tr>
-
-        <!-- Footer -->
         <tr>
           <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:16px 36px;text-align:center;">
             <a href="https://marketgrow.ai/admin" style="color:#4f46e5;font-size:13px;text-decoration:none;">
@@ -159,7 +169,6 @@ export async function sendNewSignupNotification(
             </a>
           </td>
         </tr>
-
       </table>
     </td></tr>
   </table>
@@ -182,37 +191,37 @@ export async function sendNewSignupNotification(
 }
 
 // ============================================================
-// 2. DAGELIJKSE ADMIN UPDATE
-//    Aanroepen via BullMQ scheduler om 18:00
+// 2. DAGELIJKSE ADMIN UPDATE — elke dag om 18:00
 // ============================================================
 export async function sendDailyAdminUpdate(): Promise<void> {
   try {
-    // Haal alle stats op
     const [overviewResult, newTodayResult, churnTodayResult, planBreakdownResult] = await Promise.all([
 
-      // Totaal overzicht
+      // Totaal overzicht — geen plans JOIN nodig
       db.query<{
-        total_active: string;
+        total_active:   string;
         total_trialing: string;
-        total_mrr: string;
         total_past_due: string;
+        starter_active: string;
+        growth_active:  string;
+        scale_active:   string;
       }>(
         `SELECT
            COUNT(CASE WHEN ts.status = 'active'   THEN 1 END) AS total_active,
            COUNT(CASE WHEN ts.status = 'trialing' THEN 1 END) AS total_trialing,
            COUNT(CASE WHEN ts.status = 'past_due' THEN 1 END) AS total_past_due,
-           COALESCE(SUM(CASE WHEN ts.status IN ('active','trialing') THEN p.monthly_price_cents END), 0) AS total_mrr
+           COUNT(CASE WHEN ts.status IN ('active','trialing') AND COALESCE(t.plan_slug,'starter') = 'starter' THEN 1 END) AS starter_active,
+           COUNT(CASE WHEN ts.status IN ('active','trialing') AND COALESCE(t.plan_slug,'starter') = 'growth'  THEN 1 END) AS growth_active,
+           COUNT(CASE WHEN ts.status IN ('active','trialing') AND COALESCE(t.plan_slug,'starter') = 'scale'   THEN 1 END) AS scale_active
          FROM tenant_subscriptions ts
-         JOIN plans p ON p.id = ts.plan_id`,
+         JOIN tenants t ON t.id = ts.tenant_id`,
         [], { allowNoTenant: true }
       ),
 
       // Nieuwe klanten vandaag
       db.query<{ name: string; email: string; plan_slug: string }>(
-        `SELECT t.name, t.email, p.slug AS plan_slug
+        `SELECT t.name, t.email, COALESCE(t.plan_slug, 'starter') AS plan_slug
          FROM tenants t
-         JOIN tenant_subscriptions ts ON ts.tenant_id = t.id
-         JOIN plans p ON p.id = ts.plan_id
          WHERE t.created_at >= CURRENT_DATE
          ORDER BY t.created_at DESC`,
         [], { allowNoTenant: true }
@@ -230,20 +239,26 @@ export async function sendDailyAdminUpdate(): Promise<void> {
 
       // Klanten per plan
       db.query<{ plan_slug: string; count: string }>(
-        `SELECT p.slug AS plan_slug, COUNT(*) AS count
+        `SELECT COALESCE(t.plan_slug, 'starter') AS plan_slug, COUNT(*) AS count
          FROM tenant_subscriptions ts
-         JOIN plans p ON p.id = ts.plan_id
+         JOIN tenants t ON t.id = ts.tenant_id
          WHERE ts.status IN ('active', 'trialing')
-         GROUP BY p.slug`,
+         GROUP BY t.plan_slug`,
         [], { allowNoTenant: true }
       ),
     ]);
 
-    const overview       = overviewResult.rows[0];
-    const newToday       = newTodayResult.rows;
-    const churnToday     = churnTodayResult.rows;
-    const planBreakdown  = planBreakdownResult.rows;
-    const totalMRR       = (parseInt(overview.total_mrr || '0') / 100).toFixed(0);
+    const overview      = overviewResult.rows[0];
+    const newToday      = newTodayResult.rows;
+    const churnToday    = churnTodayResult.rows;
+    const planBreakdown = planBreakdownResult.rows;
+
+    // Bereken MRR zonder plans tabel
+    const totalMRR = (
+      parseInt(overview.starter_active || '0') * PLAN_MRR_CENTS.starter +
+      parseInt(overview.growth_active  || '0') * PLAN_MRR_CENTS.growth +
+      parseInt(overview.scale_active   || '0') * PLAN_MRR_CENTS.scale
+    ) / 100;
 
     const planCounts: Record<string, string> = {};
     for (const row of planBreakdown) {
@@ -281,8 +296,6 @@ export async function sendDailyAdminUpdate(): Promise<void> {
   <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px;">
     <tr><td align="center">
       <table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">
-
-        <!-- Header -->
         <tr>
           <td style="background:#0f172a;border-radius:16px 16px 0 0;padding:28px 36px;">
             <span style="color:#fff;font-size:18px;font-weight:800;">⚡ MarketGrow</span>
@@ -292,8 +305,6 @@ export async function sendDailyAdminUpdate(): Promise<void> {
             </p>
           </td>
         </tr>
-
-        <!-- Body -->
         <tr>
           <td style="background:#1e293b;padding:32px 36px;">
 
@@ -301,52 +312,47 @@ export async function sendDailyAdminUpdate(): Promise<void> {
             <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
               <tr>
                 <td width="23%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px;text-align:center;">
-                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;">MRR</div>
-                  <div style="color:#10b981;font-size:22px;font-weight:800;">€${totalMRR}</div>
+                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">MRR</div>
+                  <div style="color:#10b981;font-size:22px;font-weight:800;margin-top:4px;">€${totalMRR.toFixed(0)}</div>
                 </td>
                 <td width="2%"></td>
                 <td width="23%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px;text-align:center;">
-                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;">Actief</div>
-                  <div style="color:#fff;font-size:22px;font-weight:800;">${overview.total_active}</div>
+                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Actief</div>
+                  <div style="color:#fff;font-size:22px;font-weight:800;margin-top:4px;">${overview.total_active || 0}</div>
                 </td>
                 <td width="2%"></td>
                 <td width="23%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px;text-align:center;">
-                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;">Trial</div>
-                  <div style="color:#f59e0b;font-size:22px;font-weight:800;">${overview.total_trialing}</div>
+                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Trial</div>
+                  <div style="color:#f59e0b;font-size:22px;font-weight:800;margin-top:4px;">${overview.total_trialing || 0}</div>
                 </td>
                 <td width="2%"></td>
                 <td width="23%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px;text-align:center;">
-                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;">Achterstallig</div>
-                  <div style="color:#f87171;font-size:22px;font-weight:800;">${overview.total_past_due}</div>
+                  <div style="color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;">Nieuw</div>
+                  <div style="color:#818cf8;font-size:22px;font-weight:800;margin-top:4px;">${newToday.length}</div>
                 </td>
               </tr>
             </table>
 
             <!-- Plan verdeling -->
-            <div style="margin-bottom:28px;">
-              <p style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 12px;">Klanten per plan</p>
-              <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td width="32%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;text-align:center;">
-                    <div style="color:#94a3b8;font-size:11px;">Starter</div>
-                    <div style="color:#fff;font-size:20px;font-weight:700;">${planCounts['starter'] || '0'}</div>
-                  </td>
-                  <td width="2%"></td>
-                  <td width="32%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;text-align:center;">
-                    <div style="color:#94a3b8;font-size:11px;">Growth</div>
-                    <div style="color:#fff;font-size:20px;font-weight:700;">${planCounts['growth'] || '0'}</div>
-                  </td>
-                  <td width="2%"></td>
-                  <td width="32%" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:12px;text-align:center;">
-                    <div style="color:#94a3b8;font-size:11px;">Scale</div>
-                    <div style="color:#fff;font-size:20px;font-weight:700;">${planCounts['scale'] || '0'}</div>
-                  </td>
-                </tr>
+            <div style="margin-bottom:24px;">
+              <p style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 12px;">
+                Plan verdeling
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;border:1px solid #334155;border-radius:10px;padding:4px 16px;">
+                ${['starter','growth','scale'].map(slug => `
+                  <tr>
+                    <td style="padding:8px 0;border-bottom:1px solid #1e293b;">
+                      <span style="color:#fff;font-size:13px;text-transform:capitalize;">${slug}</span>
+                    </td>
+                    <td style="padding:8px 0;border-bottom:1px solid #1e293b;text-align:right;">
+                      <span style="color:#94a3b8;font-size:13px;">${planCounts[slug] || 0} klanten</span>
+                    </td>
+                  </tr>`).join('')}
               </table>
             </div>
 
             <!-- Nieuwe klanten vandaag -->
-            <div style="margin-bottom:28px;">
+            <div style="margin-bottom:24px;">
               <p style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 12px;">
                 Nieuwe klanten vandaag (${newToday.length})
               </p>
@@ -364,11 +370,8 @@ export async function sendDailyAdminUpdate(): Promise<void> {
                 ${churnTodayRows}
               </table>
             </div>
-
           </td>
         </tr>
-
-        <!-- Footer -->
         <tr>
           <td style="background:#0f172a;border-radius:0 0 16px 16px;padding:16px 36px;text-align:center;">
             <a href="https://marketgrow.ai/admin" style="color:#4f46e5;font-size:13px;text-decoration:none;">
@@ -376,7 +379,6 @@ export async function sendDailyAdminUpdate(): Promise<void> {
             </a>
           </td>
         </tr>
-
       </table>
     </td></tr>
   </table>
@@ -385,7 +387,7 @@ export async function sendDailyAdminUpdate(): Promise<void> {
 
     await sendEmail(
       ADMIN_EMAIL,
-      `📊 Dagelijkse update — €${totalMRR} MRR · ${parseInt(overview.total_active) + parseInt(overview.total_trialing)} klanten`,
+      `📊 Dagelijkse update — €${totalMRR.toFixed(0)} MRR · ${parseInt(overview.total_active || '0') + parseInt(overview.total_trialing || '0')} klanten`,
       html
     );
 
