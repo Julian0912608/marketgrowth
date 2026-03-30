@@ -290,16 +290,8 @@ router.post('/webhook/shopify', async (req: Request, res: Response) => {
 
       default:
         // Overige webhooks (orders/create, products/update etc.)
-        // Doorsturen naar de integration service voor verwerking
-        try {
-          await integrationService.handleWebhook('shopify', topic, payload, shopDomain ?? '');
-        } catch (err) {
-          logger.error('shopify.webhook.handler_error', {
-            topic,
-            shopDomain,
-            error: (err as Error).message,
-          });
-        }
+        // Alleen loggen — verdere verwerking via de sync worker
+        logger.info('shopify.webhook.unhandled', { topic, shopDomain });
         break;
     }
 
