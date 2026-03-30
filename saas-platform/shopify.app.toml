@@ -1,0 +1,23 @@
+name = "MarketGrow"
+client_id = "jouw-shopify-client-id"
+application_url = "https://marketgrow.ai"
+embedded = false
+
+[access]
+redirect_urls = [
+  "https://marketgrowth-production.up.railway.app/api/integrations/callback/shopify",
+  "https://marketgrow.ai/api/integrations/callback/shopify"
+]
+
+[webhooks]
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "https://marketgrowth-production.up.railway.app/api/integrations/webhook/shopify"
+
+[auth]
+redirect_urls = [
+  "https://marketgrowth-production.up.railway.app/api/integrations/callback/shopify",
+  "https://marketgrow.ai/api/integrations/callback/shopify"
+]
