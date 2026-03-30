@@ -11,19 +11,11 @@
 //   GET  /api/ai/products          — producten voor content studio
 //   POST /api/ai/product-content   — product marketing content + beeld
 //
-// FIXES (Product Hunt readiness):
-//   1. trackUsage is niet meer silent-fail: logt een warning als het
-//      mis gaat, en blokkeert de response NIET maar laat het systeem
-//      weten dat er een tracking-probleem is.
-//   2. Redis pre-check vóór DB: snelle credit-limiet check op Redis
-//      counter voordat de Anthropic API wordt aangeroepen. Voorkomt
-//      dat gratis accounts bij launch de API hammeren.
-//   3. IP-based rate limit op alle /api/ai/* routes: max 30 req/min
-//      per IP. Beschermt tegen misbruik bij Product Hunt spike.
-//   4. Starter plan: 100 credits/month (was 500 in DB, aangepast naar
-//      100 om overeen te komen met pricing pagina).
-//   5. AI Chat en Social Content generatie zijn Growth+ only.
-//      Starter krijgt alleen AI Insights (dagelijkse briefing).
+// FIX: Lazy Anthropic instantiatie — voorkomt module crash bij startup.
+//   new Anthropic() zonder API key gooit een error in SDK >= 0.20,
+//   waardoor de hele module faalt en aiRouter als undefined geëxporteerd
+//   wordt ("Router.use() requires a middleware function but got undefined").
+//   Oplossing: Anthropic client pas aanmaken bij eerste echte API call.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -38,8 +30,19 @@ import { logger }            from '../../../shared/logging/logger';
 const router = Router();
 router.use(tenantMiddleware());
 
-const Anthropic = require('@anthropic-ai/sdk');
-const anthropic = new (Anthropic.default ?? Anthropic)();
+// FIX: Lazy instantiatie — Anthropic client pas aanmaken bij eerste gebruik,
+// niet bij module load. Voorkomt crash als ANTHROPIC_API_KEY nog niet
+// beschikbaar is op het moment dat Railway de module inlaadt.
+let _anthropic: any = null;
+function getAnthropic() {
+  if (!_anthropic) {
+    const Anthropic = require('@anthropic-ai/sdk');
+    _anthropic = new (Anthropic.default ?? Anthropic)({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+    });
+  }
+  return _anthropic;
+}
 
 // ── Cache TTL per plan (seconden) ─────────────────────────────
 const CACHE_TTL: Record<string, number> = {
@@ -50,15 +53,14 @@ const CACHE_TTL: Record<string, number> = {
 
 // ── Plan credit limieten (matcht pricing pagina) ──────────────
 const PLAN_LIMITS: Record<string, number | null> = {
-  starter: 100,    // 100 credits/month — zoals op pricing pagina
+  starter: 100,    // 100 credits/month
   growth:  2000,   // 2.000 credits/month
   scale:   null,   // unlimited
 };
 
 // ── IP rate limiter voor AI routes ────────────────────────────
-// Max 30 requests per minuut per IP — beschermt bij launch spike
-const AI_RATE_LIMIT = 30;
-const AI_RATE_WINDOW = 60; // seconden
+const AI_RATE_LIMIT  = 30;
+const AI_RATE_WINDOW = 60;
 
 async function checkIpRateLimit(req: Request): Promise<boolean> {
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
@@ -69,20 +71,17 @@ async function checkIpRateLimit(req: Request): Promise<boolean> {
     if (current === 1) await rawRedis.expire(key, AI_RATE_WINDOW);
     return current <= AI_RATE_LIMIT;
   } catch {
-    return true; // fail open als Redis niet bereikbaar is
+    return true;
   }
 }
 
-// ── Redis-backed credit pre-check ────────────────────────────
-// Snelle check VÓÓR de Anthropic API call om te voorkomen dat
-// de limiet wordt overschreden. Gebruikt een Redis counter als
-// fast-path; de DB is de bron van waarheid.
+// ── Redis-backed credit pre-check ─────────────────────────────
 async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<boolean> {
   const limit = PLAN_LIMITS[planSlug];
-  if (limit === null) return true; // unlimited
+  if (limit === null) return true;
 
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
-  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`; // YYYY-MM
+  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
 
   try {
     const used = await rawRedis.get(key);
@@ -90,11 +89,8 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
       logger.info('ai.credits.limit_reached_redis', { tenantId, planSlug, used, limit });
       return false;
     }
-  } catch {
-    // Redis niet beschikbaar — val terug op DB check
-  }
+  } catch {}
 
-  // DB check als Redis geen data heeft
   try {
     const result = await db.query(
       `SELECT COALESCE(fu.usage_count, 0) AS used
@@ -110,18 +106,13 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
     }
   } catch (err) {
     logger.warn('ai.credits.precheck_failed', { tenantId, error: (err as Error).message });
-    // Bij DB fout: laat door (liever wat overuse dan service down)
   }
 
   return true;
 }
 
 // ── Usage tracker ─────────────────────────────────────────────
-// FIX: Niet meer silent-fail. Logt warnings als tracking mislukt
-// maar blokkeert de response niet (gebruiker heeft al gekregen wat
-// hij vroeg). Werkt Redis counter bij voor snelle pre-check.
 async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promise<void> {
-  // DB tracking
   try {
     await db.query(
       `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -133,24 +124,17 @@ async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promi
       [tenantId, count], { allowNoTenant: true }
     );
   } catch (err) {
-    // Niet silent: log als warning zodat monitoring dit oppikt
     logger.warn('ai.usage.tracking_failed', {
-      tenantId,
-      count,
-      error: (err as Error).message,
+      tenantId, count, error: (err as Error).message,
     });
   }
 
-  // Redis counter bijwerken (best-effort, niet kritiek)
   try {
     const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
     const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
     await rawRedis.incrby(key, count);
-    // TTL van 35 dagen — ruim genoeg voor een maandperiode
     await rawRedis.expire(key, 35 * 24 * 3600);
-  } catch {
-    // Redis update mislukt — geen actie, DB is bron van waarheid
-  }
+  } catch {}
 }
 
 // ── Zod validation helper ─────────────────────────────────────
@@ -217,7 +201,6 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const { tenantId, planSlug } = getTenantContext();
     const force = req.query.force === 'true';
 
-    // Credit pre-check (skip als force=true want dan is cache omzeild)
     if (!force) {
       const cacheKey = `ai:insights:${tenantId}`;
       const cached = await cache.get(cacheKey);
@@ -227,7 +210,6 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
       }
     }
 
-    // Controleer credits vóór Anthropic API call
     const hasCredits = await checkCreditPreCheck(tenantId, planSlug);
     if (!hasCredits) {
       const limit = PLAN_LIMITS[planSlug];
@@ -270,7 +252,7 @@ Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} omzet, 
 Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
       : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"algemeen"}],"alerts":[]}`;
 
-    const response = await anthropic.messages.create({
+    const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1000,
       messages:   [{ role: 'user', content: prompt }],
@@ -297,7 +279,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
   try {
     const { tenantId, planSlug } = getTenantContext();
 
-    const limit = PLAN_LIMITS[planSlug] ?? 100;
+    const limit     = PLAN_LIMITS[planSlug] ?? 100;
     const unlimited = limit === null;
 
     const usageResult = await db.query(
@@ -321,7 +303,6 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
 });
 
 // ── POST /api/ai/chat ─────────────────────────────────────────
-// AI Chat is Growth+ only (Starter heeft alleen AI Insights)
 router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -353,7 +334,7 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
     );
     const stats = ordersResult.rows[0];
 
-    const response = await anthropic.messages.create({
+    const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 500,
       system:     `Je bent een ecommerce AI adviseur voor MarketGrow. De gebruiker heeft ${stats.orders} orders en €${parseFloat(stats.revenue).toFixed(2)} omzet de afgelopen 30 dagen. Antwoord altijd in het Nederlands, beknopt en actionabel.`,
@@ -368,7 +349,6 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
 });
 
 // ── POST /api/ai/social-content ───────────────────────────────
-// Social Content is Growth+ only
 router.post('/social-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -462,7 +442,7 @@ ${storeContext}${customCtx}
 Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown:
 ${outputFormat[format ?? 'single'] || outputFormat['single']}`;
 
-    const response = await anthropic.messages.create({
+    const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 2000,
       messages:   [{ role: 'user', content: prompt }],
@@ -519,7 +499,6 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 });
 
 // ── POST /api/ai/video-script ─────────────────────────────────
-// Interne tool — alleen voor owner/admin
 router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
@@ -543,8 +522,8 @@ router.post('/video-script', async (req: Request, res: Response, next: NextFunct
     };
 
     const formatGuide: Record<string, string> = {
-      'tiktok-30s': '30 seconds. ~75 words max. Hook (3s) → Problem (7s) → Solution/Insight (15s) → CTA (5s). Count words.',
-      'tiktok-60s': '60 seconds. ~150 words max. Richer story arc. Can include a mini case study.',
+      'tiktok-30s':     '30 seconds. ~75 words max. Hook (3s) → Problem (7s) → Solution/Insight (15s) → CTA (5s). Count words.',
+      'tiktok-60s':     '60 seconds. ~150 words max. Richer story arc. Can include a mini case study.',
       'instagram-reel': '15-30 seconds. Punchy. Visual-first language. Tell the viewer what to look at.',
     };
 
@@ -564,7 +543,7 @@ Return ONLY JSON:
   "visualNotes": "Brief note on what to show on screen"
 }`;
 
-    const response = await anthropic.messages.create({
+    const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 800,
       messages:   [{ role: 'user', content: prompt }],
@@ -663,7 +642,7 @@ Generate complete marketing content for this product. Return ONLY JSON:
   "keyBenefits": ["benefit1", "benefit2", "benefit3"]
 }`;
 
-    const response = await anthropic.messages.create({
+    const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1500,
       messages:   [{ role: 'user', content: prompt }],
@@ -676,7 +655,7 @@ Generate complete marketing content for this product. Return ONLY JSON:
     try { content = JSON.parse(clean); }
     catch { content = { error: 'Failed to parse content' }; }
 
-    await trackUsage(tenantId, 3, planSlug); // product content = 3 credits (meerdere formats)
+    await trackUsage(tenantId, 3, planSlug);
 
     logger.info('ai.product-content.generated', { tenantId, productId });
     res.json({ content, product: { id: product.id, title: product.title } });
