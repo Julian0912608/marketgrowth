@@ -247,10 +247,10 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const hasOrders = parseInt(stats.orders) > 0;
 
     const prompt = hasOrders
-      ? `Je bent een AI ecommerce adviseur voor MarketGrow. Analyseer de data en geef een beknopte dagelijkse briefing in JSON.
-Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} omzet, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
-Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
-      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"algemeen"}],"alerts":[]}`;
+      ? `You are an AI ecommerce advisor for MarketGrow. Analyse the data and provide a concise daily briefing in JSON.
+Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} revenue, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
+Return ONLY JSON (in English): {"briefing":"2-3 sentences","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
+      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"general"}],"alerts":[]}`;
 
     const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -337,7 +337,7 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
     const response = await getAnthropic().messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 500,
-      system:     `Je bent een ecommerce AI adviseur voor MarketGrow. De gebruiker heeft ${stats.orders} orders en €${parseFloat(stats.revenue).toFixed(2)} omzet de afgelopen 30 dagen. Antwoord altijd in het Nederlands, beknopt en actionabel.`,
+      system:     `You are an AI ecommerce advisor for MarketGrow. The user has ${stats.orders} orders and €${parseFloat(stats.revenue).toFixed(2)} revenue in the last 30 days. Always respond in English, concise and actionable.`,
       messages:   [{ role: 'user', content: message }],
     });
 
@@ -662,5 +662,4 @@ Generate complete marketing content for this product. Return ONLY JSON:
   } catch (err) { next(err); }
 });
 
-export { router as aiRouter };
 export default router;
