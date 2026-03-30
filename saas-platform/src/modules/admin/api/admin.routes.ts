@@ -155,13 +155,14 @@ router.get('/tenants', async (req: Request, res: Response, next: NextFunction) =
          SELECT
            ts.status,
            ts.stripe_sub_id,
-           COALESCE(ts.plan_slug_cache, 'starter') AS plan_slug,
+           COALESCE(p2.slug, 'starter') AS plan_slug,
            CASE
-             WHEN COALESCE(ts.plan_slug_cache, 'starter') = 'growth' THEN 4900
-             WHEN COALESCE(ts.plan_slug_cache, 'starter') = 'scale'  THEN 15000
+             WHEN COALESCE(p2.slug, 'starter') = 'growth' THEN 4900
+             WHEN COALESCE(p2.slug, 'starter') = 'scale'  THEN 15000
              ELSE 2000
            END AS mrr_cents
          FROM tenant_subscriptions ts
+         LEFT JOIN plans p2 ON p2.id = ts.plan_id
          WHERE ts.tenant_id = t.id
          ORDER BY ts.created_at DESC
          LIMIT 1
