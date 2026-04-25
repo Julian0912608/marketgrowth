@@ -8,7 +8,8 @@
 //   GET /api/integrations/callback/meta
 //     → afhandelen van de OAuth callback van Facebook
 //
-// Bestaande endpoints (security fix uit vorige PR) blijven onveranderd.
+// FIX: TypeScript vergelijking platform === 'meta' werkt nu via
+// een raw string check vóór het casten naar PlatformSlug.
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { z }                                        from 'zod';
@@ -130,13 +131,16 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
 //
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const platform        = req.params.platform as PlatformSlug;
-    const { code, state } = req.query as { code: string; state: string };
+    // Check op Meta voordat we casten naar PlatformSlug, want Meta gebruikt
+    // de URL path 'meta' terwijl het PlatformSlug 'meta_ads' is.
+    const platformParam = req.params.platform;
 
-    // Meta heeft zijn eigen callback handler hieronder
-    if (platform === 'meta') {
+    if (platformParam === 'meta') {
       return next();
     }
+
+    const platform        = platformParam as PlatformSlug;
+    const { code, state } = req.query as { code: string; state: string };
 
     if (!code || !state) {
       res.status(400).json({ error: 'Missende code of state parameter' });
@@ -180,14 +184,12 @@ router.post('/advertising/meta/connect', async (req: Request, res: Response, nex
     const redirectUri = process.env.META_OAUTH_REDIRECT_URI
       || `${process.env.APP_URL || 'https://marketgrowth-production.up.railway.app'}/api/integrations/callback/meta`;
 
-    // State is 16-byte random hex. Bevat tenantId zodat we bij callback
-    // weten van wie deze flow is, ook al heeft de callback geen JWT.
     const state = crypto.randomBytes(16).toString('hex');
 
     await cache.set(
       'oauth:state:' + state,
       JSON.stringify({ tenantId, platformSlug: 'meta_ads' }),
-      600  // 10 min
+      600
     );
 
     const authUrl = MetaAdsConnector.buildAuthUrl(redirectUri, state);
@@ -199,7 +201,6 @@ router.post('/advertising/meta/connect', async (req: Request, res: Response, nex
 });
 
 // ── GET /api/integrations/callback/meta ──────────────────────
-// OAuth callback van Facebook na succesvolle/mislukte authorisatie.
 router.get('/callback/meta', async (req: Request, res: Response) => {
   const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
   const { code, state, error, error_description } = req.query as {
@@ -209,7 +210,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
     error_description?: string;
   };
 
-  // Gebruiker heeft afgewezen of error van Facebook
   if (error) {
     logger.warn('integration.meta.oauth_denied', { error, description: error_description });
     res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent(error_description || error)}`);
@@ -227,7 +227,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
   }
 
   try {
-    // Haal state op uit Redis (verifieert dat we deze flow zelf gestart hebben)
     const cached = await cache.get('oauth:state:' + state);
     if (!cached) {
       res.redirect(`${frontendUrl}/dashboard/integrations?error=expired_state`);
@@ -240,10 +239,8 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
     const redirectUri = process.env.META_OAUTH_REDIRECT_URI
       || `${process.env.APP_URL || 'https://marketgrowth-production.up.railway.app'}/api/integrations/callback/meta`;
 
-    // Stap 1: Wissel code in voor short-lived token
     const { accessToken: shortLivedToken } = await MetaAdsConnector.exchangeCode(code, redirectUri);
 
-    // Stap 2: Wissel short-lived in voor long-lived (60 dagen)
     const connector = new MetaAdsConnector();
     const refreshed = await connector.refreshAccessToken({
       integrationId: '',
@@ -253,7 +250,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
     const longLivedToken = refreshed.accessToken;
     const tokenExpiresAt = refreshed.expiresAt;
 
-    // Stap 3: Test connection — moet werken anders kunnen we niets
     const testResult = await connector.testConnection({
       integrationId: '',
       platform:      'meta_ads',
@@ -265,7 +261,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
       return;
     }
 
-    // Stap 4: Haal alle ad accounts op
     const adAccounts = await MetaAdsConnector.fetchAdAccounts(longLivedToken);
 
     if (adAccounts.length === 0) {
@@ -273,7 +268,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
       return;
     }
 
-    // Stap 5: Maak/update tenant_integrations rij
     const integrationId = uuidv4();
 
     await db.query(
@@ -286,7 +280,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
       { allowNoTenant: true }
     );
 
-    // Lees de daadwerkelijke ID terug (kan een bestaande zijn na ON CONFLICT)
     const existing = await db.query<{ id: string }>(
       `SELECT id FROM tenant_integrations
        WHERE tenant_id = $1 AND platform_slug = 'meta_ads'
@@ -296,7 +289,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
     );
     const actualIntegrationId = existing.rows[0]?.id ?? integrationId;
 
-    // Stap 6: Sla credentials versleuteld op
     await db.query(
       `INSERT INTO integration_credentials
          (integration_id, access_token, token_expires_at, updated_at, encrypted_at)
@@ -311,7 +303,6 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
       { allowNoTenant: true }
     );
 
-    // Stap 7: Sla ad accounts op (tenant-context query, RLS doet zijn werk)
     for (let i = 0; i < adAccounts.length; i++) {
       const acc = adAccounts[i];
       await db.query(
@@ -523,11 +514,6 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 });
 
 // ── POST /api/integrations/webhook/:platform ─────────────────
-//
-// Stub die expliciet 501 teruggeeft. Wie deze stub vervangt MOET
-// de helper uit src/shared/webhooks/webhook-verifier.ts gebruiken
-// voor HMAC verificatie voordat er payload wordt verwerkt.
-//
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   logger.warn('webhook.unimplemented_called', {
     platform: req.params.platform,
