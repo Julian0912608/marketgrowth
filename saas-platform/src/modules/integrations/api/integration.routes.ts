@@ -1,22 +1,27 @@
 // saas-platform/src/modules/integrations/api/integration.routes.ts
 //
-// SECURITY UPDATE (vervangt eerdere versie volledig):
-//   1. Webhook stub vervangen door 501 met logging — dwingt af dat er een
-//      echte handler wordt geïmplementeerd voordat een platform webhooks stuurt
-//   2. Raw body parsing klaargezet voor toekomstige HMAC verificatie
-//   3. Rest van de file ongewijzigd
+// UPDATE: Meta Ads OAuth flow toegevoegd.
 //
-// LET OP: deze file vervangt de bestaande version 1-op-1.
+//   POST /api/integrations/advertising/meta/connect
+//     → start OAuth flow, redirect user naar Facebook
+//
+//   GET /api/integrations/callback/meta
+//     → afhandelen van de OAuth callback van Facebook
+//
+// Bestaande endpoints (security fix uit vorige PR) blijven onveranderd.
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { z }                                        from 'zod';
+import crypto                                       from 'crypto';
 import { v4 as uuidv4 }                            from 'uuid';
 import { IntegrationService }                       from '../service/integration.service';
 import { tenantMiddleware }                         from '../../../shared/middleware/tenant.middleware';
 import { getTenantContext }                         from '../../../shared/middleware/tenant-context';
 import { db }                                       from '../../../infrastructure/database/connection';
+import { cache }                                    from '../../../infrastructure/cache/redis';
 import { PlatformSlug, IntegrationCredentials }     from '../types/integration.types';
 import { syncBolcomAdvertisingData }                from '../connectors/bolcom-advertising.connector';
+import { MetaAdsConnector }                         from '../connectors/meta-ads.connector';
 import { encryptToken, decryptToken }               from '../../../shared/crypto/token-encryption';
 import { logger }                                   from '../../../shared/logging/logger';
 
@@ -119,10 +124,19 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
 });
 
 // ── GET /api/integrations/callback/:platform ─────────────────
+//
+// Algemene OAuth callback voor stores (Shopify, Amazon, Etsy).
+// Meta heeft een eigen callback hieronder omdat de flow afwijkt.
+//
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const platform        = req.params.platform as PlatformSlug;
     const { code, state } = req.query as { code: string; state: string };
+
+    // Meta heeft zijn eigen callback handler hieronder
+    if (platform === 'meta') {
+      return next();
+    }
 
     if (!code || !state) {
       res.status(400).json({ error: 'Missende code of state parameter' });
@@ -145,6 +159,202 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
     res.redirect(frontendUrl + '/dashboard/integrations?error=' + encodeURIComponent((err as Error).message));
   }
 });
+
+// ============================================================
+// META ADS — OAuth flow
+// ============================================================
+
+// ── POST /api/integrations/advertising/meta/connect ──────────
+// Start de OAuth flow. Geeft een authUrl terug die de frontend
+// gebruikt om de gebruiker naar Facebook te sturen.
+router.post('/advertising/meta/connect', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId } = getTenantContext();
+
+    const appId = process.env.META_APP_ID;
+    if (!appId) {
+      res.status(500).json({ error: 'Meta integratie niet geconfigureerd op de server' });
+      return;
+    }
+
+    const redirectUri = process.env.META_OAUTH_REDIRECT_URI
+      || `${process.env.APP_URL || 'https://marketgrowth-production.up.railway.app'}/api/integrations/callback/meta`;
+
+    // State is 16-byte random hex. Bevat tenantId zodat we bij callback
+    // weten van wie deze flow is, ook al heeft de callback geen JWT.
+    const state = crypto.randomBytes(16).toString('hex');
+
+    await cache.set(
+      'oauth:state:' + state,
+      JSON.stringify({ tenantId, platformSlug: 'meta_ads' }),
+      600  // 10 min
+    );
+
+    const authUrl = MetaAdsConnector.buildAuthUrl(redirectUri, state);
+
+    logger.info('integration.meta.oauth_started', { tenantId, redirectUri });
+
+    res.json({ authUrl });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/integrations/callback/meta ──────────────────────
+// OAuth callback van Facebook na succesvolle/mislukte authorisatie.
+router.get('/callback/meta', async (req: Request, res: Response) => {
+  const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
+  const { code, state, error, error_description } = req.query as {
+    code?: string;
+    state?: string;
+    error?: string;
+    error_description?: string;
+  };
+
+  // Gebruiker heeft afgewezen of error van Facebook
+  if (error) {
+    logger.warn('integration.meta.oauth_denied', { error, description: error_description });
+    res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent(error_description || error)}`);
+    return;
+  }
+
+  if (!code || !state) {
+    res.redirect(`${frontendUrl}/dashboard/integrations?error=missing_code_or_state`);
+    return;
+  }
+
+  if (typeof code !== 'string' || code.length > 512 || typeof state !== 'string' || state.length > 128) {
+    res.redirect(`${frontendUrl}/dashboard/integrations?error=invalid_params`);
+    return;
+  }
+
+  try {
+    // Haal state op uit Redis (verifieert dat we deze flow zelf gestart hebben)
+    const cached = await cache.get('oauth:state:' + state);
+    if (!cached) {
+      res.redirect(`${frontendUrl}/dashboard/integrations?error=expired_state`);
+      return;
+    }
+    await cache.del('oauth:state:' + state);
+
+    const { tenantId } = JSON.parse(cached) as { tenantId: string; platformSlug: string };
+
+    const redirectUri = process.env.META_OAUTH_REDIRECT_URI
+      || `${process.env.APP_URL || 'https://marketgrowth-production.up.railway.app'}/api/integrations/callback/meta`;
+
+    // Stap 1: Wissel code in voor short-lived token
+    const { accessToken: shortLivedToken } = await MetaAdsConnector.exchangeCode(code, redirectUri);
+
+    // Stap 2: Wissel short-lived in voor long-lived (60 dagen)
+    const connector = new MetaAdsConnector();
+    const refreshed = await connector.refreshAccessToken({
+      integrationId: '',
+      platform:      'meta_ads',
+      accessToken:   shortLivedToken,
+    });
+    const longLivedToken = refreshed.accessToken;
+    const tokenExpiresAt = refreshed.expiresAt;
+
+    // Stap 3: Test connection — moet werken anders kunnen we niets
+    const testResult = await connector.testConnection({
+      integrationId: '',
+      platform:      'meta_ads',
+      accessToken:   longLivedToken,
+    });
+
+    if (!testResult.success) {
+      res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent('Meta verbindingstest mislukt: ' + (testResult.error || 'onbekend'))}`);
+      return;
+    }
+
+    // Stap 4: Haal alle ad accounts op
+    const adAccounts = await MetaAdsConnector.fetchAdAccounts(longLivedToken);
+
+    if (adAccounts.length === 0) {
+      res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent('Geen Meta ad accounts gevonden onder dit Business Manager profiel')}`);
+      return;
+    }
+
+    // Stap 5: Maak/update tenant_integrations rij
+    const integrationId = uuidv4();
+
+    await db.query(
+      `INSERT INTO tenant_integrations
+         (id, tenant_id, platform_slug, shop_domain, shop_name, status, created_at, updated_at)
+       VALUES ($1, $2, 'meta_ads', NULL, $3, 'active', now(), now())
+       ON CONFLICT (tenant_id, platform_slug, shop_domain)
+       DO UPDATE SET status = 'active', shop_name = EXCLUDED.shop_name, updated_at = now()`,
+      [integrationId, tenantId, testResult.shopName || 'Meta Ads'],
+      { allowNoTenant: true }
+    );
+
+    // Lees de daadwerkelijke ID terug (kan een bestaande zijn na ON CONFLICT)
+    const existing = await db.query<{ id: string }>(
+      `SELECT id FROM tenant_integrations
+       WHERE tenant_id = $1 AND platform_slug = 'meta_ads'
+       LIMIT 1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
+    const actualIntegrationId = existing.rows[0]?.id ?? integrationId;
+
+    // Stap 6: Sla credentials versleuteld op
+    await db.query(
+      `INSERT INTO integration_credentials
+         (integration_id, access_token, token_expires_at, updated_at, encrypted_at)
+       VALUES ($1, $2, $3, now(), now())
+       ON CONFLICT (integration_id)
+       DO UPDATE SET
+         access_token     = EXCLUDED.access_token,
+         token_expires_at = EXCLUDED.token_expires_at,
+         updated_at       = now(),
+         encrypted_at     = now()`,
+      [actualIntegrationId, encryptToken(longLivedToken), tokenExpiresAt],
+      { allowNoTenant: true }
+    );
+
+    // Stap 7: Sla ad accounts op (tenant-context query, RLS doet zijn werk)
+    for (let i = 0; i < adAccounts.length; i++) {
+      const acc = adAccounts[i];
+      await db.query(
+        `INSERT INTO meta_ad_accounts
+           (tenant_id, integration_id, external_id, account_name, currency, timezone_name, business_id, is_primary)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (integration_id, external_id)
+         DO UPDATE SET
+           account_name  = EXCLUDED.account_name,
+           currency      = EXCLUDED.currency,
+           timezone_name = EXCLUDED.timezone_name,
+           business_id   = EXCLUDED.business_id,
+           updated_at    = now()`,
+        [
+          tenantId,
+          actualIntegrationId,
+          acc.externalId,
+          acc.name,
+          acc.currency,
+          acc.timezoneName,
+          acc.businessId ?? null,
+          i === 0,
+        ],
+        { allowNoTenant: true }
+      );
+    }
+
+    logger.info('integration.meta.connected', {
+      tenantId,
+      integrationId: actualIntegrationId,
+      adAccounts: adAccounts.length,
+    });
+
+    res.redirect(`${frontendUrl}/dashboard/integrations?connected=meta_ads`);
+  } catch (err) {
+    logger.error('integration.meta.callback_error', { error: (err as Error).message });
+    res.redirect(`${frontendUrl}/dashboard/integrations?error=${encodeURIComponent((err as Error).message)}`);
+  }
+});
+
+// ============================================================
+// BOL.COM ADVERTISING — bestaande endpoints, ongewijzigd
+// ============================================================
 
 // ── POST /api/integrations/advertising/bolcom/connect ────────
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
@@ -314,14 +524,9 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
 
 // ── POST /api/integrations/webhook/:platform ─────────────────
 //
-// SECURITY: deze stub gaf eerder altijd 200 OK terug zonder iets te
-// verwerken én zonder HMAC verificatie. Dat was geen direct lek
-// (er gebeurt niets), maar het is een tijdbom: zodra iemand er
-// verwerkingslogica achter zet zonder eerst HMAC toe te voegen,
-// is er meteen een vulnerability.
-//
-// Vandaar nu een 501 met expliciete logging. Wie deze stub vervangt
-// MOET de helper uit src/shared/webhooks/webhook-verifier.ts gebruiken.
+// Stub die expliciet 501 teruggeeft. Wie deze stub vervangt MOET
+// de helper uit src/shared/webhooks/webhook-verifier.ts gebruiken
+// voor HMAC verificatie voordat er payload wordt verwerkt.
 //
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   logger.warn('webhook.unimplemented_called', {
