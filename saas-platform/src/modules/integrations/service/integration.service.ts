@@ -1,8 +1,11 @@
 // ============================================================
 // src/modules/integrations/service/integration.service.ts
 //
-// SECURITY UPDATE: Alle credentials worden nu versleuteld
-// opgeslagen via AES-256-GCM (token-encryption.ts).
+// SECURITY: Alle credentials worden versleuteld opgeslagen via
+// AES-256-GCM (token-encryption.ts).
+//
+// FIX: PLATFORM_NAMES uitgebreid met bolcom_ads en meta_ads
+// na uitbreiding van PlatformSlug type.
 // ============================================================
 
 import crypto from 'crypto';
@@ -40,6 +43,8 @@ const PLATFORM_NAMES: Record<PlatformSlug, string> = {
   amazon:      'Amazon',
   etsy:        'Etsy',
   google_ads:  'Google Ads',
+  bolcom_ads:  'Bol.com Advertising',
+  meta_ads:    'Meta Ads',
 };
 
 const OAUTH_PLATFORMS: PlatformSlug[] = ['shopify', 'amazon', 'etsy'];
@@ -53,7 +58,10 @@ export class IntegrationService {
     const { tenantId, planSlug } = getTenantContext();
 
     const countResult = await db.query(
-      `SELECT COUNT(*) FROM tenant_integrations WHERE tenant_id = $1 AND status != 'disconnected'`,
+      `SELECT COUNT(*) FROM tenant_integrations
+       WHERE tenant_id = $1
+         AND status != 'disconnected'
+         AND platform_slug NOT IN ('bolcom_ads', 'meta_ads', 'google_ads')`,
       [tenantId]
     );
     const currentCount = parseInt(countResult.rows[0].count);
@@ -212,7 +220,6 @@ export class IntegrationService {
       { allowNoTenant: true }
     );
 
-    // ✅ ENCRYPTED: access_token en refresh_token worden versleuteld opgeslagen
     await db.query(
       `INSERT INTO integration_credentials (integration_id, access_token, refresh_token, updated_at, encrypted_at)
        VALUES ($1, $2, $3, now(), now())
@@ -276,7 +283,6 @@ export class IntegrationService {
       { allowNoTenant: true }
     );
 
-    // ✅ ENCRYPTED: api_key en api_secret worden versleuteld opgeslagen
     await db.query(
       `INSERT INTO integration_credentials (integration_id, api_key, api_secret, store_url, updated_at, encrypted_at)
        VALUES ($1, $2, $3, $4, now(), now())`,
