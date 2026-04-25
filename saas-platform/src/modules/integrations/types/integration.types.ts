@@ -1,5 +1,7 @@
 // ============================================================
 // src/modules/integrations/types/integration.types.ts
+//
+// UPDATE: 'meta_ads' toegevoegd als advertising platform slug.
 // ============================================================
 
 export type PlatformSlug =
@@ -11,7 +13,9 @@ export type PlatformSlug =
   | 'magento'
   | 'amazon'
   | 'etsy'
-  | 'google_ads';
+  | 'google_ads'
+  | 'bolcom_ads'
+  | 'meta_ads';
 
 export interface IntegrationCredentials {
   integrationId:  string;
@@ -31,7 +35,7 @@ export interface FetchOptions {
   limit?:        number;
   cursor?:       string;
   page?:         number;
-  jobType?:      'full_sync' | 'incremental'; // ← nieuw
+  jobType?:      'full_sync' | 'incremental';
 }
 
 export interface NormalizedLineItem {
@@ -82,7 +86,6 @@ export interface NormalizedProduct {
   priceMax?:         number;
   publishedAt?:      Date;
   updatedAt:         Date;
-  // Bol.com specifiek
   ean?:              string;
   condition?:        string;
   fulfillmentBy?:    string;
