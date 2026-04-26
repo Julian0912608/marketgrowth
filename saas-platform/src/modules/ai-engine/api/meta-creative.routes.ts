@@ -4,26 +4,19 @@
 // API endpoints voor Meta Ad Creative Studio:
 //
 //   GET    /api/ai/meta-creative/ad-accounts
-//                              — lijst beschikbare Meta ad accounts
 //   GET    /api/ai/meta-creative/list
-//                              — lijst eerder gegenereerde creatives
 //   POST   /api/ai/meta-creative/generate
-//                              — genereer nieuwe creative (copy + image)
 //   POST   /api/ai/meta-creative/:id/regenerate-image
-//                              — genereer nieuwe image voor bestaande creative
 //   PATCH  /api/ai/meta-creative/:id
-//                              — bewerk copy (primary_text, headline, etc.)
 //   DELETE /api/ai/meta-creative/:id
-//                              — soft delete (zet is_archived=true)
 //
-// Plan rules (PR 3a):
-//   - Starter:  geen toegang tot Meta Creative Studio
-//   - Growth:   toegang, max 50 generations/maand (telt onder
-//               'ai-recommendations' credit pool)
+// PR 3a.2: GenerateSchema uitgebreid met imageMode + uploadedImage
+// voor 4 image modi (ai_generated, product_image, uploaded, none).
+//
+// Plan rules:
+//   - Starter:  geen toegang
+//   - Growth:   toegang, valt onder 'ai-recommendations' credit pool
 //   - Scale:    unlimited
-//
-// Plan gating wordt afgehandeld door de bestaande featureGate
-// middleware op 'ai-recommendations' + extra credit pre-check.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -38,6 +31,7 @@ import {
   regenerateCreativeImage,
   META_CTA_OPTIONS,
   MetaFormat,
+  ImageMode,
 } from '../services/meta-creative-generator';
 
 const router = Router();
@@ -98,16 +92,23 @@ async function trackCreditUsage(
 // ── Schemas ───────────────────────────────────────────────────
 
 const FORMATS = ['single_image', 'carousel', 'video', 'story'] as const;
+const IMAGE_MODES = ['ai_generated', 'product_image', 'uploaded', 'none'] as const;
 
 const GenerateSchema = z.object({
-  format:        z.enum(FORMATS),
-  prompt:        z.string().min(5).max(1000),
-  productId:     z.string().uuid().optional(),
-  language:      z.enum(['nl', 'en']).default('nl'),
-  tone:          z.string().max(50).default('lifestyle'),
-  generateImage: z.boolean().optional(),
-  brandContext:  z.string().max(500).optional(),
-  callToAction:  z.enum(META_CTA_OPTIONS).optional(),
+  format:         z.enum(FORMATS),
+  prompt:         z.string().min(5).max(1000),
+  productId:      z.string().uuid().optional(),
+  language:       z.enum(['nl', 'en']).default('nl'),
+  tone:           z.string().max(50).default('lifestyle'),
+  imageMode:      z.enum(IMAGE_MODES).default('ai_generated'),
+  // Base64 data URL voor uploaded image. Limit 5MB om DB en
+  // request body niet te overbelasten. Format: 'data:image/jpeg;base64,...'
+  uploadedImage:  z.string()
+                    .max(7_000_000) // ~5MB ruwe binary = ~7MB base64
+                    .regex(/^data:image\/(jpeg|jpg|png|webp);base64,/, 'Moet een data:image base64 URL zijn')
+                    .optional(),
+  brandContext:   z.string().max(500).optional(),
+  callToAction:   z.enum(META_CTA_OPTIONS).optional(),
 });
 
 const UpdateSchema = z.object({
@@ -119,8 +120,6 @@ const UpdateSchema = z.object({
 });
 
 // ── GET /api/ai/meta-creative/ad-accounts ────────────────────
-// Lijst alle Meta ad accounts beschikbaar voor deze tenant.
-// Gebruikt door de Studio om te weten waar creatives bij horen.
 router.get('/ad-accounts', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -151,7 +150,6 @@ router.get('/ad-accounts', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ── GET /api/ai/meta-creative/list ───────────────────────────
-// Lijst alle (niet-gearchiveerde) creatives voor deze tenant.
 router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -160,7 +158,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
     const result = await db.query(
       `SELECT mc.id, mc.format, mc.primary_text, mc.headline, mc.description,
               mc.call_to_action, mc.asset_urls, mc.status, mc.source,
-              mc.generation_prompt, mc.image_aspect_ratio,
+              mc.generation_prompt, mc.image_aspect_ratio, mc.meta,
               mc.created_at, mc.updated_at,
               p.title AS product_title
        FROM meta_creatives mc
@@ -185,6 +183,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
         source:            r.source,
         generationPrompt:  r.generation_prompt,
         imageAspectRatio:  r.image_aspect_ratio,
+        imageSource:       r.meta?.image_source ?? null,
         productTitle:      r.product_title,
         createdAt:         r.created_at,
         updatedAt:         r.updated_at,
@@ -194,7 +193,6 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ── POST /api/ai/meta-creative/generate ──────────────────────
-// Genereer een nieuwe Meta creative.
 router.post('/generate', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -232,13 +230,18 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
       productId:     input.productId,
       language:      input.language,
       tone:          input.tone,
-      generateImage: input.generateImage,
+      imageMode:     input.imageMode as ImageMode,
+      uploadedImage: input.uploadedImage,
       brandContext:  input.brandContext,
       callToAction:  input.callToAction,
     });
 
-    // 3 credits per generation: 1 voor copy + 2 voor image (image is duurder)
-    const creditCost = generated.imageUrl ? 3 : 1;
+    // Credits per modus:
+    //   - ai_generated: 3 (copy + Gemini)
+    //   - product_image: 1 (alleen copy)
+    //   - uploaded: 1 (alleen copy)
+    //   - none: 1 (alleen copy)
+    const creditCost = input.imageMode === 'ai_generated' ? 3 : 1;
     await trackCreditUsage(tenantId, creditCost);
 
     res.status(201).json({
@@ -255,7 +258,6 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
 });
 
 // ── POST /api/ai/meta-creative/:id/regenerate-image ─────────
-// Genereer een nieuwe image voor bestaande creative (copy blijft).
 router.post('/:id/regenerate-image', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -267,14 +269,13 @@ router.post('/:id/regenerate-image', featureGate('ai-recommendations'), async (r
     }
 
     const result = await regenerateCreativeImage(tenantId, req.params.id);
-    await trackCreditUsage(tenantId, 2); // alleen image = 2 credits
+    await trackCreditUsage(tenantId, 2);
 
     res.json(result);
   } catch (err) { next(err); }
 });
 
 // ── PATCH /api/ai/meta-creative/:id ──────────────────────────
-// Update copy fields. Geen credits — handmatige bewerking is gratis.
 router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -287,7 +288,6 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => 
 
     const updates = validate(UpdateSchema, req.body);
 
-    // Build dynamic SET clause
     const sets: string[]  = [];
     const params: any[]   = [req.params.id, tenantId];
     let paramIdx = 3;
@@ -338,7 +338,6 @@ router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => 
 });
 
 // ── DELETE /api/ai/meta-creative/:id ─────────────────────────
-// Soft delete — zet is_archived = true.
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
