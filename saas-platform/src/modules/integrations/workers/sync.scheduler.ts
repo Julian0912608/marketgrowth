@@ -1,12 +1,13 @@
 // saas-platform/src/modules/integrations/workers/sync.scheduler.ts
 //
-// SECURITY UPDATE: api_key en api_secret worden nu gedecrypteerd
-// via decryptToken() voordat ze gebruikt worden voor de Bol.com API.
+// PR 2 UPDATE: Meta Ads sync toegevoegd aan scheduler.
+// Draait elk uur parallel aan Bol.com Ads sync.
 
 import { db }        from '../../../infrastructure/database/connection';
 import { logger }    from '../../../shared/logging/logger';
 import { syncQueue } from './sync.worker';
 import { syncBolcomAdvertisingData } from '../connectors/bolcom-advertising.connector';
+import { syncMetaAdsData }           from '../connectors/meta-ads-sync';
 import { decryptToken } from '../../../shared/crypto/token-encryption';
 import { PlatformSlug, IntegrationCredentials } from '../types/integration.types';
 
@@ -28,7 +29,7 @@ async function scheduleIncrementalSyncs(): Promise<void> {
        FROM tenant_integrations ti
        JOIN tenant_subscriptions ts ON ts.tenant_id = ti.tenant_id
        WHERE ti.status = 'active'
-         AND ti.platform_slug != 'bolcom_ads'
+         AND ti.platform_slug NOT IN ('bolcom_ads', 'meta_ads', 'google_ads')
          AND (ti.next_sync_at IS NULL OR ti.next_sync_at <= now())
          AND ts.status IN ('active', 'trialing')
        ORDER BY ti.next_sync_at ASC NULLS FIRST
@@ -96,9 +97,9 @@ async function scheduleIncrementalSyncs(): Promise<void> {
   });
 }
 
-// ── Advertising sync (bolcom_ads) — elk uur ───────────────────
-async function scheduleAdvertisingSync(): Promise<void> {
-  logger.info('scheduler.advertising.start', { timestamp: new Date().toISOString() });
+// ── Bol.com Advertising sync (elk uur) ───────────────────────
+async function scheduleBolcomAdvertisingSync(): Promise<void> {
+  logger.info('scheduler.bolcom_ads.start', { timestamp: new Date().toISOString() });
 
   let totalSynced = 0;
 
@@ -121,19 +122,17 @@ async function scheduleAdvertisingSync(): Promise<void> {
 
     for (const row of rows.rows) {
       try {
-        // ✅ DECRYPTED: api_key en api_secret worden gedecrypteerd voor gebruik
         const clientId     = decryptToken(row.api_key)    ?? '';
         const clientSecret = decryptToken(row.api_secret) ?? '';
 
         if (!clientId || !clientSecret) {
-          logger.warn('scheduler.advertising.missing_credentials', {
+          logger.warn('scheduler.bolcom_ads.missing_credentials', {
             integrationId: row.integration_id,
             tenantId:      row.tenant_id,
           });
           continue;
         }
 
-        // Token ophalen met gedecrypte credentials
         const encoded  = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
         const tokenRes = await fetch('https://login.bol.com/token?grant_type=client_credentials', {
           method:  'POST',
@@ -144,7 +143,7 @@ async function scheduleAdvertisingSync(): Promise<void> {
         });
 
         if (!tokenRes.ok) {
-          logger.warn('scheduler.advertising.token_failed', {
+          logger.warn('scheduler.bolcom_ads.token_failed', {
             integrationId: row.integration_id,
             tenantId:      row.tenant_id,
             status:        tokenRes.status,
@@ -175,7 +174,7 @@ async function scheduleAdvertisingSync(): Promise<void> {
 
         if (result.hasAccess) totalSynced++;
 
-        logger.info('scheduler.advertising.synced', {
+        logger.info('scheduler.bolcom_ads.synced', {
           tenantId:      row.tenant_id,
           integrationId: row.integration_id,
           hasAccess:     result.hasAccess,
@@ -183,7 +182,7 @@ async function scheduleAdvertisingSync(): Promise<void> {
         });
 
       } catch (err) {
-        logger.error('scheduler.advertising.error', {
+        logger.error('scheduler.bolcom_ads.error', {
           integrationId: row.integration_id,
           tenantId:      row.tenant_id,
           error:         (err as Error).message,
@@ -191,10 +190,97 @@ async function scheduleAdvertisingSync(): Promise<void> {
       }
     }
   } catch (err) {
-    logger.error('scheduler.advertising.fatal', { error: (err as Error).message });
+    logger.error('scheduler.bolcom_ads.fatal', { error: (err as Error).message });
   }
 
-  logger.info('scheduler.advertising.complete', { totalSynced });
+  logger.info('scheduler.bolcom_ads.complete', { totalSynced });
+}
+
+// ── Meta Ads sync (elk uur) — PR 2 ───────────────────────────
+async function scheduleMetaAdsSync(): Promise<void> {
+  logger.info('scheduler.meta_ads.start', { timestamp: new Date().toISOString() });
+
+  let totalSynced     = 0;
+  let totalCampaigns  = 0;
+  let totalSpend      = 0;
+
+  try {
+    const rows = await db.query<{
+      integration_id: string;
+      tenant_id:      string;
+    }>(
+      `SELECT ti.id AS integration_id, ti.tenant_id
+       FROM tenant_integrations ti
+       JOIN tenant_subscriptions ts ON ts.tenant_id = ti.tenant_id
+       WHERE ti.platform_slug = 'meta_ads'
+         AND ti.status = 'active'
+         AND ts.status IN ('active', 'trialing')
+         AND (ti.next_sync_at IS NULL OR ti.next_sync_at <= now())
+       ORDER BY ti.next_sync_at ASC NULLS FIRST
+       LIMIT $1`,
+      [BATCH_SIZE],
+      { allowNoTenant: true }
+    );
+
+    for (const row of rows.rows) {
+      try {
+        const result = await syncMetaAdsData(row.integration_id, row.tenant_id);
+
+        if (result.hasAccess) {
+          totalSynced++;
+          totalCampaigns += result.campaignsCount;
+          totalSpend     += result.totalSpend;
+        } else {
+          // Bij no-access markeer integratie als error zodat dashboard het toont
+          await db.query(
+            `UPDATE tenant_integrations
+             SET status        = 'error',
+                 error_message = $2,
+                 updated_at    = now()
+             WHERE id = $1`,
+            [row.integration_id, result.errorMessage || 'Meta Ads sync zonder toegang'],
+            { allowNoTenant: true }
+          );
+        }
+
+        // syncMetaAdsData zelf zet next_sync_at al
+
+        logger.info('scheduler.meta_ads.synced', {
+          tenantId:      row.tenant_id,
+          integrationId: row.integration_id,
+          hasAccess:     result.hasAccess,
+          campaigns:     result.campaignsCount,
+          spend:         result.totalSpend,
+        });
+
+      } catch (err) {
+        logger.error('scheduler.meta_ads.error', {
+          integrationId: row.integration_id,
+          tenantId:      row.tenant_id,
+          error:         (err as Error).message,
+        });
+
+        // Bij sync-fout: zet next_sync_at vooruit zodat we niet vastlopen op dezelfde rij
+        await db.query(
+          `UPDATE tenant_integrations
+           SET next_sync_at = now() + INTERVAL '1 hour',
+               error_message = $2,
+               updated_at   = now()
+           WHERE id = $1`,
+          [row.integration_id, (err as Error).message.slice(0, 500)],
+          { allowNoTenant: true }
+        );
+      }
+    }
+  } catch (err) {
+    logger.error('scheduler.meta_ads.fatal', { error: (err as Error).message });
+  }
+
+  logger.info('scheduler.meta_ads.complete', {
+    totalSynced,
+    totalCampaigns,
+    totalSpend,
+  });
 }
 
 // ── Stale job cleanup ─────────────────────────────────────────
@@ -235,7 +321,8 @@ async function main(): Promise<void> {
   });
 
   await scheduleIncrementalSyncs();
-  await scheduleAdvertisingSync();
+  await scheduleBolcomAdvertisingSync();
+  await scheduleMetaAdsSync();
   await cleanupStaleJobs();
 
   setInterval(async () => {
@@ -244,7 +331,8 @@ async function main(): Promise<void> {
   }, SCHEDULER_INTERVAL_MS);
 
   setInterval(async () => {
-    await scheduleAdvertisingSync();
+    await scheduleBolcomAdvertisingSync();
+    await scheduleMetaAdsSync();
   }, ADV_INTERVAL_MS);
 }
 
