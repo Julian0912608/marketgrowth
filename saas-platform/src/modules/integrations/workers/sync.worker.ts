@@ -1,20 +1,10 @@
 // ============================================================
 // src/modules/integrations/workers/sync.worker.ts
 //
-// FIXES:
-//   1. Bulk INSERT voor order line items (geen N+1 meer)
-//   2. Per-tenant concurrency guard via Redis SETNX
-//      (max 2 gelijktijdige sync jobs per tenant)
-//   3. Priority queuing: Scale=1, Growth=5, Starter=10
-//   4. FIX: updatedAfter gebruikt nu ook last_sync_at van de
-//      integratie zelf als fallback, zodat incremental sync
-//      altijd een zinvolle tijdsvenster heeft — ook als er
-//      nog geen completed full_sync is.
-//
-// PR 3a.1 UPDATE: image_url wordt nu opgeslagen in products
-// tabel. Voor Shopify komt deze uit normalizeProduct (zie
-// shopify.connector.ts). Bol.com en andere platforms hebben
-// (nog) geen image URL — blijft NULL.
+// PR 3a.3 UPDATE: products INSERT/UPDATE schrijft nu ook
+//   description, images, variants_summary, seo_description
+// (nieuwe kolommen uit migration 008). Voor Bol.com blijven
+// deze NULL — geen API support.
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
@@ -30,7 +20,6 @@ import {
   IntegrationCredentials,
 } from '../types/integration.types';
 
-// Raw redis voor incr/decr/expire/del
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
 
@@ -79,7 +68,6 @@ function buildBullMQConnection() {
 
 const bullConnection = buildBullMQConnection();
 
-// ── Queues ────────────────────────────────────────────────────
 export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',      { connection: bullConnection });
 export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: bullConnection });
 
@@ -109,7 +97,6 @@ async function releaseTenantSlot(tenantId: string): Promise<void> {
   } catch {}
 }
 
-// ── Platform rate limiter ─────────────────────────────────────
 async function acquireRateLimit(platformSlug: string, integrationId: string): Promise<void> {
   const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
   const limit = getRateLimit(platformSlug);
@@ -128,7 +115,6 @@ function getRateLimit(platform: string): number {
   return limits[platform] ?? 5;
 }
 
-// ── Prioriteit op basis van plan ──────────────────────────────
 function getPriority(planSlug?: string): number {
   if (planSlug === 'scale')  return 1;
   if (planSlug === 'growth') return 5;
@@ -230,12 +216,6 @@ export const syncWorker = new Worker<SyncJobPayload>(
         { tenantId, tenantSlug: '', userId: 'sync-worker', planSlug: (planSlug ?? 'starter') as PlanSlug, traceId: uuidv4(), requestStartedAt: new Date() },
         async () => {
 
-          // FIX: updatedAfter bepalen voor incremental sync.
-          // Strategie: gebruik de meest recente van:
-          //   1. MAX(completed_at) van enige completed sync job
-          //   2. last_sync_at van de integratie zelf
-          // Zo heeft de incremental sync altijd een zinvol tijdsvenster,
-          // ook als er nog geen completed full_sync is.
           let updatedAfter: Date | undefined = undefined;
 
           if (jobType === 'incremental') {
@@ -324,6 +304,8 @@ export const syncWorker = new Worker<SyncJobPayload>(
           }
 
           // ── Products ─────────────────────────────────────────
+          // PR 3a.3: extra kolommen description, images, variants_summary,
+          // seo_description toegevoegd aan INSERT/UPDATE.
           let productPage: number | string | undefined = 1;
           while (productPage !== undefined) {
             const result = await connector.fetchProducts(credentials, {
@@ -338,8 +320,9 @@ export const syncWorker = new Worker<SyncJobPayload>(
                    tenant_id, integration_id, external_id, title, handle, status,
                    product_type, tags, vendor, total_inventory, requires_shipping,
                    price_min, price_max, published_at, updated_at,
-                   ean, condition, fulfillment_by, image_url
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                   ean, condition, fulfillment_by, image_url,
+                   description, images, variants_summary, seo_description
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
                  ON CONFLICT (tenant_id, integration_id, external_id)
                  DO UPDATE SET
                    title           = EXCLUDED.title,
@@ -351,6 +334,10 @@ export const syncWorker = new Worker<SyncJobPayload>(
                    condition       = COALESCE(EXCLUDED.condition, products.condition),
                    fulfillment_by  = COALESCE(EXCLUDED.fulfillment_by, products.fulfillment_by),
                    image_url       = COALESCE(EXCLUDED.image_url, products.image_url),
+                   description     = COALESCE(EXCLUDED.description, products.description),
+                   images          = COALESCE(EXCLUDED.images, products.images),
+                   variants_summary = COALESCE(EXCLUDED.variants_summary, products.variants_summary),
+                   seo_description = COALESCE(EXCLUDED.seo_description, products.seo_description),
                    updated_at      = now(),
                    synced_at       = now()`,
                 [
@@ -366,6 +353,10 @@ export const syncWorker = new Worker<SyncJobPayload>(
                   (product as any).condition ?? 'NEW',
                   (product as any).fulfillmentBy ?? 'FBR',
                   (product as any).imageUrl ?? null,
+                  (product as any).description ?? null,
+                  (product as any).images ? JSON.stringify((product as any).images) : null,
+                  (product as any).variantsSummary ? JSON.stringify((product as any).variantsSummary) : null,
+                  (product as any).seoDescription ?? null,
                 ],
                 { allowNoTenant: true }
               );
@@ -377,7 +368,6 @@ export const syncWorker = new Worker<SyncJobPayload>(
               : undefined;
           }
 
-          // ── Sync job afronden ─────────────────────────────────
           await db.query(
             `UPDATE integration_sync_jobs
              SET status = 'completed', completed_at = now(),
@@ -415,7 +405,6 @@ export const syncWorker = new Worker<SyncJobPayload>(
   }
 );
 
-// ── Helper: job toevoegen aan queue met juiste prioriteit ─────
 export async function enqueueSyncJob(payload: SyncJobPayload): Promise<void> {
   const priority = getPriority(payload.planSlug);
   await syncQueue.add(
