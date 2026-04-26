@@ -1,9 +1,13 @@
 // ============================================================
 // src/modules/integrations/connectors/shopify.connector.ts
 //
-// PR 3a.1 UPDATE: normalizeProduct haalt nu image URL op uit
-// p.image.src (featured image van het product). Wordt gebruikt
-// als ad creative in de Meta Studio.
+// PR 3a.3 UPDATE: normalizeProduct extract nu:
+//   - description (body_html)
+//   - images (alle product images, niet alleen primary)
+//   - variantsSummary (compact variant overzicht)
+//   - seoDescription (uit metafields wanneer beschikbaar)
+//
+// PR 3a.1 update: imageUrl uit p.image.src blijft behouden.
 // ============================================================
 
 import crypto from 'crypto';
@@ -19,6 +23,8 @@ import {
   WebhookRegistration,
   TokenRefreshResult,
   NormalizedLineItem,
+  ProductImage,
+  VariantsSummary,
 } from '../types/integration.types';
 import { logger } from '../../../shared/logging/logger';
 
@@ -176,21 +182,41 @@ export class ShopifyConnector implements IPlatformConnector {
     const variants = (p.variants as Record<string, unknown>[] | undefined) ?? [];
     const prices   = variants.map(v => parseFloat(String((v as Record<string, unknown>).price ?? '0'))).filter(n => n > 0);
 
-    // PR 3a.1: extract image URL.
-    // Shopify product API geeft images terug in twee plekken:
-    //   1. p.image (featured image — primary product image)
-    //   2. p.images (array van alle product images)
-    // We pakken eerst p.image.src, fallback p.images[0].src
+    // PR 3a.1: primary image
     let imageUrl: string | undefined;
     const featuredImage = p.image as Record<string, unknown> | undefined;
     if (featuredImage?.src) {
       imageUrl = String(featuredImage.src);
     } else {
-      const images = p.images as Record<string, unknown>[] | undefined;
-      if (images && images.length > 0 && images[0].src) {
-        imageUrl = String(images[0].src);
+      const imagesArr = p.images as Record<string, unknown>[] | undefined;
+      if (imagesArr && imagesArr.length > 0 && imagesArr[0].src) {
+        imageUrl = String(imagesArr[0].src);
       }
     }
+
+    // PR 3a.3: alle images
+    const imagesArr = (p.images as Record<string, unknown>[] | undefined) ?? [];
+    const images: ProductImage[] = imagesArr
+      .map(img => ({
+        src:      String(img.src ?? ''),
+        position: typeof img.position === 'number' ? img.position : undefined,
+        alt:      img.alt as string | undefined,
+      }))
+      .filter(img => img.src.length > 0);
+
+    // PR 3a.3: description (body_html). Shopify levert HTML — wij slaan dat direct op.
+    // De AI knipt de HTML er later uit als nodig (Claude is goed in HTML-naar-tekst).
+    const description = (p.body_html as string | undefined)?.trim() || undefined;
+
+    // PR 3a.3: variants_summary (compact)
+    const variantsSummary: VariantsSummary | undefined = variants.length > 0
+      ? this.summarizeVariants(p, variants)
+      : undefined;
+
+    // PR 3a.3: SEO description komt uit Shopify's product object niet standaard.
+    // Hij zit in metafields (apart endpoint). Voor v1 skippen, kunnen later in een
+    // aparte fetch toevoegen als waardevol blijkt.
+    const seoDescription: string | undefined = undefined;
 
     return {
       externalId:       String(p.id),
@@ -207,6 +233,52 @@ export class ShopifyConnector implements IPlatformConnector {
       publishedAt:      p.published_at ? new Date(p.published_at as string) : undefined,
       updatedAt:        new Date(p.updated_at as string),
       imageUrl,
+      description,
+      images,
+      variantsSummary,
+      seoDescription,
+    };
+  }
+
+  // Compacte samenvatting van variants — alleen unieke options + counts
+  private summarizeVariants(
+    p: Record<string, unknown>,
+    variants: Record<string, unknown>[]
+  ): VariantsSummary {
+    const options: Record<string, Set<string>> = {};
+
+    // Shopify product object heeft p.options met namen ("Color", "Size")
+    const productOptions = (p.options as Record<string, unknown>[] | undefined) ?? [];
+    const optionNames = productOptions.map(o => String(o.name ?? '')).filter(Boolean);
+
+    for (const variant of variants) {
+      // Variants hebben option1, option2, option3 fields
+      for (let i = 0; i < optionNames.length; i++) {
+        const name = optionNames[i];
+        const valueKey = `option${i + 1}`;
+        const value = variant[valueKey];
+        if (value && typeof value === 'string' && value.length > 0) {
+          if (!options[name]) options[name] = new Set();
+          options[name].add(value);
+        }
+      }
+    }
+
+    let inStock = 0;
+    let outOfStock = 0;
+    for (const variant of variants) {
+      const qty = variant.inventory_quantity as number ?? 0;
+      if (qty > 0) inStock++;
+      else outOfStock++;
+    }
+
+    return {
+      total_variants:       variants.length,
+      options:              Object.fromEntries(
+        Object.entries(options).map(([k, v]) => [k, Array.from(v)])
+      ),
+      in_stock_count:       inStock,
+      out_of_stock_count:   outOfStock,
     };
   }
 
