@@ -3,6 +3,8 @@
 //
 // FIX: express.raw() toegevoegd voor Shopify webhook route
 // zodat HMAC verificatie correct werkt op de raw payload.
+//
+// PR 3a: metaCreativeRouter geregistreerd op /api/ai/meta-creative.
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -173,6 +175,14 @@ try {
   app.use('/api/ai', aiRouter);
   console.log('  aiRouter OK');
 } catch (e: any) { console.error('  aiRouter FAILED:', e.message); }
+
+// PR 3a: Meta Creative Studio — aparte router op /api/ai/meta-creative
+// Geregistreerd na aiRouter zodat de meer-specifieke route eerst gepakt wordt.
+try {
+  const { metaCreativeRouter } = require('./modules/ai-engine/api/meta-creative.routes');
+  app.use('/api/ai/meta-creative', metaCreativeRouter);
+  console.log('  metaCreativeRouter OK');
+} catch (e: any) { console.error('  metaCreativeRouter FAILED:', e.message); }
 
 try {
   const { adminRouter } = require('./modules/admin/api/admin.routes');
