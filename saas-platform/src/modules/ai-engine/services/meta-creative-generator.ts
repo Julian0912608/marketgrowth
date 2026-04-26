@@ -1,27 +1,11 @@
 // ============================================================
 // src/modules/ai-engine/services/meta-creative-generator.ts
 //
+// FIX: order_line_items heeft geen 'created_at' kolom.
+// Vervangen door JOIN naar orders.ordered_at voor datum filter.
+//
 // Genereert Meta-advertentie content (copy + optioneel image)
 // via Claude + Gemini, en slaat op als 'draft' in meta_creatives.
-//
-// Wordt aangeroepen vanuit:
-//   POST /api/ai/meta-creative/generate (zie meta-creative.routes.ts)
-//
-// PR 3a.2: 4 image-modi ondersteund:
-//   1. ai_generated  — Gemini genereert vanaf nul
-//   2. product_image — gebruik productfoto uit Shopify products tabel
-//   3. uploaded      — gebruik door klant geüploade foto (base64)
-//   4. none          — geen image, alleen copy
-//
-// Architectuur:
-//   1. Claude Sonnet 4 → genereert primary_text, headline,
-//      description, call_to_action, targeting_hints
-//   2. Image bron bepalen op basis van imageMode:
-//      - ai_generated: Gemini call
-//      - product_image: haal image_url op uit products tabel
-//      - uploaded: gebruik direct de meegegeven base64 data URL
-//      - none: skip image
-//   3. Schrijft naar meta_creatives met status='draft'
 // ============================================================
 
 import { db }                from '../../../infrastructure/database/connection';
@@ -42,12 +26,12 @@ export interface GenerateMetaCreativeInput {
   integrationId:    string;
   adAccountDbId:    string;
   format:           MetaFormat;
-  prompt:           string;                 // user prompt
-  productId?:       string;                 // optioneel: koppel aan bestaand product
+  prompt:           string;
+  productId?:       string;
   language?:        'nl' | 'en';
   tone?:            string;
-  imageMode?:       ImageMode;              // PR 3a.2: 4 modi
-  uploadedImage?:   string;                 // base64 data URL (voor imageMode='uploaded')
+  imageMode?:       ImageMode;
+  uploadedImage?:   string;
   brandContext?:    string;
   callToAction?:    string;
 }
@@ -60,7 +44,7 @@ export interface GeneratedMetaCreative {
   callToAction:    string;
   targetingHints?: string[];
   imageUrl?:       string;
-  imageSource?:    string;                  // 'ai_generated' | 'product_image' | 'uploaded' | 'none'
+  imageSource?:    string;
   format:          MetaFormat;
   status:          'draft';
 }
@@ -76,7 +60,6 @@ interface ProductContext {
   unitsSold30d?: number;
 }
 
-// ── Lijst van geldige Meta CTA-knoppen ────────────────────────
 export const META_CTA_OPTIONS = [
   'SHOP_NOW',      'LEARN_MORE',  'SIGN_UP',     'GET_OFFER',
   'BOOK_TRAVEL',   'CONTACT_US',  'DOWNLOAD',    'DONATE_NOW',
@@ -87,6 +70,9 @@ export const META_CTA_OPTIONS = [
 export type MetaCTA = typeof META_CTA_OPTIONS[number];
 
 // ── Helper: ophalen product context als productId is meegegeven ─
+// FIX: order_line_items heeft géén created_at kolom.
+// Datum filter werkt via JOIN op orders.ordered_at, zoals overal
+// elders in de codebase wordt gedaan.
 async function loadProductContext(
   tenantId:  string,
   productId: string,
@@ -102,7 +88,10 @@ async function loadProductContext(
      LEFT JOIN order_line_items li
        ON li.product_id = p.id::text
        AND li.tenant_id = p.tenant_id
-       AND li.created_at >= NOW() - INTERVAL '30 days'
+     LEFT JOIN orders o
+       ON o.id = li.order_id
+       AND o.ordered_at >= NOW() - INTERVAL '30 days'
+       AND o.status NOT IN ('cancelled', 'refunded')
      WHERE p.id = $1 AND p.tenant_id = $2
      GROUP BY p.id, ti.platform_slug`,
     [productId, tenantId],
@@ -115,11 +104,11 @@ async function loadProductContext(
   return {
     id:           row.id,
     title:        row.title,
-    price:        row.price_min ?? undefined,
+    price:        row.price_min !== null ? parseFloat(String(row.price_min)) : undefined,
     platform:     row.platform,
     imageUrl:     row.image_url ?? undefined,
-    revenue30d:   parseFloat(row.total_revenue ?? '0'),
-    unitsSold30d: parseInt(row.units_sold ?? '0', 10),
+    revenue30d:   parseFloat(String(row.total_revenue ?? '0')),
+    unitsSold30d: parseInt(String(row.units_sold ?? '0'), 10),
   };
 }
 
@@ -182,7 +171,6 @@ REQUIREMENTS:
 - description: Sub-headline below headline. Max 30 characters.
 - call_to_action: ${ctaInstruction}
 - targeting_hints: 3-5 short bullet points (each max 10 words) suggesting who this ad targets.
-  Examples: "Women 25-45 interested in sustainable fashion", "Parents with young children", "Premium product buyers in NL/BE"
 
 Return ONLY valid JSON, no markdown, no commentary:
 {
@@ -225,10 +213,21 @@ export async function generateMetaCreative(
   });
 
   // Stap 1: optioneel product ophalen
+  // Defensive: als loadProductContext crasht door schema-issues,
+  // gaan we toch door zonder product context (copy wordt dan generieker)
   let product: ProductContext | undefined;
   if (productId) {
-    const loaded = await loadProductContext(tenantId, productId);
-    product = loaded ?? undefined;
+    try {
+      const loaded = await loadProductContext(tenantId, productId);
+      product = loaded ?? undefined;
+    } catch (err) {
+      logger.warn('meta.creative.product_load_failed', {
+        tenantId,
+        productId,
+        error: (err as Error).message,
+      });
+      // Continue zonder product context — beter dan crash
+    }
   }
 
   // Validatie image mode
@@ -284,12 +283,10 @@ export async function generateMetaCreative(
     throw new Error('AI copy genereren mislukt — onverwacht antwoord');
   }
 
-  // Sanitize: enforce max lengths zoals Meta die hanteert
   parsed.primary_text = (parsed.primary_text ?? '').slice(0, 500);
   parsed.headline     = (parsed.headline    ?? '').slice(0, 100);
   parsed.description  = (parsed.description ?? '').slice(0, 100);
 
-  // Valideer CTA
   let cta: string = parsed.call_to_action ?? 'LEARN_MORE';
   if (!META_CTA_OPTIONS.includes(cta as MetaCTA)) {
     logger.warn('meta.creative.invalid_cta', { tenantId, cta });
@@ -303,7 +300,6 @@ export async function generateMetaCreative(
   const aspectRatio = aspectRatioForFormat(format);
 
   if (format === 'video') {
-    // Video heeft geen image, alleen copy
     imageSource = 'none';
   } else {
     switch (imageMode) {
@@ -322,7 +318,7 @@ export async function generateMetaCreative(
               platform:     'meta',
               revenue30d:   product?.revenue30d,
               sold30d:      product?.unitsSold30d,
-              imageUrl:     product?.imageUrl,  // Gemini gebruikt deze als referentie
+              imageUrl:     product?.imageUrl,
             },
             format:     nbFormat,
             platform:   'meta',
@@ -337,14 +333,12 @@ export async function generateMetaCreative(
             tenantId,
             error: (err as Error).message,
           });
-          // Best-effort: copy gaat door zonder image
           imageSource = 'none';
         }
         break;
       }
 
       case 'product_image': {
-        // We weten al dat product.imageUrl bestaat (validatie hierboven)
         imageUrl    = product!.imageUrl;
         imagePrompt = `Product image van ${product!.title} (geen AI generatie)`;
         break;
@@ -357,7 +351,6 @@ export async function generateMetaCreative(
       }
 
       case 'none':
-        // Niets te doen
         break;
     }
   }
@@ -448,8 +441,12 @@ export async function regenerateCreativeImage(
 
   let product: ProductContext | undefined;
   if (row.source_product_id) {
-    const loaded = await loadProductContext(tenantId, row.source_product_id);
-    product = loaded ?? undefined;
+    try {
+      const loaded = await loadProductContext(tenantId, row.source_product_id);
+      product = loaded ?? undefined;
+    } catch {
+      // Continue zonder product
+    }
   }
 
   const nbFormat: 'single' | 'story' | 'carousel' =
@@ -473,7 +470,6 @@ export async function regenerateCreativeImage(
     brandColor: '#4f46e5',
   });
 
-  // Update bestaande creative met nieuwe image
   await db.query(
     `UPDATE meta_creatives
      SET asset_urls         = $2,
