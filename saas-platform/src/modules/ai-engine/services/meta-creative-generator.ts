@@ -5,16 +5,23 @@
 // via Claude + Gemini, en slaat op als 'draft' in meta_creatives.
 //
 // Wordt aangeroepen vanuit:
-//   POST /api/ai/meta-creative/generate (zie ai.routes.ts)
+//   POST /api/ai/meta-creative/generate (zie meta-creative.routes.ts)
+//
+// PR 3a.2: 4 image-modi ondersteund:
+//   1. ai_generated  — Gemini genereert vanaf nul
+//   2. product_image — gebruik productfoto uit Shopify products tabel
+//   3. uploaded      — gebruik door klant geüploade foto (base64)
+//   4. none          — geen image, alleen copy
 //
 // Architectuur:
 //   1. Claude Sonnet 4 → genereert primary_text, headline,
 //      description, call_to_action, targeting_hints
-//   2. (optioneel) Gemini → genereert image creative
+//   2. Image bron bepalen op basis van imageMode:
+//      - ai_generated: Gemini call
+//      - product_image: haal image_url op uit products tabel
+//      - uploaded: gebruik direct de meegegeven base64 data URL
+//      - none: skip image
 //   3. Schrijft naar meta_creatives met status='draft'
-//
-// In PR 3b breidt de publish-worker dit uit met een 'publish' flow
-// die de creative pakt en als campaign/adset/ad naar Meta pusht.
 // ============================================================
 
 import { db }                from '../../../infrastructure/database/connection';
@@ -28,29 +35,32 @@ const anthropic = new (Anthropic.default ?? Anthropic)();
 
 export type MetaFormat   = 'single_image' | 'carousel' | 'video' | 'story';
 export type MetaPlacement = 'feed' | 'stories' | 'reels';
+export type ImageMode    = 'ai_generated' | 'product_image' | 'uploaded' | 'none';
 
 export interface GenerateMetaCreativeInput {
   tenantId:         string;
   integrationId:    string;
   adAccountDbId:    string;
   format:           MetaFormat;
-  prompt:           string;                 // user prompt: "Maak ad voor wintercollectie"
+  prompt:           string;                 // user prompt
   productId?:       string;                 // optioneel: koppel aan bestaand product
   language?:        'nl' | 'en';
-  tone?:            string;                 // 'urgent' | 'lifestyle' | 'educational' | etc.
-  generateImage?:   boolean;                // standaard: true voor single_image, false voor video
-  brandContext?:    string;                 // extra context, max 500 chars
-  callToAction?:    string;                 // override CTA (anders bepaalt AI)
+  tone?:            string;
+  imageMode?:       ImageMode;              // PR 3a.2: 4 modi
+  uploadedImage?:   string;                 // base64 data URL (voor imageMode='uploaded')
+  brandContext?:    string;
+  callToAction?:    string;
 }
 
 export interface GeneratedMetaCreative {
-  creativeId:      string;                  // UUID van de meta_creatives rij
+  creativeId:      string;
   primaryText:     string;
   headline:        string;
   description:     string;
   callToAction:    string;
-  targetingHints?: string[];                // suggesties voor targeting (vrije tekst)
-  imageUrl?:       string;                  // base64 data URL als image gegenereerd
+  targetingHints?: string[];
+  imageUrl?:       string;
+  imageSource?:    string;                  // 'ai_generated' | 'product_image' | 'uploaded' | 'none'
   format:          MetaFormat;
   status:          'draft';
 }
@@ -67,7 +77,6 @@ interface ProductContext {
 }
 
 // ── Lijst van geldige Meta CTA-knoppen ────────────────────────
-// (volgens Meta Marketing API documentatie)
 export const META_CTA_OPTIONS = [
   'SHOP_NOW',      'LEARN_MORE',  'SIGN_UP',     'GET_OFFER',
   'BOOK_TRAVEL',   'CONTACT_US',  'DOWNLOAD',    'DONATE_NOW',
@@ -83,16 +92,19 @@ async function loadProductContext(
   productId: string,
 ): Promise<ProductContext | null> {
   const result = await db.query(
-    `SELECT p.id, p.title, p.price_min, p.platform, p.image_url,
+    `SELECT p.id, p.title, p.price_min,
+            COALESCE(ti.platform_slug, 'unknown') AS platform,
+            p.image_url,
             COALESCE(SUM(li.quantity), 0)    AS units_sold,
             COALESCE(SUM(li.total_price), 0) AS total_revenue
      FROM products p
+     LEFT JOIN tenant_integrations ti ON ti.id = p.integration_id
      LEFT JOIN order_line_items li
        ON li.product_id = p.id::text
        AND li.tenant_id = p.tenant_id
        AND li.created_at >= NOW() - INTERVAL '30 days'
      WHERE p.id = $1 AND p.tenant_id = $2
-     GROUP BY p.id`,
+     GROUP BY p.id, ti.platform_slug`,
     [productId, tenantId],
     { allowNoTenant: true },
   );
@@ -182,6 +194,13 @@ Return ONLY valid JSON, no markdown, no commentary:
 }`;
 }
 
+// ── Helper: bepaal aspect ratio op basis van format ───────────
+function aspectRatioForFormat(format: MetaFormat): string {
+  if (format === 'story') return '9:16';
+  if (format === 'video') return '16:9';
+  return '1:1';
+}
+
 // ── Hoofdfunctie ──────────────────────────────────────────────
 export async function generateMetaCreative(
   input: GenerateMetaCreativeInput,
@@ -192,7 +211,8 @@ export async function generateMetaCreative(
     format, prompt, productId,
     language     = 'nl',
     tone         = 'lifestyle',
-    generateImage,
+    imageMode    = 'ai_generated',
+    uploadedImage,
     brandContext,
     callToAction,
   } = input;
@@ -201,6 +221,7 @@ export async function generateMetaCreative(
     tenantId, integrationId, format,
     promptLength: prompt.length,
     hasProduct:   !!productId,
+    imageMode,
   });
 
   // Stap 1: optioneel product ophalen
@@ -208,6 +229,21 @@ export async function generateMetaCreative(
   if (productId) {
     const loaded = await loadProductContext(tenantId, productId);
     product = loaded ?? undefined;
+  }
+
+  // Validatie image mode
+  if (imageMode === 'product_image' && !product?.imageUrl) {
+    throw Object.assign(
+      new Error('Product image mode geselecteerd maar product heeft geen image. Selecteer een Shopify product met foto, of kies een andere image-modus.'),
+      { httpStatus: 400 }
+    );
+  }
+
+  if (imageMode === 'uploaded' && !uploadedImage) {
+    throw Object.assign(
+      new Error('Upload mode geselecteerd maar geen afbeelding meegegeven.'),
+      { httpStatus: 400 }
+    );
   }
 
   // Stap 2: Claude → ad copy
@@ -249,7 +285,7 @@ export async function generateMetaCreative(
   }
 
   // Sanitize: enforce max lengths zoals Meta die hanteert
-  parsed.primary_text = (parsed.primary_text ?? '').slice(0, 500);  // veilig boven Meta limiet
+  parsed.primary_text = (parsed.primary_text ?? '').slice(0, 500);
   parsed.headline     = (parsed.headline    ?? '').slice(0, 100);
   parsed.description  = (parsed.description ?? '').slice(0, 100);
 
@@ -260,48 +296,69 @@ export async function generateMetaCreative(
     cta = 'LEARN_MORE';
   }
 
-  // Stap 3: optioneel image genereren via Gemini
+  // Stap 3: image bepalen op basis van imageMode
   let imageUrl: string | undefined;
   let imagePrompt: string | undefined;
-  let aspectRatio: string | undefined;
+  let imageSource: ImageMode = imageMode;
+  const aspectRatio = aspectRatioForFormat(format);
 
-  const shouldGenerateImage = generateImage ?? (format === 'single_image' || format === 'story');
+  if (format === 'video') {
+    // Video heeft geen image, alleen copy
+    imageSource = 'none';
+  } else {
+    switch (imageMode) {
+      case 'ai_generated': {
+        try {
+          const nbFormat: 'single' | 'story' | 'carousel' =
+            format === 'single_image' ? 'single' :
+            format === 'story'        ? 'story'  :
+                                        'carousel';
 
-  if (shouldGenerateImage && format !== 'video') {
-    try {
-      // Map MetaFormat → nano-banana format
-      const nbFormat: 'single' | 'story' | 'carousel' = format === 'single_image' ? 'single'
-                                                       : format === 'story'        ? 'story'
-                                                       :                              'carousel';
+          const imageResult = await generateAdCreative({
+            product: {
+              title:        product?.title ?? prompt.slice(0, 60),
+              description:  product?.description,
+              price:        product?.price,
+              platform:     'meta',
+              revenue30d:   product?.revenue30d,
+              sold30d:      product?.unitsSold30d,
+              imageUrl:     product?.imageUrl,  // Gemini gebruikt deze als referentie
+            },
+            format:     nbFormat,
+            platform:   'meta',
+            style:      'product-focus',
+            brandColor: '#4f46e5',
+          });
 
-      const imageResult = await generateAdCreative({
-        product: {
-          title:        product?.title ?? prompt.slice(0, 60),
-          description:  product?.description,
-          price:        product?.price,
-          platform:     'meta',
-          revenue30d:   product?.revenue30d,
-          sold30d:      product?.unitsSold30d,
-          imageUrl:     product?.imageUrl,
-        },
-        format:       nbFormat,
-        platform:     'meta',
-        style:        'product-focus',
-        brandColor:   '#4f46e5',
-      });
+          imageUrl    = imageResult.imageUrl;
+          imagePrompt = imageResult.prompt;
+        } catch (err) {
+          logger.warn('meta.creative.image_gen_failed', {
+            tenantId,
+            error: (err as Error).message,
+          });
+          // Best-effort: copy gaat door zonder image
+          imageSource = 'none';
+        }
+        break;
+      }
 
-      imageUrl    = imageResult.imageUrl;
-      imagePrompt = imageResult.prompt;
-      aspectRatio = imageResult.aspectRatio;
+      case 'product_image': {
+        // We weten al dat product.imageUrl bestaat (validatie hierboven)
+        imageUrl    = product!.imageUrl;
+        imagePrompt = `Product image van ${product!.title} (geen AI generatie)`;
+        break;
+      }
 
-    } catch (err) {
-      // Image generatie is best-effort — als het mislukt gaat de copy
-      // wel mee als draft, gebruiker kan later opnieuw genereren of
-      // zelf een afbeelding uploaden in PR 3b.
-      logger.warn('meta.creative.image_gen_failed', {
-        tenantId,
-        error: (err as Error).message,
-      });
+      case 'uploaded': {
+        imageUrl    = uploadedImage;
+        imagePrompt = `Door gebruiker geüploade afbeelding`;
+        break;
+      }
+
+      case 'none':
+        // Niets te doen
+        break;
     }
   }
 
@@ -334,11 +391,12 @@ export async function generateMetaCreative(
         language,
         tone,
         brand_context:   brandContext ?? null,
+        image_source:    imageSource,
       }),
       productId ?? null,
       prompt,
       imagePrompt ?? null,
-      aspectRatio ?? null,
+      imageUrl ? aspectRatio : null,
     ],
     { allowNoTenant: true },
   );
@@ -349,6 +407,7 @@ export async function generateMetaCreative(
     tenantId,
     creativeId,
     format,
+    imageSource,
     hasImage:        !!imageUrl,
     primaryTextLen:  parsed.primary_text.length,
   });
@@ -361,6 +420,7 @@ export async function generateMetaCreative(
     callToAction:   cta,
     targetingHints: parsed.targeting_hints ?? [],
     imageUrl,
+    imageSource,
     format,
     status:         'draft',
   };
