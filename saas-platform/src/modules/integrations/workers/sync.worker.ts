@@ -1,13 +1,20 @@
 // ============================================================
 // src/modules/integrations/workers/sync.worker.ts
 //
-// FIX: malformed array literal: "[]"
-//   product.tags werd opgeslagen als JSON.stringify(tags) = '[]'
-//   maar de products.tags kolom is een TEXT[] PostgreSQL array.
-//   Fix: converteer naar PostgreSQL array literal '{item1,item2}'
-//   of NULL als de array leeg is.
+// FIXES:
+//   1. Bulk INSERT voor order line items (geen N+1 meer)
+//   2. Per-tenant concurrency guard via Redis SETNX
+//      (max 2 gelijktijdige sync jobs per tenant)
+//   3. Priority queuing: Scale=1, Growth=5, Starter=10
+//   4. FIX: updatedAfter gebruikt nu ook last_sync_at van de
+//      integratie zelf als fallback, zodat incremental sync
+//      altijd een zinvolle tijdsvenster heeft — ook als er
+//      nog geen completed full_sync is.
 //
-// FIX: order.tags zelfde probleem opgelost.
+// PR 3a.1 UPDATE: image_url wordt nu opgeslagen in products
+// tabel. Voor Shopify komt deze uit normalizeProduct (zie
+// shopify.connector.ts). Bol.com en andere platforms hebben
+// (nog) geen image URL — blijft NULL.
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
@@ -44,19 +51,6 @@ export interface WebhookJobPayload {
   payload:       Record<string, unknown>;
 }
 
-// ── Helper: converteer JS array naar PostgreSQL array literal ─
-// PostgreSQL TEXT[] verwacht: '{item1,item2}' of NULL
-// NIET: '["item1","item2"]' (JSON) of '[]' (lege JSON array)
-function toPostgresArray(arr: unknown): string | null {
-  if (!arr || !Array.isArray(arr) || arr.length === 0) return null;
-  // Escape items: vervang dubbele quotes en backslashes
-  const escaped = arr.map((item: unknown) => {
-    const str = String(item ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    return `"${str}"`;
-  });
-  return `{${escaped.join(',')}}`;
-}
-
 // ── Redis connectie voor BullMQ ───────────────────────────────
 function buildBullMQConnection() {
   const url = process.env.REDIS_URL;
@@ -75,6 +69,7 @@ function buildBullMQConnection() {
     maxRetriesPerRequest: null,
     enableOfflineQueue:   true,
     lazyConnect:          false,
+    family:               4,
     retryStrategy: (times: number) => {
       if (times > 10) return null;
       return Math.min(times * 500, 5000);
@@ -84,33 +79,53 @@ function buildBullMQConnection() {
 
 const bullConnection = buildBullMQConnection();
 
-export const syncQueue = new Queue<SyncJobPayload>('integration-sync', {
-  connection: bullConnection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 5000 },
-    removeOnComplete: { count: 100 },
-    removeOnFail:     { count: 50 },
-  },
-});
+// ── Queues ────────────────────────────────────────────────────
+export const syncQueue    = new Queue<SyncJobPayload>('integration-sync',      { connection: bullConnection });
+export const webhookQueue = new Queue<WebhookJobPayload>('integration-webhook', { connection: bullConnection });
 
 // ── Per-tenant concurrency guard ──────────────────────────────
 const MAX_CONCURRENT_PER_TENANT = 2;
 
 async function acquireTenantSlot(tenantId: string): Promise<boolean> {
-  const key     = `sync:slots:${tenantId}`;
-  const current = await rawRedis.incr(key);
-  await rawRedis.expire(key, 300); // 5 min TTL
-  if (current > MAX_CONCURRENT_PER_TENANT) {
-    await rawRedis.decr(key);
-    return false;
+  const key = `sync:concurrent:${tenantId}`;
+  try {
+    const current = await rawRedis.incr(key);
+    if (current === 1) await rawRedis.expire(key, 3600);
+    if (current > MAX_CONCURRENT_PER_TENANT) {
+      await rawRedis.decr(key);
+      return false;
+    }
+    return true;
+  } catch {
+    return true;
   }
-  return true;
 }
 
 async function releaseTenantSlot(tenantId: string): Promise<void> {
-  const key = `sync:slots:${tenantId}`;
-  await rawRedis.decr(key);
+  const key = `sync:concurrent:${tenantId}`;
+  try {
+    const val = await rawRedis.decr(key);
+    if (val <= 0) await rawRedis.del(key);
+  } catch {}
+}
+
+// ── Platform rate limiter ─────────────────────────────────────
+async function acquireRateLimit(platformSlug: string, integrationId: string): Promise<void> {
+  const key   = `ratelimit:sync:${platformSlug}:${integrationId}`;
+  const limit = getRateLimit(platformSlug);
+  try {
+    const current = await rawRedis.incr(key);
+    if (current === 1) await rawRedis.expire(key, 1);
+    if (current > limit) await new Promise(r => setTimeout(r, 1000));
+  } catch {}
+}
+
+function getRateLimit(platform: string): number {
+  const limits: Record<string, number> = {
+    shopify: 2, woocommerce: 10, lightspeed: 5,
+    magento: 10, bigcommerce: 10, bolcom: 3,
+  };
+  return limits[platform] ?? 5;
 }
 
 // ── Prioriteit op basis van plan ──────────────────────────────
@@ -215,37 +230,50 @@ export const syncWorker = new Worker<SyncJobPayload>(
         { tenantId, tenantSlug: '', userId: 'sync-worker', planSlug: (planSlug ?? 'starter') as PlanSlug, traceId: uuidv4(), requestStartedAt: new Date() },
         async () => {
 
-          // FIX: updatedAfter bepalen voor incremental sync
-          let updatedAfter: Date | undefined;
+          // FIX: updatedAfter bepalen voor incremental sync.
+          // Strategie: gebruik de meest recente van:
+          //   1. MAX(completed_at) van enige completed sync job
+          //   2. last_sync_at van de integratie zelf
+          // Zo heeft de incremental sync altijd een zinvol tijdsvenster,
+          // ook als er nog geen completed full_sync is.
+          let updatedAfter: Date | undefined = undefined;
+
           if (jobType === 'incremental') {
-            const lastSync = await db.query(
+            const lastSyncRow = await db.query(
               `SELECT GREATEST(
                  MAX(isj.completed_at),
                  ti.last_sync_at
-               ) AS last_synced
-               FROM integration_sync_jobs isj
-               RIGHT JOIN tenant_integrations ti ON ti.id = $1
-               WHERE (isj.integration_id = $1 AND isj.status = 'completed')
-                  OR isj.id IS NULL
+               ) AS last_sync_at
+               FROM tenant_integrations ti
+               LEFT JOIN integration_sync_jobs isj
+                 ON isj.integration_id = ti.id
+                 AND isj.status = 'completed'
+               WHERE ti.id = $1
                GROUP BY ti.last_sync_at`,
-              [integrationId],
-              { allowNoTenant: true }
+              [integrationId], { allowNoTenant: true }
             );
-            const lastSynced = lastSync.rows[0]?.last_synced;
-            updatedAfter = lastSynced
-              ? new Date(lastSynced)
-              : new Date(Date.now() - 60 * 60 * 1000); // fallback: 1 uur terug
+
+            const lastSyncAt = lastSyncRow.rows[0]?.last_sync_at;
+            if (lastSyncAt) {
+              updatedAfter = new Date(lastSyncAt);
+              logger.info('sync.incremental.window', {
+                integrationId,
+                updatedAfter: updatedAfter.toISOString(),
+                minutesAgo: Math.round((Date.now() - updatedAfter.getTime()) / 60000),
+              });
+            }
           }
+
+          await acquireRateLimit(platformSlug, integrationId);
 
           let totalOrders   = 0;
           let totalProducts = 0;
 
-          // ── Orders ───────────────────────────────────────────
+          // ── Orders ──────────────────────────────────────────
           let orderPage: number | string | undefined = 1;
           while (orderPage !== undefined) {
             const result = await connector.fetchOrders(credentials, {
               updatedAfter,
-              jobType,
               page:   typeof orderPage === 'number' ? orderPage : undefined,
               cursor: typeof orderPage === 'string' ? orderPage : undefined,
             });
@@ -277,8 +305,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
                   order.shippingAmount, order.discountAmount, order.currency,
                   order.status, order.financialStatus || null, order.fulfillmentStatus || null,
                   order.customerEmailHash || null, order.isFirstOrder || null,
-                  // FIX: gebruik PostgreSQL array literal, niet JSON string
-                  toPostgresArray(order.tags),
+                  order.tags ? JSON.stringify(order.tags) : null,
                   order.note || null, order.source || null, order.orderedAt,
                 ],
                 { allowNoTenant: true }
@@ -311,8 +338,8 @@ export const syncWorker = new Worker<SyncJobPayload>(
                    tenant_id, integration_id, external_id, title, handle, status,
                    product_type, tags, vendor, total_inventory, requires_shipping,
                    price_min, price_max, published_at, updated_at,
-                   ean, condition, fulfillment_by
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                   ean, condition, fulfillment_by, image_url
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                  ON CONFLICT (tenant_id, integration_id, external_id)
                  DO UPDATE SET
                    title           = EXCLUDED.title,
@@ -323,14 +350,14 @@ export const syncWorker = new Worker<SyncJobPayload>(
                    ean             = COALESCE(EXCLUDED.ean, products.ean),
                    condition       = COALESCE(EXCLUDED.condition, products.condition),
                    fulfillment_by  = COALESCE(EXCLUDED.fulfillment_by, products.fulfillment_by),
+                   image_url       = COALESCE(EXCLUDED.image_url, products.image_url),
                    updated_at      = now(),
                    synced_at       = now()`,
                 [
                   tenantId, integrationId, product.externalId,
                   product.title, (product as any).handle ?? null,
                   product.status ?? 'active', (product as any).productType ?? null,
-                  // FIX: gebruik PostgreSQL array literal, niet JSON string
-                  toPostgresArray((product as any).tags),
+                  product.tags ? JSON.stringify(product.tags) : null,
                   (product as any).vendor ?? null,
                   product.totalInventory ?? 0, product.requiresShipping ?? true,
                   product.priceMin ?? null, product.priceMax ?? null,
@@ -338,6 +365,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
                   (product as any).ean ?? null,
                   (product as any).condition ?? 'NEW',
                   (product as any).fulfillmentBy ?? 'FBR',
+                  (product as any).imageUrl ?? null,
                 ],
                 { allowNoTenant: true }
               );
