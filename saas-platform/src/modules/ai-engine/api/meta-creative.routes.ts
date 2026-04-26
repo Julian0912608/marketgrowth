@@ -1,22 +1,14 @@
 // ============================================================
 // src/modules/ai-engine/api/meta-creative.routes.ts
 //
-// API endpoints voor Meta Ad Creative Studio:
+// API endpoints voor Meta Ad Creative Studio.
 //
-//   GET    /api/ai/meta-creative/ad-accounts
-//   GET    /api/ai/meta-creative/list
-//   POST   /api/ai/meta-creative/generate
-//   POST   /api/ai/meta-creative/:id/regenerate-image
-//   PATCH  /api/ai/meta-creative/:id
-//   DELETE /api/ai/meta-creative/:id
+// PR 3a.3 toevoegingen:
+//   POST /api/ai/meta-creative/suggest-concepts
+//   GET  /api/ai/meta-creative/products/:id/enrichment
+//   PUT  /api/ai/meta-creative/products/:id/enrichment
 //
-// PR 3a.2: GenerateSchema uitgebreid met imageMode + uploadedImage
-// voor 4 image modi (ai_generated, product_image, uploaded, none).
-//
-// Plan rules:
-//   - Starter:  geen toegang
-//   - Growth:   toegang, valt onder 'ai-recommendations' credit pool
-//   - Scale:    unlimited
+// Bestaande endpoints blijven werken zoals voorheen.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -33,6 +25,10 @@ import {
   MetaFormat,
   ImageMode,
 } from '../services/meta-creative-generator';
+import {
+  suggestConcepts,
+  CONCEPT_ANGLES,
+} from '../services/meta-ad-set-generator';
 
 const router = Router();
 router.use(tenantMiddleware());
@@ -101,10 +97,8 @@ const GenerateSchema = z.object({
   language:       z.enum(['nl', 'en']).default('nl'),
   tone:           z.string().max(50).default('lifestyle'),
   imageMode:      z.enum(IMAGE_MODES).default('ai_generated'),
-  // Base64 data URL voor uploaded image. Limit 5MB om DB en
-  // request body niet te overbelasten. Format: 'data:image/jpeg;base64,...'
   uploadedImage:  z.string()
-                    .max(7_000_000) // ~5MB ruwe binary = ~7MB base64
+                    .max(7_000_000)
                     .regex(/^data:image\/(jpeg|jpg|png|webp);base64,/, 'Moet een data:image base64 URL zijn')
                     .optional(),
   brandContext:   z.string().max(500).optional(),
@@ -117,6 +111,27 @@ const UpdateSchema = z.object({
   description:     z.string().max(100).optional(),
   call_to_action:  z.enum(META_CTA_OPTIONS).optional(),
   link_url:        z.string().url().max(500).nullable().optional(),
+});
+
+// PR 3a.3
+const SuggestConceptsSchema = z.object({
+  productId:       z.string().uuid(),
+  campaignBrief:   z.string().min(5).max(1000),
+  funnelStage:     z.enum(['cold', 'warm', 'hot']).optional(),
+  audienceHint:    z.string().max(300).optional(),
+  urgencyContext:  z.string().max(300).optional(),
+  promoContext:    z.string().max(300).optional(),
+  language:        z.enum(['nl', 'en']).default('nl'),
+  tone:            z.string().max(50).optional(),
+});
+
+// PR 3a.3 — voor enrichment UI in PR 3a.4
+const EnrichmentSchema = z.object({
+  target_audience: z.string().max(500).optional().nullable(),
+  key_benefits:    z.array(z.string().max(200)).max(10).optional(),
+  pain_points:     z.array(z.string().max(200)).max(10).optional(),
+  brand_story:     z.string().max(1000).optional().nullable(),
+  use_cases:       z.array(z.string().max(150)).max(10).optional(),
 });
 
 // ── GET /api/ai/meta-creative/ad-accounts ────────────────────
@@ -150,6 +165,8 @@ router.get('/ad-accounts', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ── GET /api/ai/meta-creative/list ───────────────────────────
+// Toont alleen STANDALONE creatives (ad_set_id IS NULL).
+// Campaigns hebben hun eigen endpoint (komt in PR 3a.5).
 router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -165,6 +182,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
        LEFT JOIN products p ON p.id = mc.source_product_id
        WHERE mc.tenant_id = $1
          AND mc.is_archived = false
+         AND mc.ad_set_id IS NULL
        ORDER BY mc.created_at DESC
        LIMIT 100`,
       [tenantId],
@@ -193,6 +211,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ── POST /api/ai/meta-creative/generate ──────────────────────
+// Quick mode (1 ad). Blijft werken zoals voorheen.
 router.post('/generate', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -200,7 +219,6 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
 
     const input = validate(GenerateSchema, req.body);
 
-    // Vind primair Meta ad account voor deze tenant
     const accountResult = await db.query(
       `SELECT ma.id, ma.integration_id
        FROM meta_ad_accounts ma
@@ -236,11 +254,6 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
       callToAction:  input.callToAction,
     });
 
-    // Credits per modus:
-    //   - ai_generated: 3 (copy + Gemini)
-    //   - product_image: 1 (alleen copy)
-    //   - uploaded: 1 (alleen copy)
-    //   - none: 1 (alleen copy)
     const creditCost = input.imageMode === 'ai_generated' ? 3 : 1;
     await trackCreditUsage(tenantId, creditCost);
 
@@ -255,6 +268,155 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
     });
     next(err);
   }
+});
+
+// ── POST /api/ai/meta-creative/suggest-concepts (PR 3a.3) ────
+// AI stelt 5 concept-angles voor op basis van product context + brief.
+// Dit is stap 3 van de Campaign wizard.
+router.post('/suggest-concepts', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+    if (!requireGrowthOrAbove(planSlug, res)) return;
+
+    const input = validate(SuggestConceptsSchema, req.body);
+
+    const result = await suggestConcepts({
+      tenantId,
+      productId:       input.productId,
+      campaignBrief:   input.campaignBrief,
+      funnelStage:     input.funnelStage,
+      audienceHint:    input.audienceHint,
+      urgencyContext:  input.urgencyContext,
+      promoContext:    input.promoContext,
+      language:        input.language,
+      tone:            input.tone,
+    });
+
+    // Concept suggestion = 2 credits
+    await trackCreditUsage(tenantId, 2);
+
+    res.json({
+      ...result,
+      creditsUsed: 2,
+      availableAngles: CONCEPT_ANGLES,
+    });
+  } catch (err) {
+    logger.error('meta.suggest_concepts.error', {
+      error: (err as Error).message,
+      stack: (err as Error).stack?.slice(0, 300),
+    });
+    next(err);
+  }
+});
+
+// ── GET /api/ai/meta-creative/products/:id/enrichment ────────
+router.get('/products/:id/enrichment', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+    if (!requireGrowthOrAbove(planSlug, res)) return;
+
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig product ID' });
+      return;
+    }
+
+    // Check product exists for this tenant
+    const productCheck = await db.query(
+      `SELECT id, title FROM products WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, tenantId],
+    );
+    if (!productCheck.rows[0]) {
+      res.status(404).json({ error: 'Product niet gevonden' });
+      return;
+    }
+
+    const result = await db.query(
+      `SELECT target_audience, key_benefits, pain_points, brand_story, use_cases,
+              created_at, updated_at
+       FROM product_enrichment
+       WHERE tenant_id = $1 AND product_id = $2`,
+      [tenantId, req.params.id],
+    );
+
+    if (!result.rows[0]) {
+      res.json({
+        productId: req.params.id,
+        productTitle: productCheck.rows[0].title,
+        enrichment: null,
+      });
+      return;
+    }
+
+    res.json({
+      productId: req.params.id,
+      productTitle: productCheck.rows[0].title,
+      enrichment: {
+        targetAudience: result.rows[0].target_audience,
+        keyBenefits:    result.rows[0].key_benefits ?? [],
+        painPoints:     result.rows[0].pain_points ?? [],
+        brandStory:     result.rows[0].brand_story,
+        useCases:       result.rows[0].use_cases ?? [],
+        createdAt:      result.rows[0].created_at,
+        updatedAt:      result.rows[0].updated_at,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// ── PUT /api/ai/meta-creative/products/:id/enrichment ────────
+router.put('/products/:id/enrichment', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, userId, planSlug } = getTenantContext();
+    if (!requireGrowthOrAbove(planSlug, res)) return;
+
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig product ID' });
+      return;
+    }
+
+    const productCheck = await db.query(
+      `SELECT id FROM products WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, tenantId],
+    );
+    if (!productCheck.rows[0]) {
+      res.status(404).json({ error: 'Product niet gevonden' });
+      return;
+    }
+
+    const input = validate(EnrichmentSchema, req.body);
+
+    await db.query(
+      `INSERT INTO product_enrichment
+         (tenant_id, product_id, target_audience, key_benefits, pain_points,
+          brand_story, use_cases, enriched_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (tenant_id, product_id)
+       DO UPDATE SET
+         target_audience = EXCLUDED.target_audience,
+         key_benefits    = EXCLUDED.key_benefits,
+         pain_points     = EXCLUDED.pain_points,
+         brand_story     = EXCLUDED.brand_story,
+         use_cases       = EXCLUDED.use_cases,
+         enriched_by     = EXCLUDED.enriched_by,
+         updated_at      = now()`,
+      [
+        tenantId,
+        req.params.id,
+        input.target_audience ?? null,
+        input.key_benefits ?? null,
+        input.pain_points ?? null,
+        input.brand_story ?? null,
+        input.use_cases ?? null,
+        userId,
+      ],
+    );
+
+    logger.info('meta.product_enrichment.saved', {
+      tenantId, productId: req.params.id, userId,
+    });
+
+    res.json({ success: true });
+  } catch (err) { next(err); }
 });
 
 // ── POST /api/ai/meta-creative/:id/regenerate-image ─────────
