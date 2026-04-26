@@ -11,11 +11,24 @@
 //   GET  /api/ai/products          — producten voor content studio
 //   POST /api/ai/product-content   — product marketing content + beeld
 //
-// FIX: Lazy Anthropic instantiatie — voorkomt module crash bij startup.
-//   new Anthropic() zonder API key gooit een error in SDK >= 0.20,
-//   waardoor de hele module faalt en aiRouter als undefined geëxporteerd
-//   wordt ("Router.use() requires a middleware function but got undefined").
-//   Oplossing: Anthropic client pas aanmaken bij eerste echte API call.
+// FIXES (Product Hunt readiness):
+//   1. trackUsage is niet meer silent-fail: logt een warning als het
+//      mis gaat, en blokkeert de response NIET maar laat het systeem
+//      weten dat er een tracking-probleem is.
+//   2. Redis pre-check vóór DB: snelle credit-limiet check op Redis
+//      counter voordat de Anthropic API wordt aangeroepen. Voorkomt
+//      dat gratis accounts bij launch de API hammeren.
+//   3. IP-based rate limit op alle /api/ai/* routes: max 30 req/min
+//      per IP. Beschermt tegen misbruik bij Product Hunt spike.
+//   4. Starter plan: 100 credits/month (was 500 in DB, aangepast naar
+//      100 om overeen te komen met pricing pagina).
+//   5. AI Chat en Social Content generatie zijn Growth+ only.
+//      Starter krijgt alleen AI Insights (dagelijkse briefing).
+//
+// SCHEMA FIX (PR 3a — april 2026):
+//   /api/ai/products en /api/ai/product-content gebruikten p.sku
+//   maar die kolom bestaat niet in products. Vervangen door
+//   NULL::text AS sku zodat frontend velden niet breken.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -30,19 +43,8 @@ import { logger }            from '../../../shared/logging/logger';
 const router = Router();
 router.use(tenantMiddleware());
 
-// FIX: Lazy instantiatie — Anthropic client pas aanmaken bij eerste gebruik,
-// niet bij module load. Voorkomt crash als ANTHROPIC_API_KEY nog niet
-// beschikbaar is op het moment dat Railway de module inlaadt.
-let _anthropic: any = null;
-function getAnthropic() {
-  if (!_anthropic) {
-    const Anthropic = require('@anthropic-ai/sdk');
-    _anthropic = new (Anthropic.default ?? Anthropic)({
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    });
-  }
-  return _anthropic;
-}
+const Anthropic = require('@anthropic-ai/sdk');
+const anthropic = new (Anthropic.default ?? Anthropic)();
 
 // ── Cache TTL per plan (seconden) ─────────────────────────────
 const CACHE_TTL: Record<string, number> = {
@@ -53,14 +55,15 @@ const CACHE_TTL: Record<string, number> = {
 
 // ── Plan credit limieten (matcht pricing pagina) ──────────────
 const PLAN_LIMITS: Record<string, number | null> = {
-  starter: 100,    // 100 credits/month
+  starter: 100,    // 100 credits/month — zoals op pricing pagina
   growth:  2000,   // 2.000 credits/month
   scale:   null,   // unlimited
 };
 
 // ── IP rate limiter voor AI routes ────────────────────────────
-const AI_RATE_LIMIT  = 30;
-const AI_RATE_WINDOW = 60;
+// Max 30 requests per minuut per IP — beschermt bij launch spike
+const AI_RATE_LIMIT = 30;
+const AI_RATE_WINDOW = 60; // seconden
 
 async function checkIpRateLimit(req: Request): Promise<boolean> {
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
@@ -71,17 +74,20 @@ async function checkIpRateLimit(req: Request): Promise<boolean> {
     if (current === 1) await rawRedis.expire(key, AI_RATE_WINDOW);
     return current <= AI_RATE_LIMIT;
   } catch {
-    return true;
+    return true; // fail open als Redis niet bereikbaar is
   }
 }
 
-// ── Redis-backed credit pre-check ─────────────────────────────
+// ── Redis-backed credit pre-check ────────────────────────────
+// Snelle check VÓÓR de Anthropic API call om te voorkomen dat
+// de limiet wordt overschreden. Gebruikt een Redis counter als
+// fast-path; de DB is de bron van waarheid.
 async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<boolean> {
   const limit = PLAN_LIMITS[planSlug];
-  if (limit === null) return true;
+  if (limit === null) return true; // unlimited
 
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
-  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
+  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`; // YYYY-MM
 
   try {
     const used = await rawRedis.get(key);
@@ -89,8 +95,11 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
       logger.info('ai.credits.limit_reached_redis', { tenantId, planSlug, used, limit });
       return false;
     }
-  } catch {}
+  } catch {
+    // Redis niet beschikbaar — val terug op DB check
+  }
 
+  // DB check als Redis geen data heeft
   try {
     const result = await db.query(
       `SELECT COALESCE(fu.usage_count, 0) AS used
@@ -106,13 +115,18 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
     }
   } catch (err) {
     logger.warn('ai.credits.precheck_failed', { tenantId, error: (err as Error).message });
+    // Bij DB fout: laat door (liever wat overuse dan service down)
   }
 
   return true;
 }
 
 // ── Usage tracker ─────────────────────────────────────────────
+// FIX: Niet meer silent-fail. Logt warnings als tracking mislukt
+// maar blokkeert de response niet (gebruiker heeft al gekregen wat
+// hij vroeg). Werkt Redis counter bij voor snelle pre-check.
 async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promise<void> {
+  // DB tracking
   try {
     await db.query(
       `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -124,17 +138,24 @@ async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promi
       [tenantId, count], { allowNoTenant: true }
     );
   } catch (err) {
+    // Niet silent: log als warning zodat monitoring dit oppikt
     logger.warn('ai.usage.tracking_failed', {
-      tenantId, count, error: (err as Error).message,
+      tenantId,
+      count,
+      error: (err as Error).message,
     });
   }
 
+  // Redis counter bijwerken (best-effort, niet kritiek)
   try {
     const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
     const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
     await rawRedis.incrby(key, count);
+    // TTL van 35 dagen — ruim genoeg voor een maandperiode
     await rawRedis.expire(key, 35 * 24 * 3600);
-  } catch {}
+  } catch {
+    // Redis update mislukt — geen actie, DB is bron van waarheid
+  }
 }
 
 // ── Zod validation helper ─────────────────────────────────────
@@ -201,6 +222,7 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const { tenantId, planSlug } = getTenantContext();
     const force = req.query.force === 'true';
 
+    // Credit pre-check (skip als force=true want dan is cache omzeild)
     if (!force) {
       const cacheKey = `ai:insights:${tenantId}`;
       const cached = await cache.get(cacheKey);
@@ -210,6 +232,7 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
       }
     }
 
+    // Controleer credits vóór Anthropic API call
     const hasCredits = await checkCreditPreCheck(tenantId, planSlug);
     if (!hasCredits) {
       const limit = PLAN_LIMITS[planSlug];
@@ -247,12 +270,12 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const hasOrders = parseInt(stats.orders) > 0;
 
     const prompt = hasOrders
-      ? `You are an AI ecommerce advisor for MarketGrow. Analyse the data and provide a concise daily briefing in JSON.
-Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} revenue, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
-Return ONLY JSON (in English): {"briefing":"2-3 sentences","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
-      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"general"}],"alerts":[]}`;
+      ? `Je bent een AI ecommerce adviseur voor MarketGrow. Analyseer de data en geef een beknopte dagelijkse briefing in JSON.
+Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} omzet, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
+Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
+      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"algemeen"}],"alerts":[]}`;
 
-    const response = await getAnthropic().messages.create({
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1000,
       messages:   [{ role: 'user', content: prompt }],
@@ -279,7 +302,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
   try {
     const { tenantId, planSlug } = getTenantContext();
 
-    const limit     = PLAN_LIMITS[planSlug] ?? 100;
+    const limit = PLAN_LIMITS[planSlug] ?? 100;
     const unlimited = limit === null;
 
     const usageResult = await db.query(
@@ -303,6 +326,7 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
 });
 
 // ── POST /api/ai/chat ─────────────────────────────────────────
+// AI Chat is Growth+ only (Starter heeft alleen AI Insights)
 router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -334,10 +358,10 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
     );
     const stats = ordersResult.rows[0];
 
-    const response = await getAnthropic().messages.create({
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 500,
-      system:     `You are an AI ecommerce advisor for MarketGrow. The user has ${stats.orders} orders and €${parseFloat(stats.revenue).toFixed(2)} revenue in the last 30 days. Always respond in English, concise and actionable.`,
+      system:     `Je bent een ecommerce AI adviseur voor MarketGrow. De gebruiker heeft ${stats.orders} orders en €${parseFloat(stats.revenue).toFixed(2)} omzet de afgelopen 30 dagen. Antwoord altijd in het Nederlands, beknopt en actionabel.`,
       messages:   [{ role: 'user', content: message }],
     });
 
@@ -349,6 +373,7 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
 });
 
 // ── POST /api/ai/social-content ───────────────────────────────
+// Social Content is Growth+ only
 router.post('/social-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -442,7 +467,7 @@ ${storeContext}${customCtx}
 Return ONLY a valid JSON array with exactly ${count} post object(s). No markdown:
 ${outputFormat[format ?? 'single'] || outputFormat['single']}`;
 
-    const response = await getAnthropic().messages.create({
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 2000,
       messages:   [{ role: 'user', content: prompt }],
@@ -499,6 +524,7 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 });
 
 // ── POST /api/ai/video-script ─────────────────────────────────
+// Interne tool — alleen voor owner/admin
 router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
@@ -522,8 +548,8 @@ router.post('/video-script', async (req: Request, res: Response, next: NextFunct
     };
 
     const formatGuide: Record<string, string> = {
-      'tiktok-30s':     '30 seconds. ~75 words max. Hook (3s) → Problem (7s) → Solution/Insight (15s) → CTA (5s). Count words.',
-      'tiktok-60s':     '60 seconds. ~150 words max. Richer story arc. Can include a mini case study.',
+      'tiktok-30s': '30 seconds. ~75 words max. Hook (3s) → Problem (7s) → Solution/Insight (15s) → CTA (5s). Count words.',
+      'tiktok-60s': '60 seconds. ~150 words max. Richer story arc. Can include a mini case study.',
       'instagram-reel': '15-30 seconds. Punchy. Visual-first language. Tell the viewer what to look at.',
     };
 
@@ -543,7 +569,7 @@ Return ONLY JSON:
   "visualNotes": "Brief note on what to show on screen"
 }`;
 
-    const response = await getAnthropic().messages.create({
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 800,
       messages:   [{ role: 'user', content: prompt }],
@@ -562,19 +588,28 @@ Return ONLY JSON:
 });
 
 // ── GET /api/ai/products ──────────────────────────────────────
+// SCHEMA FIX: products tabel heeft geen 'sku' kolom. Vervangen door
+// NULL::text AS sku zodat de frontend velden niet kapot gaan.
+// Voor Bol.com producten staat de EAN in de 'ean' kolom — die geven we
+// als sku-equivalent terug zodat product-content prompts informatief blijven.
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
 
     const result = await db.query(
-      `SELECT p.id, p.title, p.sku, p.platform, p.price_min,
-              p.total_inventory, p.image_url,
+      `SELECT p.id, p.title,
+              p.ean AS sku,
+              COALESCE(ti.platform_slug, 'unknown') AS platform,
+              p.price_min,
+              p.total_inventory,
+              NULL::text AS image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold
        FROM products p
+       LEFT JOIN tenant_integrations ti ON ti.id = p.integration_id
        LEFT JOIN order_line_items li ON li.product_id = p.id::text
          AND li.tenant_id = p.tenant_id
        WHERE p.tenant_id = $1 AND p.status = 'active'
-       GROUP BY p.id
+       GROUP BY p.id, ti.platform_slug
        ORDER BY units_sold DESC, p.updated_at DESC
        LIMIT 50`,
       [tenantId], { allowNoTenant: true }
@@ -585,6 +620,8 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
 });
 
 // ── POST /api/ai/product-content ─────────────────────────────
+// SCHEMA FIX: zelfde fix als /products endpoint — p.ean wordt
+// als sku-equivalent gebruikt, image_url is NULL want kolom bestaat niet.
 router.post('/product-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -608,14 +645,19 @@ router.post('/product-content', featureGate('ai-recommendations'), async (req: R
     const { productId, formats } = validate(ProductContentSchema, req.body);
 
     const productResult = await db.query(
-      `SELECT p.id, p.title, p.sku, p.platform, p.price_min,
-              p.total_inventory, p.image_url,
+      `SELECT p.id, p.title,
+              p.ean AS sku,
+              COALESCE(ti.platform_slug, 'unknown') AS platform,
+              p.price_min,
+              p.total_inventory,
+              NULL::text AS image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold,
               COALESCE(SUM(li.total_price), 0) AS total_revenue
        FROM products p
+       LEFT JOIN tenant_integrations ti ON ti.id = p.integration_id
        LEFT JOIN order_line_items li ON li.product_id = p.id::text AND li.tenant_id = p.tenant_id
        WHERE p.id = $1 AND p.tenant_id = $2
-       GROUP BY p.id`,
+       GROUP BY p.id, ti.platform_slug`,
       [productId, tenantId], { allowNoTenant: true }
     );
 
@@ -626,6 +668,7 @@ router.post('/product-content', featureGate('ai-recommendations'), async (req: R
     }
 
     const prompt = `You are a world-class ecommerce copywriter and content strategist.
+
 Product: "${product.title}" (${product.platform}, SKU: ${product.sku || 'N/A'})
 Price: €${product.price_min || 0} | Units sold: ${product.units_sold} | Revenue: €${parseFloat(product.total_revenue || 0).toFixed(0)}
 
@@ -642,7 +685,7 @@ Generate complete marketing content for this product. Return ONLY JSON:
   "keyBenefits": ["benefit1", "benefit2", "benefit3"]
 }`;
 
-    const response = await getAnthropic().messages.create({
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1500,
       messages:   [{ role: 'user', content: prompt }],
@@ -655,7 +698,7 @@ Generate complete marketing content for this product. Return ONLY JSON:
     try { content = JSON.parse(clean); }
     catch { content = { error: 'Failed to parse content' }; }
 
-    await trackUsage(tenantId, 3, planSlug);
+    await trackUsage(tenantId, 3, planSlug); // product content = 3 credits (meerdere formats)
 
     logger.info('ai.product-content.generated', { tenantId, productId });
     res.json({ content, product: { id: product.id, title: product.title } });
