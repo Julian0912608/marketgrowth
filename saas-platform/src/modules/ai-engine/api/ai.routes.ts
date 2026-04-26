@@ -11,24 +11,13 @@
 //   GET  /api/ai/products          — producten voor content studio
 //   POST /api/ai/product-content   — product marketing content + beeld
 //
-// FIXES (Product Hunt readiness):
-//   1. trackUsage is niet meer silent-fail: logt een warning als het
-//      mis gaat, en blokkeert de response NIET maar laat het systeem
-//      weten dat er een tracking-probleem is.
-//   2. Redis pre-check vóór DB: snelle credit-limiet check op Redis
-//      counter voordat de Anthropic API wordt aangeroepen. Voorkomt
-//      dat gratis accounts bij launch de API hammeren.
-//   3. IP-based rate limit op alle /api/ai/* routes: max 30 req/min
-//      per IP. Beschermt tegen misbruik bij Product Hunt spike.
-//   4. Starter plan: 100 credits/month (was 500 in DB, aangepast naar
-//      100 om overeen te komen met pricing pagina).
-//   5. AI Chat en Social Content generatie zijn Growth+ only.
-//      Starter krijgt alleen AI Insights (dagelijkse briefing).
+// SCHEMA FIXES:
+//   - p.sku → p.ean AS sku (Bol.com EAN als SKU equivalent)
+//   - p.platform → JOIN tenant_integrations voor platform_slug
 //
-// SCHEMA FIX (PR 3a — april 2026):
-//   /api/ai/products en /api/ai/product-content gebruikten p.sku
-//   maar die kolom bestaat niet in products. Vervangen door
-//   NULL::text AS sku zodat frontend velden niet breken.
+// PR 3a.1 UPDATE:
+//   - p.image_url is nu een echte kolom (na migration 007)
+//     dus geen NULL fallback meer nodig
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -48,22 +37,21 @@ const anthropic = new (Anthropic.default ?? Anthropic)();
 
 // ── Cache TTL per plan (seconden) ─────────────────────────────
 const CACHE_TTL: Record<string, number> = {
-  starter: 14400,   // 4 uur
-  growth:  3600,    // 1 uur
-  scale:   1800,    // 30 minuten
+  starter: 14400,
+  growth:  3600,
+  scale:   1800,
 };
 
-// ── Plan credit limieten (matcht pricing pagina) ──────────────
+// ── Plan credit limieten ──────────────────────────────────────
 const PLAN_LIMITS: Record<string, number | null> = {
-  starter: 100,    // 100 credits/month — zoals op pricing pagina
-  growth:  2000,   // 2.000 credits/month
-  scale:   null,   // unlimited
+  starter: 100,
+  growth:  2000,
+  scale:   null,
 };
 
 // ── IP rate limiter voor AI routes ────────────────────────────
-// Max 30 requests per minuut per IP — beschermt bij launch spike
 const AI_RATE_LIMIT = 30;
-const AI_RATE_WINDOW = 60; // seconden
+const AI_RATE_WINDOW = 60;
 
 async function checkIpRateLimit(req: Request): Promise<boolean> {
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
@@ -74,20 +62,17 @@ async function checkIpRateLimit(req: Request): Promise<boolean> {
     if (current === 1) await rawRedis.expire(key, AI_RATE_WINDOW);
     return current <= AI_RATE_LIMIT;
   } catch {
-    return true; // fail open als Redis niet bereikbaar is
+    return true;
   }
 }
 
 // ── Redis-backed credit pre-check ────────────────────────────
-// Snelle check VÓÓR de Anthropic API call om te voorkomen dat
-// de limiet wordt overschreden. Gebruikt een Redis counter als
-// fast-path; de DB is de bron van waarheid.
 async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<boolean> {
   const limit = PLAN_LIMITS[planSlug];
-  if (limit === null) return true; // unlimited
+  if (limit === null) return true;
 
   const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
-  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`; // YYYY-MM
+  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
 
   try {
     const used = await rawRedis.get(key);
@@ -99,7 +84,6 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
     // Redis niet beschikbaar — val terug op DB check
   }
 
-  // DB check als Redis geen data heeft
   try {
     const result = await db.query(
       `SELECT COALESCE(fu.usage_count, 0) AS used
@@ -115,18 +99,13 @@ async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<
     }
   } catch (err) {
     logger.warn('ai.credits.precheck_failed', { tenantId, error: (err as Error).message });
-    // Bij DB fout: laat door (liever wat overuse dan service down)
   }
 
   return true;
 }
 
 // ── Usage tracker ─────────────────────────────────────────────
-// FIX: Niet meer silent-fail. Logt warnings als tracking mislukt
-// maar blokkeert de response niet (gebruiker heeft al gekregen wat
-// hij vroeg). Werkt Redis counter bij voor snelle pre-check.
 async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promise<void> {
-  // DB tracking
   try {
     await db.query(
       `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -138,7 +117,6 @@ async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promi
       [tenantId, count], { allowNoTenant: true }
     );
   } catch (err) {
-    // Niet silent: log als warning zodat monitoring dit oppikt
     logger.warn('ai.usage.tracking_failed', {
       tenantId,
       count,
@@ -146,19 +124,14 @@ async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promi
     });
   }
 
-  // Redis counter bijwerken (best-effort, niet kritiek)
   try {
     const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
     const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
     await rawRedis.incrby(key, count);
-    // TTL van 35 dagen — ruim genoeg voor een maandperiode
     await rawRedis.expire(key, 35 * 24 * 3600);
-  } catch {
-    // Redis update mislukt — geen actie, DB is bron van waarheid
-  }
+  } catch {}
 }
 
-// ── Zod validation helper ─────────────────────────────────────
 function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
@@ -222,7 +195,6 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const { tenantId, planSlug } = getTenantContext();
     const force = req.query.force === 'true';
 
-    // Credit pre-check (skip als force=true want dan is cache omzeild)
     if (!force) {
       const cacheKey = `ai:insights:${tenantId}`;
       const cached = await cache.get(cacheKey);
@@ -232,7 +204,6 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
       }
     }
 
-    // Controleer credits vóór Anthropic API call
     const hasCredits = await checkCreditPreCheck(tenantId, planSlug);
     if (!hasCredits) {
       const limit = PLAN_LIMITS[planSlug];
@@ -326,7 +297,6 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
 });
 
 // ── POST /api/ai/chat ─────────────────────────────────────────
-// AI Chat is Growth+ only (Starter heeft alleen AI Insights)
 router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -373,7 +343,6 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
 });
 
 // ── POST /api/ai/social-content ───────────────────────────────
-// Social Content is Growth+ only
 router.post('/social-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -524,7 +493,6 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 });
 
 // ── POST /api/ai/video-script ─────────────────────────────────
-// Interne tool — alleen voor owner/admin
 router.post('/video-script', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
@@ -588,10 +556,7 @@ Return ONLY JSON:
 });
 
 // ── GET /api/ai/products ──────────────────────────────────────
-// SCHEMA FIX: products tabel heeft geen 'sku' kolom. Vervangen door
-// NULL::text AS sku zodat de frontend velden niet kapot gaan.
-// Voor Bol.com producten staat de EAN in de 'ean' kolom — die geven we
-// als sku-equivalent terug zodat product-content prompts informatief blijven.
+// PR 3a.1: gebruikt nu p.image_url uit migration 007
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -602,7 +567,7 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
               COALESCE(ti.platform_slug, 'unknown') AS platform,
               p.price_min,
               p.total_inventory,
-              NULL::text AS image_url,
+              p.image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold
        FROM products p
        LEFT JOIN tenant_integrations ti ON ti.id = p.integration_id
@@ -620,8 +585,7 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
 });
 
 // ── POST /api/ai/product-content ─────────────────────────────
-// SCHEMA FIX: zelfde fix als /products endpoint — p.ean wordt
-// als sku-equivalent gebruikt, image_url is NULL want kolom bestaat niet.
+// PR 3a.1: gebruikt nu p.image_url uit migration 007
 router.post('/product-content', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -650,7 +614,7 @@ router.post('/product-content', featureGate('ai-recommendations'), async (req: R
               COALESCE(ti.platform_slug, 'unknown') AS platform,
               p.price_min,
               p.total_inventory,
-              NULL::text AS image_url,
+              p.image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold,
               COALESCE(SUM(li.total_price), 0) AS total_revenue
        FROM products p
@@ -698,7 +662,7 @@ Generate complete marketing content for this product. Return ONLY JSON:
     try { content = JSON.parse(clean); }
     catch { content = { error: 'Failed to parse content' }; }
 
-    await trackUsage(tenantId, 3, planSlug); // product content = 3 credits (meerdere formats)
+    await trackUsage(tenantId, 3, planSlug);
 
     logger.info('ai.product-content.generated', { tenantId, productId });
     res.json({ content, product: { id: product.id, title: product.title } });
