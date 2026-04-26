@@ -1,15 +1,11 @@
 // saas-platform/src/modules/integrations/api/integration.routes.ts
 //
-// UPDATE: Meta Ads OAuth flow toegevoegd.
+// PR 2 UPDATE: Meta Ads sync endpoint toegevoegd.
 //
-//   POST /api/integrations/advertising/meta/connect
-//     → start OAuth flow, redirect user naar Facebook
+//   POST /api/integrations/advertising/meta/:integrationId/sync
+//     → handmatige sync trigger voor een specifieke Meta integratie
 //
-//   GET /api/integrations/callback/meta
-//     → afhandelen van de OAuth callback van Facebook
-//
-// FIX: TypeScript vergelijking platform === 'meta' werkt nu via
-// een raw string check vóór het casten naar PlatformSlug.
+// Behoudt alle bestaande endpoints uit PR 1 (security fix + Meta OAuth).
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { z }                                        from 'zod';
@@ -23,6 +19,7 @@ import { cache }                                    from '../../../infrastructur
 import { PlatformSlug, IntegrationCredentials }     from '../types/integration.types';
 import { syncBolcomAdvertisingData }                from '../connectors/bolcom-advertising.connector';
 import { MetaAdsConnector }                         from '../connectors/meta-ads.connector';
+import { syncMetaAdsData }                          from '../connectors/meta-ads-sync';
 import { encryptToken, decryptToken }               from '../../../shared/crypto/token-encryption';
 import { logger }                                   from '../../../shared/logging/logger';
 
@@ -57,7 +54,6 @@ const SyncSchema = z.object({
   jobType: z.enum(['full_sync', 'incremental']).optional().default('incremental'),
 });
 
-// ── Validate helper ───────────────────────────────────────────
 function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
@@ -67,7 +63,6 @@ function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   return result.data;
 }
 
-// ── UUID param guard ──────────────────────────────────────────
 function validateUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
@@ -125,14 +120,8 @@ router.post('/shopify/install', async (req: Request, res: Response, next: NextFu
 });
 
 // ── GET /api/integrations/callback/:platform ─────────────────
-//
-// Algemene OAuth callback voor stores (Shopify, Amazon, Etsy).
-// Meta heeft een eigen callback hieronder omdat de flow afwijkt.
-//
 router.get('/callback/:platform', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Check op Meta voordat we casten naar PlatformSlug, want Meta gebruikt
-    // de URL path 'meta' terwijl het PlatformSlug 'meta_ads' is.
     const platformParam = req.params.platform;
 
     if (platformParam === 'meta') {
@@ -165,12 +154,9 @@ router.get('/callback/:platform', async (req: Request, res: Response, next: Next
 });
 
 // ============================================================
-// META ADS — OAuth flow
+// META ADS — OAuth flow (uit PR 1)
 // ============================================================
 
-// ── POST /api/integrations/advertising/meta/connect ──────────
-// Start de OAuth flow. Geeft een authUrl terug die de frontend
-// gebruikt om de gebruiker naar Facebook te sturen.
 router.post('/advertising/meta/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -200,7 +186,6 @@ router.post('/advertising/meta/connect', async (req: Request, res: Response, nex
   } catch (err) { next(err); }
 });
 
-// ── GET /api/integrations/callback/meta ──────────────────────
 router.get('/callback/meta', async (req: Request, res: Response) => {
   const frontendUrl = process.env.FRONTEND_URL || 'https://marketgrow.ai';
   const { code, state, error, error_description } = req.query as {
@@ -343,11 +328,56 @@ router.get('/callback/meta', async (req: Request, res: Response) => {
   }
 });
 
+// ── POST /api/integrations/advertising/meta/:integrationId/sync ────
+//
+// PR 2: handmatige sync trigger voor Meta Ads.
+// Roept syncMetaAdsData aan dat campaigns/adsets/ads + insights ophaalt.
+router.post('/advertising/meta/:integrationId/sync', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!validateUuid(req.params.integrationId)) {
+      res.status(400).json({ error: 'Ongeldig integration ID' });
+      return;
+    }
+
+    const { tenantId } = getTenantContext();
+    const integrationId = req.params.integrationId;
+
+    // Verifieer dat deze integratie van deze tenant is en Meta is
+    const verifyResult = await db.query(
+      `SELECT id FROM tenant_integrations
+       WHERE id = $1 AND tenant_id = $2 AND platform_slug = 'meta_ads' AND status = 'active'`,
+      [integrationId, tenantId]
+    );
+
+    if (!verifyResult.rows[0]) {
+      res.status(404).json({ error: 'Meta Ads integratie niet gevonden' });
+      return;
+    }
+
+    const result = await syncMetaAdsData(integrationId, tenantId);
+
+    if (!result.hasAccess) {
+      res.status(400).json({
+        error: result.errorMessage || 'Meta sync mislukt',
+      });
+      return;
+    }
+
+    res.json({
+      success:    true,
+      campaigns:  result.campaignsCount,
+      adsets:     result.adsetsCount,
+      ads:        result.adsCount,
+      insights:   result.insightsCount,
+      totalSpend: result.totalSpend,
+    });
+  } catch (err) { next(err); }
+});
+
 // ============================================================
 // BOL.COM ADVERTISING — bestaande endpoints, ongewijzigd
 // ============================================================
 
-// ── POST /api/integrations/advertising/bolcom/connect ────────
 router.post('/advertising/bolcom/connect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId }               = getTenantContext();
@@ -367,7 +397,7 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
       return;
     }
 
-    const { access_token } = await tokenRes.json() as { access_token: string };
+    await tokenRes.json();
 
     const integrationId = uuidv4();
 
@@ -401,7 +431,6 @@ router.post('/advertising/bolcom/connect', async (req: Request, res: Response, n
   } catch (err) { next(err); }
 });
 
-// ── POST /api/integrations/advertising/bolcom/:integrationId/sync ────
 router.post('/advertising/bolcom/:integrationId/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!validateUuid(req.params.integrationId)) {
@@ -476,7 +505,8 @@ router.post('/advertising/bolcom/:integrationId/sync', async (req: Request, res:
   } catch (err) { next(err); }
 });
 
-// ── POST /api/integrations/:id/sync ──────────────────────────
+// ── Generic store sync endpoints ─────────────────────────────
+
 router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!validateUuid(req.params.id)) {
@@ -489,7 +519,6 @@ router.post('/:id/sync', async (req: Request, res: Response, next: NextFunction)
   } catch (err) { next(err); }
 });
 
-// ── GET /api/integrations/:id/sync-status ────────────────────
 router.get('/:id/sync-status', async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!validateUuid(req.params.id)) {
@@ -501,7 +530,6 @@ router.get('/:id/sync-status', async (req: Request, res: Response, next: NextFun
   } catch (err) { next(err); }
 });
 
-// ── DELETE /api/integrations/:id ─────────────────────────────
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!validateUuid(req.params.id)) {
@@ -513,7 +541,6 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
   } catch (err) { next(err); }
 });
 
-// ── POST /api/integrations/webhook/:platform ─────────────────
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
   logger.warn('webhook.unimplemented_called', {
     platform: req.params.platform,
