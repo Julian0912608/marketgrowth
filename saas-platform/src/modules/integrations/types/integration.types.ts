@@ -1,9 +1,13 @@
 // ============================================================
 // src/modules/integrations/types/integration.types.ts
 //
-// PR 3a.1 UPDATE: imageUrl toegevoegd aan NormalizedProduct
-// zodat connectors productfoto's kunnen meegeven die naar
-// products.image_url worden geschreven door de sync worker.
+// PR 3a.3 UPDATE: NormalizedProduct uitgebreid met
+//   - description     (Shopify body_html)
+//   - images          (array van alle product images)
+//   - variantsSummary (compact variant overzicht)
+//   - seoDescription  (Shopify SEO meta description)
+//
+// Voor Bol.com blijven deze undefined — geen API support.
 // ============================================================
 
 export type PlatformSlug =
@@ -31,7 +35,6 @@ export interface IntegrationCredentials {
   shopDomain?:    string;
 }
 
-// FetchOptions — jobType toegevoegd zodat connectors weten of het full_sync is
 export interface FetchOptions {
   updatedAfter?: Date;
   limit?:        number;
@@ -74,6 +77,21 @@ export interface NormalizedOrder {
   updatedAt:          Date;
 }
 
+// Compact variant overzicht: alleen unieke options + counts
+// Niet alle variant-data (te verbose), genoeg om AI productinfo te geven.
+export interface VariantsSummary {
+  total_variants?: number;
+  options?:        Record<string, string[]>;  // {"Color": ["Black", "Brown"], "Size": ["S", "M", "L"]}
+  in_stock_count?: number;
+  out_of_stock_count?: number;
+}
+
+export interface ProductImage {
+  src:       string;
+  position?: number;
+  alt?:      string;
+}
+
 export interface NormalizedProduct {
   externalId:        string;
   title:             string;
@@ -88,8 +106,16 @@ export interface NormalizedProduct {
   priceMax?:         number;
   publishedAt?:      Date;
   updatedAt:         Date;
-  // PR 3a.1: productfoto URL — primair voor Shopify, NULL voor Bol.com
+
+  // PR 3a.1: primary image
   imageUrl?:         string;
+
+  // PR 3a.3: rich product context voor AI
+  description?:      string;            // body_html van Shopify (HTML toegestaan)
+  images?:           ProductImage[];    // alle images, niet alleen primary
+  variantsSummary?:  VariantsSummary;
+  seoDescription?:   string;
+
   // Bol.com specifiek
   ean?:              string;
   condition?:        string;
