@@ -1,7 +1,9 @@
 // ============================================================
 // src/modules/integrations/types/integration.types.ts
 //
-// UPDATE: 'meta_ads' toegevoegd als advertising platform slug.
+// PR 3a.1 UPDATE: imageUrl toegevoegd aan NormalizedProduct
+// zodat connectors productfoto's kunnen meegeven die naar
+// products.image_url worden geschreven door de sync worker.
 // ============================================================
 
 export type PlatformSlug =
@@ -14,8 +16,8 @@ export type PlatformSlug =
   | 'amazon'
   | 'etsy'
   | 'google_ads'
-  | 'bolcom_ads'
-  | 'meta_ads';
+  | 'meta_ads'
+  | 'bolcom_ads';
 
 export interface IntegrationCredentials {
   integrationId:  string;
@@ -86,6 +88,9 @@ export interface NormalizedProduct {
   priceMax?:         number;
   publishedAt?:      Date;
   updatedAt:         Date;
+  // PR 3a.1: productfoto URL — primair voor Shopify, NULL voor Bol.com
+  imageUrl?:         string;
+  // Bol.com specifiek
   ean?:              string;
   condition?:        string;
   fulfillmentBy?:    string;
