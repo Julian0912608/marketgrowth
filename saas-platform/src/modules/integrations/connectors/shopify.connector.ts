@@ -1,5 +1,9 @@
 // ============================================================
 // src/modules/integrations/connectors/shopify.connector.ts
+//
+// PR 3a.1 UPDATE: normalizeProduct haalt nu image URL op uit
+// p.image.src (featured image van het product). Wordt gebruikt
+// als ad creative in de Meta Studio.
 // ============================================================
 
 import crypto from 'crypto';
@@ -171,6 +175,23 @@ export class ShopifyConnector implements IPlatformConnector {
   private normalizeProduct(p: Record<string, unknown>): NormalizedProduct {
     const variants = (p.variants as Record<string, unknown>[] | undefined) ?? [];
     const prices   = variants.map(v => parseFloat(String((v as Record<string, unknown>).price ?? '0'))).filter(n => n > 0);
+
+    // PR 3a.1: extract image URL.
+    // Shopify product API geeft images terug in twee plekken:
+    //   1. p.image (featured image — primary product image)
+    //   2. p.images (array van alle product images)
+    // We pakken eerst p.image.src, fallback p.images[0].src
+    let imageUrl: string | undefined;
+    const featuredImage = p.image as Record<string, unknown> | undefined;
+    if (featuredImage?.src) {
+      imageUrl = String(featuredImage.src);
+    } else {
+      const images = p.images as Record<string, unknown>[] | undefined;
+      if (images && images.length > 0 && images[0].src) {
+        imageUrl = String(images[0].src);
+      }
+    }
+
     return {
       externalId:       String(p.id),
       title:            (p.title as string) ?? '',
@@ -185,6 +206,7 @@ export class ShopifyConnector implements IPlatformConnector {
       priceMax:         prices.length ? Math.max(...prices) : undefined,
       publishedAt:      p.published_at ? new Date(p.published_at as string) : undefined,
       updatedAt:        new Date(p.updated_at as string),
+      imageUrl,
     };
   }
 
