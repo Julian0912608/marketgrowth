@@ -3,12 +3,20 @@
 //
 // API endpoints voor Meta Ad Creative Studio.
 //
-// PR 3a.3 toevoegingen:
+// PR 3a.4 toevoegingen:
+//   POST /api/ai/meta-creative/products/:id/enrichment-suggest
+//   (AI assist — "Help me invullen" knop in modal)
+//
+// PR 3a.3:
 //   POST /api/ai/meta-creative/suggest-concepts
 //   GET  /api/ai/meta-creative/products/:id/enrichment
 //   PUT  /api/ai/meta-creative/products/:id/enrichment
 //
-// Bestaande endpoints blijven werken zoals voorheen.
+// PR 3a (basis, blijven werken):
+//   POST /api/ai/meta-creative/generate
+//   GET  /api/ai/meta-creative/list
+//   PATCH/DELETE /api/ai/meta-creative/:id
+//   POST /api/ai/meta-creative/:id/regenerate-image
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -27,13 +35,13 @@ import {
 } from '../services/meta-creative-generator';
 import {
   suggestConcepts,
+  suggestEnrichment,
   CONCEPT_ANGLES,
 } from '../services/meta-ad-set-generator';
 
 const router = Router();
 router.use(tenantMiddleware());
 
-// ── Validation helpers ────────────────────────────────────────
 function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
   const result = schema.safeParse(data);
   if (!result.success) {
@@ -47,7 +55,6 @@ function validateUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
-// ── Plan gating helper ────────────────────────────────────────
 function requireGrowthOrAbove(planSlug: string, res: Response): boolean {
   if (planSlug === 'starter') {
     res.status(403).json({
@@ -61,7 +68,6 @@ function requireGrowthOrAbove(planSlug: string, res: Response): boolean {
   return true;
 }
 
-// ── Credit usage tracker ──────────────────────────────────────
 async function trackCreditUsage(
   tenantId: string,
   count:    number,
@@ -113,7 +119,6 @@ const UpdateSchema = z.object({
   link_url:        z.string().url().max(500).nullable().optional(),
 });
 
-// PR 3a.3
 const SuggestConceptsSchema = z.object({
   productId:       z.string().uuid(),
   campaignBrief:   z.string().min(5).max(1000),
@@ -125,13 +130,16 @@ const SuggestConceptsSchema = z.object({
   tone:            z.string().max(50).optional(),
 });
 
-// PR 3a.3 — voor enrichment UI in PR 3a.4
 const EnrichmentSchema = z.object({
   target_audience: z.string().max(500).optional().nullable(),
   key_benefits:    z.array(z.string().max(200)).max(10).optional(),
   pain_points:     z.array(z.string().max(200)).max(10).optional(),
   brand_story:     z.string().max(1000).optional().nullable(),
   use_cases:       z.array(z.string().max(150)).max(10).optional(),
+});
+
+const SuggestEnrichmentSchema = z.object({
+  language: z.enum(['nl', 'en']).default('nl'),
 });
 
 // ── GET /api/ai/meta-creative/ad-accounts ────────────────────
@@ -165,8 +173,6 @@ router.get('/ad-accounts', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ── GET /api/ai/meta-creative/list ───────────────────────────
-// Toont alleen STANDALONE creatives (ad_set_id IS NULL).
-// Campaigns hebben hun eigen endpoint (komt in PR 3a.5).
 router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -211,7 +217,6 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ── POST /api/ai/meta-creative/generate ──────────────────────
-// Quick mode (1 ad). Blijft werken zoals voorheen.
 router.post('/generate', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -271,8 +276,6 @@ router.post('/generate', featureGate('ai-recommendations'), async (req: Request,
 });
 
 // ── POST /api/ai/meta-creative/suggest-concepts (PR 3a.3) ────
-// AI stelt 5 concept-angles voor op basis van product context + brief.
-// Dit is stap 3 van de Campaign wizard.
 router.post('/suggest-concepts', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
@@ -292,7 +295,6 @@ router.post('/suggest-concepts', featureGate('ai-recommendations'), async (req: 
       tone:            input.tone,
     });
 
-    // Concept suggestion = 2 credits
     await trackCreditUsage(tenantId, 2);
 
     res.json({
@@ -320,7 +322,6 @@ router.get('/products/:id/enrichment', async (req: Request, res: Response, next:
       return;
     }
 
-    // Check product exists for this tenant
     const productCheck = await db.query(
       `SELECT id, title FROM products WHERE id = $1 AND tenant_id = $2`,
       [req.params.id, tenantId],
@@ -417,6 +418,43 @@ router.put('/products/:id/enrichment', async (req: Request, res: Response, next:
 
     res.json({ success: true });
   } catch (err) { next(err); }
+});
+
+// ── POST /api/ai/meta-creative/products/:id/enrichment-suggest (PR 3a.4) ──
+// AI assist — "Help me invullen" knop in modal.
+// AI doet voorstel voor alle 5 enrichment velden.
+router.post('/products/:id/enrichment-suggest', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { tenantId, planSlug } = getTenantContext();
+    if (!requireGrowthOrAbove(planSlug, res)) return;
+
+    if (!validateUuid(req.params.id)) {
+      res.status(400).json({ error: 'Ongeldig product ID' });
+      return;
+    }
+
+    const input = validate(SuggestEnrichmentSchema, req.body);
+
+    const result = await suggestEnrichment({
+      tenantId,
+      productId: req.params.id,
+      language:  input.language,
+    });
+
+    // Enrichment suggestion = 3 credits (Sonnet call met grote prompt)
+    await trackCreditUsage(tenantId, 3);
+
+    res.json({
+      ...result,
+      creditsUsed: 3,
+    });
+  } catch (err) {
+    logger.error('meta.enrichment_suggest.error', {
+      error: (err as Error).message,
+      stack: (err as Error).stack?.slice(0, 300),
+    });
+    next(err);
+  }
 });
 
 // ── POST /api/ai/meta-creative/:id/regenerate-image ─────────
