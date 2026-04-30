@@ -11,10 +11,13 @@
 //   GET  /api/ai/products          — producten voor content studio
 //   POST /api/ai/product-content   — product marketing content + beeld
 //
-// PR 3a.4 UPDATE:
-//   GET /api/ai/products geeft nu has_enrichment boolean terug,
-//   zodat de frontend "Geen context" badge kan tonen op producten
-//   zonder enrichment.
+// SCHEMA FIXES:
+//   - p.sku → p.ean AS sku (Bol.com EAN als SKU equivalent)
+//   - p.platform → JOIN tenant_integrations voor platform_slug
+//
+// PR 3a.1: p.image_url is een echte kolom (na migration 007)
+// PR 3a.4: GET /products geeft nu has_enrichment + has_description
+//          terug zodat frontend "Geen context" badge kan tonen
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -32,60 +35,77 @@ router.use(tenantMiddleware());
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new (Anthropic.default ?? Anthropic)();
 
-// ── IP-based rate limiting (in-memory, simple) ────────────────
-const ipCounters = new Map<string, { count: number; resetAt: number }>();
-function checkIpRateLimit(ip: string, max = 30, windowMs = 60_000): boolean {
-  const now = Date.now();
-  const entry = ipCounters.get(ip);
-  if (!entry || now > entry.resetAt) {
-    ipCounters.set(ip, { count: 1, resetAt: now + windowMs });
+// ── Cache TTL per plan (seconden) ─────────────────────────────
+const CACHE_TTL: Record<string, number> = {
+  starter: 14400,
+  growth:  3600,
+  scale:   1800,
+};
+
+// ── Plan credit limieten ──────────────────────────────────────
+const PLAN_LIMITS: Record<string, number | null> = {
+  starter: 100,
+  growth:  2000,
+  scale:   null,
+};
+
+// ── IP rate limiter voor AI routes ────────────────────────────
+const AI_RATE_LIMIT = 30;
+const AI_RATE_WINDOW = 60;
+
+async function checkIpRateLimit(req: Request): Promise<boolean> {
+  const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
+  const ip = req.ip ?? req.headers['x-forwarded-for'] ?? 'unknown';
+  const key = `ratelimit:ai:ip:${ip}`;
+  try {
+    const current = await rawRedis.incr(key);
+    if (current === 1) await rawRedis.expire(key, AI_RATE_WINDOW);
+    return current <= AI_RATE_LIMIT;
+  } catch {
     return true;
   }
-  if (entry.count >= max) return false;
-  entry.count++;
-  return true;
 }
 
-router.use((req: Request, res: Response, next: NextFunction) => {
-  const ip = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
-  if (!checkIpRateLimit(ip)) {
-    res.status(429).json({ error: 'Too many requests, slow down.' });
-    return;
-  }
-  next();
-});
-
-// ── Helpers ───────────────────────────────────────────────────
-function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
-  const result = schema.safeParse(data);
-  if (!result.success) {
-    throw Object.assign(new Error(result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')), { httpStatus: 400 });
-  }
-  return result.data;
-}
-
+// ── Redis-backed credit pre-check ────────────────────────────
 async function checkCreditPreCheck(tenantId: string, planSlug: string): Promise<boolean> {
-  const limits: Record<string, number> = { starter: 100, growth: 2000, scale: 10000 };
-  const limit = limits[planSlug] ?? 100;
+  const limit = PLAN_LIMITS[planSlug];
+  if (limit === null) return true;
+
+  const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
+  const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
+
+  try {
+    const used = await rawRedis.get(key);
+    if (used !== null && parseInt(used) >= limit) {
+      logger.info('ai.credits.limit_reached_redis', { tenantId, planSlug, used, limit });
+      return false;
+    }
+  } catch {
+    // Redis niet beschikbaar — val terug op DB check
+  }
 
   try {
     const result = await db.query(
-      `SELECT COALESCE(SUM(usage_count), 0) AS total
-       FROM feature_usage fu
-       JOIN features f ON f.id = fu.feature_id
-       WHERE fu.tenant_id = $1
-         AND f.slug = 'ai-recommendations'
+      `SELECT COALESCE(fu.usage_count, 0) AS used
+       FROM feature_usage fu JOIN features f ON f.id = fu.feature_id
+       WHERE fu.tenant_id = $1 AND f.slug = 'ai-recommendations'
          AND fu.period_start = date_trunc('month', now())`,
       [tenantId], { allowNoTenant: true }
     );
-    const used = parseInt(result.rows[0]?.total ?? '0', 10);
-    return used < limit;
-  } catch {
-    return true; // fail-open op DB error
+    const used = parseInt(result.rows[0]?.used || '0');
+    if (used >= limit) {
+      logger.info('ai.credits.limit_reached_db', { tenantId, planSlug, used, limit });
+      return false;
+    }
+  } catch (err) {
+    logger.warn('ai.credits.precheck_failed', { tenantId, error: (err as Error).message });
   }
+
+  return true;
 }
 
-async function trackUsage(tenantId: string, count: number, planSlug: string): Promise<void> {
+// ── Usage tracker ─────────────────────────────────────────────
+async function trackUsage(tenantId: string, count = 1, planSlug?: string): Promise<void> {
   try {
     await db.query(
       `INSERT INTO feature_usage (tenant_id, feature_id, period_start, period_end, usage_count)
@@ -94,70 +114,102 @@ async function trackUsage(tenantId: string, count: number, planSlug: string): Pr
        FROM features f WHERE f.slug = 'ai-recommendations'
        ON CONFLICT (tenant_id, feature_id, period_start)
        DO UPDATE SET usage_count = feature_usage.usage_count + $2, updated_at = now()`,
-      [tenantId, count],
-      { allowNoTenant: true }
+      [tenantId, count], { allowNoTenant: true }
     );
   } catch (err) {
-    logger.warn('ai.usage.track_failed', { tenantId, planSlug, error: (err as Error).message });
+    logger.warn('ai.usage.tracking_failed', {
+      tenantId,
+      count,
+      error: (err as Error).message,
+    });
   }
+
+  try {
+    const rawRedis = require('../../../infrastructure/cache/redis').redis as any;
+    const key = `ai:credits:used:${tenantId}:${new Date().toISOString().slice(0, 7)}`;
+    await rawRedis.incrby(key, count);
+    await rawRedis.expire(key, 35 * 24 * 3600);
+  } catch {}
 }
 
-// ── Validation schemas ────────────────────────────────────────
+function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    const messages = result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+    throw Object.assign(new Error(messages), { httpStatus: 400 });
+  }
+  return result.data;
+}
+
+// ── Schemas ───────────────────────────────────────────────────
 const ChatSchema = z.object({
-  message:  z.string().min(1).max(2000),
-  history:  z.array(z.object({
-    role:    z.enum(['user', 'assistant']),
-    content: z.string(),
-  })).max(10).optional(),
+  message: z.string().min(1).max(1000),
 });
 
 const SocialContentSchema = z.object({
-  platform:    z.enum(['instagram', 'tiktok', 'facebook', 'pinterest']),
-  format:      z.enum(['single', 'carousel', 'story']),
-  productId:   z.string().uuid().optional(),
-  prompt:      z.string().max(500).optional(),
-  tone:        z.enum(['lifestyle', 'promotional', 'educational', 'ugc']).default('lifestyle'),
-  language:    z.enum(['nl', 'en']).default('nl'),
+  platform:      z.enum(['instagram', 'tiktok', 'linkedin', 'facebook', 'twitter']),
+  tone:          z.string().max(50),
+  topic:         z.string().max(200),
+  format:        z.string().optional(),
+  customContext: z.string().max(500).optional(),
+  count:         z.number().int().min(1).max(5).default(1),
 });
 
 const GenerateImageSchema = z.object({
-  productId:   z.string().uuid().optional(),
-  prompt:      z.string().min(5).max(1000),
-  platform:    z.enum(['instagram', 'tiktok', 'meta', 'google']).default('meta'),
-  format:      z.enum(['single', 'carousel', 'story', 'banner']).default('single'),
-  style:       z.enum(['minimal', 'bold', 'lifestyle', 'product-focus']).default('minimal'),
-  brandColor:  z.string().optional(),
+  prompt:     z.string().max(500),
+  slideTitle: z.string().max(100).optional(),
+  slideBody:  z.string().max(300).optional(),
+  index:      z.number().int().optional(),
 });
 
 const VideoScriptSchema = z.object({
-  scenario:   z.string().min(5).max(500),
-  format:     z.enum(['short', 'long']).default('short'),
-  angle:      z.enum(['educational', 'entertaining', 'inspirational', 'promotional']).default('educational'),
-  language:   z.enum(['nl', 'en']).default('nl'),
+  scenario: z.string().max(200),
+  format:   z.string().max(50).optional(),
+  angle:    z.string().max(50).optional(),
+  index:    z.number().int().optional(),
+  total:    z.number().int().optional(),
 });
 
 const ProductContentSchema = z.object({
-  productId:   z.string().uuid(),
-  formats:     z.array(z.string()).optional(),
+  productId: z.string().uuid(),
+  formats:   z.array(z.string()).optional(),
+});
+
+// ── IP rate limit middleware voor AI routes ───────────────────
+router.use(async (req: Request, res: Response, next: NextFunction) => {
+  const allowed = await checkIpRateLimit(req);
+  if (!allowed) {
+    res.status(429).json({
+      error: 'too_many_requests',
+      message: 'Too many AI requests. Please slow down.',
+      retryAfter: AI_RATE_WINDOW,
+    });
+    return;
+  }
+  next();
 });
 
 // ── GET /api/ai/insights ──────────────────────────────────────
 router.get('/insights', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId, planSlug } = getTenantContext();
+    const force = req.query.force === 'true';
 
-    const cached = await cache.get(`ai:insights:${tenantId}`);
-    if (cached) {
-      const cachedObj = cached as unknown as Record<string, unknown>;
-      res.json({ ...cachedObj, cached: true });
-      return;
+    if (!force) {
+      const cacheKey = `ai:insights:${tenantId}`;
+      const cached = await cache.get(cacheKey);
+      if (cached) {
+        res.json({ ...JSON.parse(cached), fromCache: true });
+        return;
+      }
     }
 
     const hasCredits = await checkCreditPreCheck(tenantId, planSlug);
     if (!hasCredits) {
+      const limit = PLAN_LIMITS[planSlug];
       res.status(402).json({
-        error:           'credits_exhausted',
-        message:         `Monthly AI credit limit reached for the ${planSlug} plan. Upgrade to get more.`,
+        error: 'credits_exhausted',
+        message: `You've used all ${limit} AI credits this month. Upgrade for more.`,
         upgradeRequired: true,
       });
       return;
@@ -189,10 +241,10 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
     const hasOrders = parseInt(stats.orders) > 0;
 
     const prompt = hasOrders
-      ? `Je bent een AI ecommerce adviseur voor MarketGrow. Analyseer de data en geef een beknopte dagelijkse briefing in JSON.
-Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} omzet, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
-Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
-      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"algemeen"}],"alerts":[]}`;
+      ? `You are an AI ecommerce advisor for MarketGrow. Analyze the data and give a concise daily briefing in JSON.
+Data: ${stats.orders} orders, €${parseFloat(stats.revenue).toFixed(0)} revenue, AOV €${parseFloat(stats.avg_order_value).toFixed(0)}, ad spend €${parseFloat(ads.total_spend).toFixed(0)}, ROAS ${parseFloat(ads.avg_roas).toFixed(2)}x.
+Return ONLY JSON: {"briefing":"2-3 sentences","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"string"}],"alerts":["string"]}`
+      : `Return ONLY JSON: {"briefing":"Connect your first store to receive AI insights. Once orders come in you will see your daily briefing here.","actions":[{"priority":"medium","title":"Connect your store","description":"Go to Integrations and connect your first shop to unlock AI insights.","channel":"general"}],"alerts":[]}`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -200,25 +252,19 @@ Return ONLY JSON: {"briefing":"2-3 zinnen","actions":[{"priority":"high|medium|l
       messages:   [{ role: 'user', content: prompt }],
     });
 
-    const text  = response.content[0].type === 'text' ? response.content[0].text : '{}';
+    const text  = response.content[0].type === 'text' ? response.content[0].text : '';
     const clean = text.replace(/```json|```/g, '').trim();
 
-    let payload;
-    try { payload = JSON.parse(clean); }
-    catch { payload = { briefing: 'AI inzichten konden niet worden gegenereerd.', actions: [], alerts: [] }; }
+    let parsed;
+    try { parsed = JSON.parse(clean); }
+    catch { parsed = { briefing: text.slice(0, 300), actions: [], alerts: [] }; }
 
-    payload.metrics = {
-      orders30d: parseInt(stats.orders),
-      revenue30d: parseFloat(stats.revenue),
-      aov: parseFloat(stats.avg_order_value),
-      adSpend: parseFloat(ads.total_spend),
-      roas: parseFloat(ads.avg_roas),
-    };
-
-    await cache.set(`ai:insights:${tenantId}`, payload, 3600);
+    const cacheKey = `ai:insights:${tenantId}`;
+    await cache.set(cacheKey, JSON.stringify(parsed), CACHE_TTL[planSlug] || 3600);
     await trackUsage(tenantId, 1, planSlug);
 
-    res.json(payload);
+    logger.info('ai.insights.generated', { tenantId, planSlug, hasOrders, force });
+    res.json({ ...parsed, fromCache: false });
   } catch (err) { next(err); }
 });
 
@@ -227,25 +273,24 @@ router.get('/credits', async (req: Request, res: Response, next: NextFunction) =
   try {
     const { tenantId, planSlug } = getTenantContext();
 
-    const limits: Record<string, number> = { starter: 100, growth: 2000, scale: 10000 };
-    const limit = limits[planSlug] ?? 100;
+    const limit = PLAN_LIMITS[planSlug] ?? 100;
+    const unlimited = limit === null;
 
-    const result = await db.query(
-      `SELECT COALESCE(SUM(usage_count), 0) AS total
-       FROM feature_usage fu
-       JOIN features f ON f.id = fu.feature_id
-       WHERE fu.tenant_id = $1
-         AND f.slug = 'ai-recommendations'
+    const usageResult = await db.query(
+      `SELECT COALESCE(fu.usage_count, 0) AS used
+       FROM feature_usage fu JOIN features f ON f.id = fu.feature_id
+       WHERE fu.tenant_id = $1 AND f.slug = 'ai-recommendations'
          AND fu.period_start = date_trunc('month', now())`,
       [tenantId], { allowNoTenant: true }
     );
 
-    const used = parseInt(result.rows[0]?.total ?? '0', 10);
+    const used = parseInt(usageResult.rows[0]?.used || '0');
 
     res.json({
       used,
       limit,
-      remaining: Math.max(0, limit - used),
+      remaining: unlimited ? null : Math.max(0, (limit as number) - used),
+      unlimited,
       planSlug,
     });
   } catch (err) { next(err); }
@@ -258,10 +303,10 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
 
     if (planSlug === 'starter') {
       res.status(403).json({
-        error:           'plan_insufficient',
-        message:         'AI Chat is available from the Growth plan.',
+        error: 'plan_insufficient',
+        message: 'AI Chat is available from the Growth plan.',
         upgradeRequired: true,
-        requiredPlan:    'growth',
+        requiredPlan: 'growth',
       });
       return;
     }
@@ -272,18 +317,13 @@ router.post('/chat', featureGate('ai-recommendations'), async (req: Request, res
       return;
     }
 
-    const { message, history = [] } = validate(ChatSchema, req.body);
-
-    const messages = [
-      ...history.map(h => ({ role: h.role, content: h.content })),
-      { role: 'user' as const, content: message },
-    ];
+    const { message } = validate(ChatSchema, req.body);
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
       max_tokens: 1500,
-      system:     'Je bent een AI ecommerce adviseur voor MarketGrow gebruikers. Je helpt ondernemers met concrete adviezen over hun webshop, marketing, en groei. Houd antwoorden helder en actionable.',
-      messages,
+      system:     'You are an AI ecommerce advisor for MarketGrow users. You help entrepreneurs with concrete advice on their webshop, marketing, and growth. Keep answers clear and actionable.',
+      messages:   [{ role: 'user', content: message }],
     });
 
     const reply = response.content[0].type === 'text' ? response.content[0].text : '';
@@ -316,41 +356,27 @@ router.post('/social-content', featureGate('ai-recommendations'), async (req: Re
 
     const input = validate(SocialContentSchema, req.body);
 
-    let productContext = '';
-    if (input.productId) {
-      const productResult = await db.query(
-        `SELECT title, sku, platform_slug AS platform, price_min,
-                COALESCE((SELECT SUM(quantity) FROM order_line_items WHERE product_id = p.id::text), 0) AS units_sold
-         FROM products p WHERE p.id = $1 AND p.tenant_id = $2`,
-        [input.productId, tenantId], { allowNoTenant: true }
-      );
-      const product = productResult.rows[0];
-      if (product) {
-        productContext = `Product: ${product.title} (${product.platform}, €${product.price_min ?? 0}, ${product.units_sold} verkocht)`;
-      }
-    }
+    const prompt = `Generate ${input.count} ${input.platform} ${input.format ?? 'post'} variant${input.count > 1 ? 's' : ''} about: ${input.topic}.
+Tone: ${input.tone}.
+${input.customContext ? `Context: ${input.customContext}` : ''}
 
-    const prompt = `Genereer ${input.platform} ${input.format} content in ${input.language}.
-${productContext}
-Tone: ${input.tone}. ${input.prompt ?? ''}
-
-Return ONLY JSON: {"hook":"...","caption":"...","cta":"...","hashtags":["tag1","tag2"]}`;
+Return ONLY JSON array of ${input.count}: [{"hook":"...","caption":"...","cta":"...","hashtags":["tag1","tag2"]}]`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
-      max_tokens: 800,
+      max_tokens: 1500,
       messages:   [{ role: 'user', content: prompt }],
     });
 
-    const text  = response.content[0].type === 'text' ? response.content[0].text : '{}';
+    const text  = response.content[0].type === 'text' ? response.content[0].text : '[]';
     const clean = text.replace(/```json|```/g, '').trim();
 
     let content;
     try { content = JSON.parse(clean); }
-    catch { content = { error: 'Failed to parse content' }; }
+    catch { content = [{ error: 'Failed to parse content' }]; }
 
-    await trackUsage(tenantId, 2, planSlug);
-    res.json(content);
+    await trackUsage(tenantId, input.count * 2, planSlug);
+    res.json({ variants: content });
   } catch (err) { next(err); }
 });
 
@@ -379,31 +405,11 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 
     const { generateAdCreative } = await import('../services/nano-banana.service');
 
-    let productCtx: any = { title: 'Product', platform: 'shopify' };
-    if (input.productId) {
-      const r = await db.query(
-        `SELECT title, sku, platform_slug AS platform, price_min,
-                description, image_url
-         FROM products p WHERE p.id = $1 AND p.tenant_id = $2`,
-        [input.productId, tenantId], { allowNoTenant: true }
-      );
-      if (r.rows[0]) {
-        productCtx = {
-          title:       r.rows[0].title,
-          description: r.rows[0].description,
-          price:       r.rows[0].price_min ? parseFloat(r.rows[0].price_min) : undefined,
-          platform:    r.rows[0].platform,
-          imageUrl:    r.rows[0].image_url,
-        };
-      }
-    }
-
     const result = await generateAdCreative({
-      product:    productCtx,
-      format:     input.format     as 'single' | 'carousel' | 'story' | 'banner',
-      platform:   input.platform   as 'instagram' | 'tiktok' | 'meta' | 'google',
-      style:      input.style      as 'minimal' | 'bold' | 'lifestyle' | 'product-focus',
-      brandColor: input.brandColor,
+      product:    { title: input.slideTitle ?? 'Product', platform: 'shopify' },
+      format:     'single',
+      platform:   'meta',
+      style:      'minimal',
     });
 
     await trackUsage(tenantId, 2, planSlug);
@@ -430,10 +436,10 @@ router.post('/video-script', async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    const input = validate(VideoScriptSchema, req.body);
+    const { scenario, format, angle } = validate(VideoScriptSchema, req.body);
 
-    const prompt = `Generate a ${input.format} video script for ${input.scenario}.
-Angle: ${input.angle}. Language: ${input.language}.
+    const prompt = `Generate a ${format ?? 'short'} video script for: ${scenario}.
+Angle: ${angle ?? 'educational'}.
 Return ONLY JSON: {"hook":"first 3 sec hook","body":"main content","cta":"closing CTA","onScreenText":["text1","text2"]}`;
 
     const response = await anthropic.messages.create({
@@ -451,13 +457,14 @@ Return ONLY JSON: {"hook":"first 3 sec hook","body":"main content","cta":"closin
 
     await trackUsage(tenantId, 1, planSlug);
 
-    logger.info('ai.video-script.generated', { userId, scenario: input.scenario, format: input.format, angle: input.angle });
+    logger.info('ai.video-script.generated', { userId, scenario, format, angle });
     res.json(script);
   } catch (err) { next(err); }
 });
 
 // ── GET /api/ai/products ──────────────────────────────────────
-// PR 3a.4 UPDATE: voegt has_enrichment boolean toe via LEFT JOIN
+// PR 3a.1: gebruikt p.image_url uit migration 007
+// PR 3a.4: voegt has_enrichment + has_description toe voor frontend badge
 router.get('/products', featureGate('ai-recommendations'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { tenantId } = getTenantContext();
@@ -467,7 +474,8 @@ router.get('/products', featureGate('ai-recommendations'), async (req: Request, 
               p.ean AS sku,
               COALESCE(ti.platform_slug, 'unknown') AS platform,
               p.price_min,
-              p.total_inventory, p.image_url,
+              p.total_inventory,
+              p.image_url,
               COALESCE(SUM(li.quantity), 0) AS units_sold,
               CASE
                 WHEN p.description IS NOT NULL AND LENGTH(p.description) > 50 THEN true
@@ -515,7 +523,7 @@ router.post('/product-content', featureGate('ai-recommendations'), async (req: R
       return;
     }
 
-    const { productId, formats } = validate(ProductContentSchema, req.body);
+    const { productId } = validate(ProductContentSchema, req.body);
 
     const productResult = await db.query(
       `SELECT p.id, p.title,
