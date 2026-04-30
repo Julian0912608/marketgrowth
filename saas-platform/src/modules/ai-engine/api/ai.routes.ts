@@ -148,7 +148,8 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
 
     const cached = await cache.get(`ai:insights:${tenantId}`);
     if (cached) {
-      res.json({ ...(cached as Record<string, unknown>), cached: true });
+      const cachedObj = cached as unknown as Record<string, unknown>;
+      res.json({ ...cachedObj, cached: true });
       return;
     }
 
