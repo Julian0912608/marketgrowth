@@ -146,9 +146,9 @@ router.get('/insights', featureGate('ai-recommendations'), async (req: Request, 
   try {
     const { tenantId, planSlug } = getTenantContext();
 
-    const cached = await cache.get<unknown>(`ai:insights:${tenantId}`);
+    const cached = await cache.get(`ai:insights:${tenantId}`);
     if (cached) {
-      res.json({ ...cached as object, cached: true });
+      res.json({ ...(cached as Record<string, unknown>), cached: true });
       return;
     }
 
@@ -399,9 +399,9 @@ router.post('/generate-image', featureGate('ai-recommendations'), async (req: Re
 
     const result = await generateAdCreative({
       product:    productCtx,
-      format:     input.format,
-      platform:   input.platform,
-      style:      input.style,
+      format:     input.format     as 'single' | 'carousel' | 'story' | 'banner',
+      platform:   input.platform   as 'instagram' | 'tiktok' | 'meta' | 'google',
+      style:      input.style      as 'minimal' | 'bold' | 'lifestyle' | 'product-focus',
       brandColor: input.brandColor,
     });
 
