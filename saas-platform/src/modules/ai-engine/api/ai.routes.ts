@@ -356,11 +356,12 @@ router.post('/social-content', featureGate('ai-recommendations'), async (req: Re
 
     const input = validate(SocialContentSchema, req.body);
 
-    const prompt = `Generate ${input.count} ${input.platform} ${input.format ?? 'post'} variant${input.count > 1 ? 's' : ''} about: ${input.topic}.
+    const count = input.count ?? 1;
+    const prompt = `Generate ${count} ${input.platform} ${input.format ?? 'post'} variant${count > 1 ? 's' : ''} about: ${input.topic}.
 Tone: ${input.tone}.
 ${input.customContext ? `Context: ${input.customContext}` : ''}
 
-Return ONLY JSON array of ${input.count}: [{"hook":"...","caption":"...","cta":"...","hashtags":["tag1","tag2"]}]`;
+Return ONLY JSON array of ${count}: [{"hook":"...","caption":"...","cta":"...","hashtags":["tag1","tag2"]}]`;
 
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-20250514',
@@ -375,7 +376,7 @@ Return ONLY JSON array of ${input.count}: [{"hook":"...","caption":"...","cta":"
     try { content = JSON.parse(clean); }
     catch { content = [{ error: 'Failed to parse content' }]; }
 
-    await trackUsage(tenantId, input.count * 2, planSlug);
+    await trackUsage(tenantId, count * 2, planSlug);
     res.json({ variants: content });
   } catch (err) { next(err); }
 });
