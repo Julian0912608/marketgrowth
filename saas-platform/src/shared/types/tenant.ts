@@ -5,6 +5,11 @@
 // V0 Gap 1 update: countryCode toegevoegd aan TenantContext.
 // Tenant interface uitgebreid met country_code, sells_to_countries,
 // business_goal, marketing_style.
+//
+// NB: countryCode is OPTIONAL in TenantContext omdat workers
+// (sync, email) bewust country-agnostic zijn. De HTTP middleware
+// vult het altijd live in. Consumers moeten `?? null` gebruiken
+// als ze de waarde naar de feature-flags service doorgeven.
 // ============================================================
 
 export type PlanSlug = 'starter' | 'growth' | 'scale';
@@ -33,7 +38,7 @@ export interface TenantContext {
   tenantSlug:       string;
   userId:           string;
   planSlug:         PlanSlug;
-  countryCode:      string | null;   // ISO 3166-1 alpha-2, null als niet ingesteld
+  countryCode?:     string | null;   // ISO 3166-1 alpha-2; optional voor workers
   traceId:          string;
   requestStartedAt: Date;
 }
