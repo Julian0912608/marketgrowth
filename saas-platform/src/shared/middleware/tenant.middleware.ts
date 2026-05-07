@@ -1,28 +1,32 @@
 // ============================================================
 // src/shared/middleware/tenant.middleware.ts
 //
-// FIX: planSlug wordt nu live opgehaald uit Redis/DB zodat
+// FIX: planSlug wordt live opgehaald uit Redis/DB zodat
 // plan-upgrades direct effect hebben zonder opnieuw inloggen.
-// Ook: per-tenant rate limiting toegevoegd naast IP-limiet.
+// Per-tenant rate limiting toegevoegd naast IP-limiet.
+//
+// V0 Gap 1: countryCode wordt nu ook live opgehaald en in de
+// tenant context gezet voor de feature-flags layer.
 // ============================================================
 
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { runWithTenantContext } from './tenant-context';
-import { db } from '../../infrastructure/database/connection';
-import { cache } from '../../infrastructure/cache/redis';
+import { db }     from '../../infrastructure/database/connection';
+import { cache }  from '../../infrastructure/cache/redis';
 import { logger } from '../logging/logger';
 import { PlanSlug } from '../types/tenant';
 
-// Haal de raw ioredis client op voor incr/expire (niet beschikbaar via cache wrapper)
+// Haal de raw ioredis client op voor incr/expire
 function getRawRedis() {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { redis } = require('../../infrastructure/cache/redis');
   return redis as any;
 }
 
-const PLAN_CACHE_TTL = 300; // 5 minuten — kort genoeg voor snelle upgrades
+const PLAN_CACHE_TTL    = 300; // 5 min
+const COUNTRY_CACHE_TTL = 300; // 5 min
 
 async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
   const cacheKey = `perm:plan:${tenantId}`;
@@ -31,7 +35,7 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
     const cached = await cache.get(cacheKey);
     if (cached) return cached as PlanSlug;
   } catch {
-    // Redis niet beschikbaar — val terug op DB
+    // Redis niet beschikbaar, val terug op DB
   }
 
   try {
@@ -52,7 +56,7 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
     try {
       await cache.set(cacheKey, planSlug, PLAN_CACHE_TTL);
     } catch {
-      // Cache set mislukt — geen probleem
+      // Cache set mislukt is geen probleem
     }
 
     return planSlug;
@@ -62,6 +66,49 @@ async function getLivePlanSlug(tenantId: string): Promise<PlanSlug> {
       error: (err as Error).message,
     });
     return 'starter' as PlanSlug;
+  }
+}
+
+// V0 Gap 1: live country lookup met cache.
+// "_null_" sentinel zodat we niet steeds de DB raken voor tenants
+// die nog geen country hebben.
+async function getLiveCountryCode(tenantId: string): Promise<string | null> {
+  const cacheKey = `tenant:country:${tenantId}`;
+
+  try {
+    const cached = await cache.get(cacheKey);
+    if (cached === '_null_') return null;
+    if (cached) return cached;
+  } catch {
+    // Redis down, val terug op DB
+  }
+
+  try {
+    const result = await db.query<{ country_code: string | null }>(
+      `SELECT country_code FROM tenants WHERE id = $1 LIMIT 1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
+
+    const countryCode = result.rows[0]?.country_code ?? null;
+
+    try {
+      await cache.set(
+        cacheKey,
+        countryCode ?? '_null_',
+        COUNTRY_CACHE_TTL,
+      );
+    } catch {
+      // Cache set mislukt is geen probleem
+    }
+
+    return countryCode;
+  } catch (err) {
+    logger.warn('tenant.middleware.country_lookup_failed', {
+      tenantId,
+      error: (err as Error).message,
+    });
+    return null;
   }
 }
 
@@ -110,14 +157,18 @@ export function tenantMiddleware() {
       return;
     }
 
-    // Live planSlug ophalen — niet vertrouwen op JWT
-    const planSlug = await getLivePlanSlug(tenantId);
+    // Live planSlug + countryCode parallel ophalen voor minimale latency
+    const [planSlug, countryCode] = await Promise.all([
+      getLivePlanSlug(tenantId),
+      getLiveCountryCode(tenantId),
+    ]);
 
     const context = {
       tenantId,
       tenantSlug:       payload.tenantSlug || '',
       userId:           payload.sub,
       planSlug,
+      countryCode,
       traceId:          uuidv4(),
       requestStartedAt: new Date(),
     };
@@ -133,4 +184,12 @@ export function tenantMiddleware() {
 
     runWithTenantContext(context, () => next());
   };
+}
+
+// Cache invalidation hook voor wanneer de tenant zijn country wijzigt
+// (later via Settings of admin override).
+export async function invalidateTenantContextCache(tenantId: string): Promise<void> {
+  await cache.del(`perm:plan:${tenantId}`);
+  await cache.del(`tenant:country:${tenantId}`);
+  logger.info('tenant.middleware.cache_invalidated', { tenantId });
 }
