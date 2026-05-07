@@ -5,6 +5,8 @@
 // zodat HMAC verificatie correct werkt op de raw payload.
 //
 // PR 3a: metaCreativeRouter geregistreerd op /api/ai/meta-creative.
+//
+// V0 Gap 1: featureFlagsRouter geregistreerd op /api/feature-flags.
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -151,6 +153,15 @@ try {
   app.use('/api/onboarding', onboardingRouter);
   console.log('  onboardingRouter OK');
 } catch (e: any) { console.error('  onboardingRouter FAILED:', e.message); }
+
+// V0 Gap 1: country-aware feature flags.
+// Geregistreerd na onboarding (dat country_code schrijft) en voor de
+// rest, zodat alle volgende modules de flag-layer kunnen gebruiken.
+try {
+  const { featureFlagsRouter } = require('./modules/feature-flags/api/feature-flags.routes');
+  app.use('/api/feature-flags', featureFlagsRouter);
+  console.log('  featureFlagsRouter OK');
+} catch (e: any) { console.error('  featureFlagsRouter FAILED:', e.message); }
 
 try {
   const { billingRouter } = require('./modules/billing/api/billing.routes');
