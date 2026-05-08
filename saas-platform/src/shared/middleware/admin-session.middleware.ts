@@ -4,9 +4,15 @@
 // Express middleware voor admin-only routes.
 // Valideert het 'x-admin-session' header tegen de admin_sessions tabel.
 //
-// Aanname over schema: admin_sessions heeft kolommen 'token' (TEXT)
-// en 'expires_at' (TIMESTAMPTZ). Als kolomnamen anders zijn faalt de
-// query closed (deny access) — controleer Railway logs bij eerste deploy.
+// Schema admin_sessions:
+//   id          uuid (PK)
+//   token_hash  text  ← SHA-256 hex hash van de raw token
+//   expires_at  timestamptz
+//   revoked     boolean
+//   ...
+//
+// De client (cookie / x-admin-session header) bevat de raw token.
+// Wij hashen die met SHA-256 en zoeken op token_hash.
 //
 // Gebruik:
 //   import { requireAdminSession } from '../../shared/middleware/admin-session.middleware';
@@ -14,6 +20,7 @@
 // ============================================================
 
 import { Request, Response, NextFunction } from 'express';
+import { createHash } from 'crypto';
 import { db }     from '../../infrastructure/database/connection';
 import { logger } from '../logging/logger';
 
@@ -21,20 +28,38 @@ interface AdminSessionRequest extends Request {
   adminSessionToken?: string;
 }
 
-async function isValidAdminSession(token: string): Promise<boolean> {
-  if (!token || token.length < 16) return false;
+function hashToken(rawToken: string): string {
+  return createHash('sha256').update(rawToken).digest('hex');
+}
+
+async function isValidAdminSession(rawToken: string): Promise<boolean> {
+  if (!rawToken || rawToken.length < 16) return false;
+
+  const tokenHash = hashToken(rawToken);
 
   try {
-    const result = await db.query<{ valid: boolean }>(
+    const result = await db.query<{ valid: number }>(
       `SELECT 1 AS valid
        FROM admin_sessions
-       WHERE token = $1
+       WHERE token_hash = $1
          AND expires_at > NOW()
+         AND revoked = false
        LIMIT 1`,
-      [token],
+      [tokenHash],
       { allowNoTenant: true }
     );
-    return result.rows.length > 0;
+
+    if (result.rows.length === 0) return false;
+
+    // Touch last_seen_at zodat we activity kunnen tracken.
+    // Best-effort: faal niet als deze update faalt.
+    db.query(
+      `UPDATE admin_sessions SET last_seen_at = NOW() WHERE token_hash = $1`,
+      [tokenHash],
+      { allowNoTenant: true }
+    ).catch(() => { /* swallow */ });
+
+    return true;
   } catch (err) {
     logger.error('admin.session.lookup_failed', {
       error: (err as Error).message,
