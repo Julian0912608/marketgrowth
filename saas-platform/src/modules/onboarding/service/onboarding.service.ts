@@ -1,146 +1,198 @@
 // ============================================================
 // src/modules/onboarding/service/onboarding.service.ts
+//
+// Business logic voor de 4-stappen onboarding wizard.
+//
+// Beslissingen vanuit Master Plan v3.1 + Julian:
+//   - Step 1 is hard required (country drives feature flags)
+//   - Skip vanaf Step 2 = all-or-nothing (status 'skipped')
+//   - Settings biedt later edit (updateProfileFields)
+//   - Cache invalidatie na country change: tenant context + flags
+//
+// Day Zero AI setup: voor Gap 2 leveren we alleen een log-stub.
+// Volledige BullMQ implementatie volgt in Gap 3.
 // ============================================================
 
-import { db } from '../../../infrastructure/database/connection';
-import { getTenantContext } from '../../../shared/middleware/tenant-context';
-import { eventBus } from '../../../shared/events/event-bus';
 import { logger } from '../../../shared/logging/logger';
-import { OnboardingRepository } from '../repository/onboarding.repository';
-
-export type OnboardingStep =
-  | 'account_created'
-  | 'plan_selected'
-  | 'payment_completed'
-  | 'shop_connected'
-  | 'completed';
-
-export interface OnboardingStatus {
-  currentStep:     OnboardingStep;
-  completedSteps:  OnboardingStep[];
-  percentComplete: number;
-  isComplete:      boolean;
-  nextAction: {
-    step:        OnboardingStep;
-    label:       string;
-    description: string;
-    url:         string;
-  } | null;
-}
-
-const STEP_ORDER: OnboardingStep[] = [
-  'account_created',
-  'plan_selected',
-  'payment_completed',
-  'shop_connected',
-  'completed',
-];
-
-const STEP_LABELS: Record<OnboardingStep, { label: string; description: string; url: string }> = {
-  account_created:   { label: 'Account aangemaakt',   description: 'Account is aangemaakt',           url: '/onboarding' },
-  plan_selected:     { label: 'Plan kiezen',           description: 'Kies het pakket dat bij je past', url: '/onboarding' },
-  payment_completed: { label: 'Betaling instellen',    description: 'Voeg een betaalmethode toe',      url: '/onboarding' },
-  shop_connected:    { label: 'Webshop koppelen',      description: 'Verbind je eerste webshop',       url: '/onboarding' },
-  completed:         { label: 'Klaar!',                description: 'Je platform staat klaar',         url: '/dashboard' },
-};
+import {
+  OnboardingRepository,
+  onboardingRepository,
+} from '../repository/onboarding.repository';
+import { featureFlagsService } from '../../feature-flags/service/feature-flags.service';
+import { invalidateTenantContextCache } from '../../../shared/middleware/tenant.middleware';
+import {
+  OnboardingState,
+  Step1Input,
+  Step2Input,
+  Step3Input,
+  CompleteInput,
+  UpdateProfileInput,
+  StepResult,
+  CompleteResult,
+} from '../types/onboarding.types';
 
 export class OnboardingService {
-  constructor(private readonly repo = new OnboardingRepository()) {}
+  constructor(
+    private readonly repo: OnboardingRepository = onboardingRepository,
+  ) {}
 
-  async getStatus(): Promise<OnboardingStatus> {
-    const { tenantId } = getTenantContext();
-    const progress = await this.repo.getProgress(tenantId);
-
-    const currentIndex    = STEP_ORDER.indexOf(progress.current_step as OnboardingStep);
-    const percentComplete = Math.round((currentIndex / (STEP_ORDER.length - 1)) * 100);
-    const isComplete      = progress.current_step === 'completed';
-
-    const nextStep = isComplete ? null : STEP_ORDER[currentIndex + 1] as OnboardingStep;
-    const nextAction = nextStep ? {
-      step: nextStep,
-      ...STEP_LABELS[nextStep],
-    } : null;
-
-    return {
-      currentStep:    progress.current_step as OnboardingStep,
-      completedSteps: progress.completed_steps as OnboardingStep[],
-      percentComplete,
-      isComplete,
-      nextAction,
-    };
+  async getState(tenantId: string): Promise<OnboardingState> {
+    const state = await this.repo.getState(tenantId);
+    if (!state) {
+      throw new Error(`Tenant not found: ${tenantId}`);
+    }
+    return state;
   }
 
-  async completeStep(step: OnboardingStep): Promise<OnboardingStatus> {
-    const { tenantId } = getTenantContext();
-
-    const progress = await this.repo.getProgress(tenantId);
-    const completingIndex = STEP_ORDER.indexOf(step);
-    const currentIndex    = STEP_ORDER.indexOf(progress.current_step as OnboardingStep);
-
-    // Al voltooid: idempotent teruggeven
-    const alreadyCompleted = (progress.completed_steps as string[]).includes(step);
-    if (alreadyCompleted && step !== 'completed') {
-      // Maar zorg dat current_step altijd vooruit gaat
-      if (completingIndex >= currentIndex) {
-        const nextStep = STEP_ORDER[completingIndex + 1] as OnboardingStep ?? 'completed';
-        await this.repo.updateProgress(tenantId, { completedStep: step, nextStep });
-      }
-      return this.getStatus();
+  async saveStep1(tenantId: string, input: Step1Input): Promise<StepResult> {
+    const current = await this.repo.getState(tenantId);
+    if (!current) throw new Error(`Tenant not found: ${tenantId}`);
+    if (current.status === 'completed') {
+      // Edits gaan via Settings, niet via wizard
+      throw new Error('Onboarding already completed. Use settings to edit.');
     }
 
-    // Vul alle tussenliggende stappen automatisch in als die nog niet voltooid zijn
-    // Bijv: als current=account_created en step=plan_selected, markeer account_created ook als voltooid
-    if (completingIndex > currentIndex) {
-      for (let i = currentIndex; i < completingIndex; i++) {
-        const intermediateStep = STEP_ORDER[i] as OnboardingStep;
-        const alreadyDone = (progress.completed_steps as string[]).includes(intermediateStep);
-        if (!alreadyDone) {
-          await this.repo.updateProgress(tenantId, {
-            completedStep: intermediateStep,
-            nextStep: STEP_ORDER[i + 1] as OnboardingStep,
-          });
-          logger.info('onboarding.step.auto_completed', { tenantId, step: intermediateStep });
-        }
-      }
-    }
-
-    // Nu de gevraagde stap voltooien
-    const nextStep = STEP_ORDER[completingIndex + 1] as OnboardingStep ?? 'completed';
-    await this.repo.updateProgress(tenantId, { completedStep: step, nextStep });
-
-    logger.info('onboarding.step.completed', { tenantId, step, nextStep });
-
-    await eventBus.publish({
-      type: 'onboarding.step_completed',
+    await this.repo.saveStep1(
       tenantId,
-      occurredAt: new Date(),
-      payload: { step, nextStep },
-    });
-
-    if (step === 'shop_connected' || nextStep === 'completed') {
-      await this.markCompleted(tenantId);
-    }
-
-    return this.getStatus();
-  }
-
-  private async markCompleted(tenantId: string): Promise<void> {
-    await db.query(
-      `UPDATE onboarding_progress
-       SET current_step = 'completed',
-           completed_steps = array_append(completed_steps, 'completed'),
-           completed_at = now()
-       WHERE tenant_id = $1`,
-      [tenantId]
+      input.countryCode,
+      input.sellsToCountries,
     );
 
-    await eventBus.publish({
-      type: 'onboarding.completed',
+    // Country gewijzigd: tenant context cache + feature flags cache
+    // moeten beide leeg, anders ziet user op step 4 nog flags voor
+    // de oude country.
+    await Promise.all([
+      invalidateTenantContextCache(tenantId),
+      featureFlagsService.invalidateAll(),
+    ]);
+
+    logger.info('onboarding.step1.saved', {
       tenantId,
-      occurredAt: new Date(),
-      payload: {},
+      countryCode:  input.countryCode,
+      sellsToCount: input.sellsToCountries.length,
     });
 
-    logger.info('onboarding.completed', { tenantId });
+    return { ok: true, status: 'in_progress', nextStep: 2 };
+  }
+
+  async saveStep2(tenantId: string, input: Step2Input): Promise<StepResult> {
+    const current = await this.repo.getState(tenantId);
+    if (!current) throw new Error(`Tenant not found: ${tenantId}`);
+    if (current.status === 'completed') {
+      throw new Error('Onboarding already completed. Use settings to edit.');
+    }
+    if (!current.countryCode) {
+      // Hard force: step 1 moet eerst gebeuren
+      throw new Error('Step 1 must be completed first.');
+    }
+
+    await this.repo.saveStep2(tenantId, input.businessGoal);
+
+    logger.info('onboarding.step2.saved', {
+      tenantId,
+      businessGoal: input.businessGoal,
+    });
+
+    return { ok: true, status: 'in_progress', nextStep: 3 };
+  }
+
+  async saveStep3(tenantId: string, input: Step3Input): Promise<StepResult> {
+    const current = await this.repo.getState(tenantId);
+    if (!current) throw new Error(`Tenant not found: ${tenantId}`);
+    if (current.status === 'completed') {
+      throw new Error('Onboarding already completed. Use settings to edit.');
+    }
+    if (!current.countryCode) {
+      throw new Error('Step 1 must be completed first.');
+    }
+
+    await this.repo.saveStep3(tenantId, input.marketingStyle);
+
+    logger.info('onboarding.step3.saved', {
+      tenantId,
+      marketingStyle: input.marketingStyle,
+    });
+
+    return { ok: true, status: 'in_progress', nextStep: 4 };
+  }
+
+  // Wordt aangeroepen na step 4 (store connected of "I'll connect later").
+  // Idempotent: dubbele calls geven gewoon de huidige state terug.
+  async complete(tenantId: string, input: CompleteInput): Promise<CompleteResult> {
+    const current = await this.repo.getState(tenantId);
+    if (!current) throw new Error(`Tenant not found: ${tenantId}`);
+    if (!current.countryCode) {
+      throw new Error('Step 1 must be completed first.');
+    }
+    if (current.status === 'completed') {
+      return { ok: true, status: 'completed' };
+    }
+
+    await this.repo.markCompleted(tenantId);
+
+    logger.info('onboarding.completed', {
+      tenantId,
+      shopConnected: input.shopConnected,
+    });
+
+    // Day Zero AI setup trigger.
+    // Gap 2 sprint: alleen een log-stub. Echte BullMQ job in Gap 3.
+    let dayZeroJobId: string | undefined;
+    if (input.shopConnected) {
+      dayZeroJobId = `day-zero:${tenantId}:${Date.now()}`;
+      logger.info('onboarding.day_zero.queued_stub', {
+        tenantId,
+        dayZeroJobId,
+        note: 'Stub. Real BullMQ job ships in Gap 3.',
+      });
+    }
+
+    return { ok: true, status: 'completed', dayZeroJobId };
+  }
+
+  // Skip vanaf step 2 (all-or-nothing). Step 1 kan niet geskipt worden.
+  async skip(tenantId: string): Promise<StepResult> {
+    const current = await this.repo.getState(tenantId);
+    if (!current) throw new Error(`Tenant not found: ${tenantId}`);
+    if (!current.countryCode) {
+      throw new Error('Cannot skip before step 1 is completed.');
+    }
+    if (current.status !== 'in_progress') {
+      throw new Error('Onboarding is not in progress.');
+    }
+
+    await this.repo.markSkipped(tenantId);
+
+    logger.info('onboarding.skipped', {
+      tenantId,
+      stepWhenSkipped: current.step,
+    });
+
+    return { ok: true, status: 'skipped' };
+  }
+
+  // Edits via Settings, beschikbaar na completed of skipped status.
+  // Bij country wijziging worden de caches opnieuw leeggemaakt.
+  async updateProfileFields(
+    tenantId: string,
+    fields: UpdateProfileInput,
+  ): Promise<OnboardingState> {
+    await this.repo.updateProfile(tenantId, fields);
+
+    if (fields.countryCode !== undefined) {
+      await Promise.all([
+        invalidateTenantContextCache(tenantId),
+        featureFlagsService.invalidateAll(),
+      ]);
+    }
+
+    logger.info('onboarding.profile_updated', {
+      tenantId,
+      fieldsUpdated: Object.keys(fields),
+    });
+
+    return this.getState(tenantId);
   }
 }
+
+export const onboardingService = new OnboardingService();
