@@ -7,6 +7,7 @@
 // PR 3a: metaCreativeRouter geregistreerd op /api/ai/meta-creative.
 //
 // V0 Gap 1: featureFlagsRouter geregistreerd op /api/feature-flags.
+// V0 Gap 1 admin: adminFeatureFlagsRouter op /api/admin/feature-flags.
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -78,7 +79,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-admin-token'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-admin-token', 'x-admin-session'],
 }));
 
 // ── Body parsers ──────────────────────────────────────────────
@@ -155,8 +156,6 @@ try {
 } catch (e: any) { console.error('  onboardingRouter FAILED:', e.message); }
 
 // V0 Gap 1: country-aware feature flags.
-// Geregistreerd na onboarding (dat country_code schrijft) en voor de
-// rest, zodat alle volgende modules de flag-layer kunnen gebruiken.
 try {
   const { featureFlagsRouter } = require('./modules/feature-flags/api/feature-flags.routes');
   app.use('/api/feature-flags', featureFlagsRouter);
@@ -188,12 +187,21 @@ try {
 } catch (e: any) { console.error('  aiRouter FAILED:', e.message); }
 
 // PR 3a: Meta Creative Studio — aparte router op /api/ai/meta-creative
-// Geregistreerd na aiRouter zodat de meer-specifieke route eerst gepakt wordt.
 try {
   const { metaCreativeRouter } = require('./modules/ai-engine/api/meta-creative.routes');
   app.use('/api/ai/meta-creative', metaCreativeRouter);
   console.log('  metaCreativeRouter OK');
 } catch (e: any) { console.error('  metaCreativeRouter FAILED:', e.message); }
+
+// V0 Gap 1 admin: feature flag matrix beheer.
+// MOET vóór adminRouter geregistreerd zijn zodat de specifieke
+// /api/admin/feature-flags route niet door /api/admin generieke
+// routes wordt opgevangen.
+try {
+  const { adminFeatureFlagsRouter } = require('./modules/admin/feature-flags/admin-feature-flags.routes');
+  app.use('/api/admin/feature-flags', adminFeatureFlagsRouter);
+  console.log('  adminFeatureFlagsRouter OK');
+} catch (e: any) { console.error('  adminFeatureFlagsRouter FAILED:', e.message); }
 
 try {
   const { adminRouter } = require('./modules/admin/api/admin.routes');
