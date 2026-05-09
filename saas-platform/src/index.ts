@@ -163,6 +163,12 @@ try {
 } catch (e: any) { console.error('  featureFlagsRouter FAILED:', e.message); }
 
 try {
+  const { dayZeroRouter } = require('./modules/day-zero/api/day-zero.routes');
+  app.use('/api/day-zero', dayZeroRouter);
+  console.log('  dayZeroRouter OK');
+} catch (e: any) { console.error('  dayZeroRouter FAILED:', e.message); }
+
+try {
   const { billingRouter } = require('./modules/billing/api/billing.routes');
   app.use('/api/billing', billingRouter);
   console.log('  billingRouter OK');
