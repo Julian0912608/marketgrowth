@@ -210,6 +210,12 @@ try {
 } catch (e: any) { console.error('  adminRouter FAILED:', e.message); }
 
 try {
+  const { adminOnboardingRouter } = require('./modules/admin/api/admin-onboarding.routes');
+  app.use('/api/admin', adminOnboardingRouter);
+  console.log('  adminOnboardingRouter OK');
+} catch (e: any) { console.error('  adminOnboardingRouter FAILED:', e.message); }
+
+try {
   const { teamRouter } = require('./modules/team/api/team.routes');
   app.use('/api/team', teamRouter);
   console.log('  teamRouter OK');
