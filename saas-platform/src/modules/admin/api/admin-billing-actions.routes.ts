@@ -2,13 +2,17 @@
 // src/modules/admin/api/admin-billing-actions.routes.ts
 //
 // Admin endpoints voor pause / cancel / reactivate van tenant
-// abonnementen. Vervangt het oude /tenants/:id/suspend gedrag
-// (de oude endpoint blijft bestaan voor backwards compat,
-// maar wordt door de admin UI niet meer aangeroepen).
+// abonnementen. Vervangt het oude /tenants/:id/suspend gedrag.
 //
-// Fail-fast principe: als de Stripe call faalt, return 500 en
-// doe GEEN DB update. Voorkomt mismatch waarbij de tenant
-// lokaal geblokkeerd is maar Stripe blijft factureren.
+// Defensive checks:
+//   - Voor pause/reactivate: retrieve Stripe sub eerst, checken
+//     dat die echt actief is. Voorkomt errors op DB ↔ Stripe drift.
+//   - Cancel: behandelt 'resource_missing' en 'al gecancelde' subs
+//     als success-pad (DB syncen) ipv als fout.
+//   - Billing-status: rapporteert drift terug aan de UI.
+//
+// Fail-fast principe: als de Stripe write-call faalt, return 502
+// en doe GEEN DB update.
 //
 // Endpoints:
 //   GET  /admin/tenants/:id/billing-status
@@ -42,6 +46,12 @@ interface TenantBillingRow {
   stripe_sub_id:        string | null;
   stripe_customer_id:   string | null;
 }
+
+// Stripe subscription statussen die we als 'levend' beschouwen
+// (kunnen pauzeren / cancellen / reactiveren).
+const ALIVE_STRIPE_STATUSES: ReadonlySet<Stripe.Subscription.Status> = new Set([
+  'active', 'trialing', 'past_due', 'unpaid',
+]);
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -97,7 +107,28 @@ async function invalidateAllTenantCaches(tenantId: string): Promise<void> {
   ]);
 }
 
+// Probeer Stripe subscription op te halen. Returns:
+//   { found: true, sub }     - bestaat
+//   { found: false }         - bestaat niet meer (resource_missing)
+//   { error: '...' }         - andere fout (network, auth, etc)
+async function fetchStripeSub(stripeSubId: string): Promise
+  | { found: true;  sub: Stripe.Subscription }
+  | { found: false }
+  | { error: string }
+> {
+  try {
+    const sub = await stripe.subscriptions.retrieve(stripeSubId);
+    return { found: true, sub };
+  } catch (err: any) {
+    if (err?.code === 'resource_missing' || err?.statusCode === 404) {
+      return { found: false };
+    }
+    return { error: err?.message ?? 'Onbekende Stripe-fout' };
+  }
+}
+
 // ── GET /admin/tenants/:id/billing-status ────────────────────
+// Rapporteert ook DB ↔ Stripe drift wanneer dat detecteerbaar is.
 router.get('/tenants/:id/billing-status', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -112,15 +143,53 @@ router.get('/tenants/:id/billing-status', async (req: AuthedRequest, res: Respon
       return;
     }
 
+    // Optioneel: live Stripe-status ophalen voor drift-detectie.
+    // We doen dit alleen wanneer er een sub_id is. Bij netwerkfout
+    // returneren we de DB-state met stripeStatus=null (geen drift-signal).
+    let stripeStatus: Stripe.Subscription.Status | null = null;
+    let stripeMissing = false;
+    let stripePauseCollection = false;
+
+    if (row.stripe_sub_id) {
+      const result = await fetchStripeSub(row.stripe_sub_id);
+      if ('found' in result && result.found) {
+        stripeStatus = result.sub.status;
+        stripePauseCollection = Boolean(result.sub.pause_collection);
+      } else if ('found' in result && !result.found) {
+        stripeMissing = true;
+      }
+      // Bij netwerkfout: stripeStatus blijft null
+    }
+
+    // Drift detectie: DB zegt active maar Stripe is dood/missing
+    const driftDetected = row.tenant_status === 'active' && (
+      stripeMissing ||
+      (stripeStatus !== null && !ALIVE_STRIPE_STATUSES.has(stripeStatus))
+    );
+
     res.json({
-      tenantStatus:       row.tenant_status,
-      pausedAt:           row.paused_at?.toISOString() ?? null,
-      subscriptionStatus: row.subscription_status,
-      hasStripeSub:       Boolean(row.stripe_sub_id),
-      hasStripeCustomer:  Boolean(row.stripe_customer_id),
-      canPause:           row.tenant_status === 'active' && Boolean(row.stripe_sub_id),
-      canCancel:          row.tenant_status !== 'cancelled',
-      canReactivate:      row.tenant_status === 'suspended' && row.paused_at !== null && Boolean(row.stripe_sub_id),
+      tenantStatus:          row.tenant_status,
+      pausedAt:              row.paused_at?.toISOString() ?? null,
+      subscriptionStatus:    row.subscription_status,
+      hasStripeSub:          Boolean(row.stripe_sub_id),
+      hasStripeCustomer:     Boolean(row.stripe_customer_id),
+      stripeStatus,
+      stripeMissing,
+      stripePauseCollection,
+      driftDetected,
+      canPause:
+        row.tenant_status === 'active' &&
+        Boolean(row.stripe_sub_id) &&
+        stripeStatus !== null &&
+        ALIVE_STRIPE_STATUSES.has(stripeStatus) &&
+        !stripePauseCollection,
+      canCancel: row.tenant_status !== 'cancelled',
+      canReactivate:
+        row.tenant_status === 'suspended' &&
+        row.paused_at !== null &&
+        Boolean(row.stripe_sub_id) &&
+        stripeStatus !== null &&
+        ALIVE_STRIPE_STATUSES.has(stripeStatus),
     });
   } catch (err) {
     next(err);
@@ -128,9 +197,6 @@ router.get('/tenants/:id/billing-status', async (req: AuthedRequest, res: Respon
 });
 
 // ── POST /admin/tenants/:id/pause ────────────────────────────
-// Stripe: pause_collection met 'mark_uncollectible' behavior.
-// Subscription blijft bestaan, geen incasso gedurende pauze.
-// Reactivate herstelt de incasso vanaf de volgende cycle.
 router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -162,16 +228,65 @@ router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next
       return;
     }
 
-    // Stripe-call EERST. Geen DB update bij falen.
+    // DEFENSIVE: check live Stripe status voor we proberen te pauzeren.
+    const fetch = await fetchStripeSub(row.stripe_sub_id);
+
+    if ('error' in fetch) {
+      logger.error('admin.stripe.pause_retrieve_failed', {
+        tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
+      });
+      res.status(502).json({
+        error:   'stripe_failed',
+        message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+      });
+      return;
+    }
+
+    if (!fetch.found) {
+      res.status(409).json({
+        error:    'stripe_sub_missing',
+        message:  'Stripe subscription bestaat niet meer. Gebruik "Definitief annuleren" om de DB te syncen.',
+        driftDetected: true,
+      });
+      return;
+    }
+
+    if (!ALIVE_STRIPE_STATUSES.has(fetch.sub.status)) {
+      res.status(409).json({
+        error:    'stripe_sub_not_alive',
+        message:  `Stripe subscription staat op '${fetch.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
+        stripeStatus:  fetch.sub.status,
+        driftDetected: true,
+      });
+      return;
+    }
+
+    if (fetch.sub.pause_collection) {
+      res.status(409).json({
+        error:    'already_paused_in_stripe',
+        message:  'Stripe subscription is al gepauzeerd. DB wordt nu gesynct.',
+      });
+      // Ook al is Stripe al pauzed, syncen we de DB alvast voor consistentie
+      await db.query(
+        `UPDATE tenants
+         SET status = 'suspended',
+             paused_at = COALESCE(paused_at, NOW()),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [id], { allowNoTenant: true }
+      );
+      await invalidateAllTenantCaches(id);
+      return;
+    }
+
+    // Stripe-call. Bij falen: geen DB update.
     try {
       await stripe.subscriptions.update(row.stripe_sub_id, {
         pause_collection: { behavior: 'mark_uncollectible' },
       });
     } catch (stripeErr: any) {
       logger.error('admin.stripe.pause_failed', {
-        tenantId:   id,
-        subId:      row.stripe_sub_id,
-        error:      stripeErr.message,
+        tenantId: id, subId: row.stripe_sub_id, error: stripeErr.message,
       });
       res.status(502).json({
         error:   'stripe_failed',
@@ -210,8 +325,8 @@ router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next
 });
 
 // ── POST /admin/tenants/:id/cancel ───────────────────────────
-// Permanent: Stripe subscription wordt gecanceld. Klant moet
-// een nieuwe checkout doorlopen om terug te komen.
+// Behandelt resource_missing en al-gecancelde subs als success
+// (DB syncen). Voor andere fouten: fail-fast.
 router.post('/tenants/:id/cancel', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -235,37 +350,64 @@ router.post('/tenants/:id/cancel', async (req: AuthedRequest, res: Response, nex
       return;
     }
 
-    // Als er een Stripe sub is, eerst Stripe. Bij falen: geen DB update.
-    // Als er GEEN Stripe sub is (bv. nooit doorbetaald), gewoon DB update.
+    let stripeAction: 'cancelled' | 'already_dead' | 'no_sub' = 'no_sub';
+
     if (row.stripe_sub_id) {
-      try {
-        await stripe.subscriptions.cancel(row.stripe_sub_id);
-      } catch (stripeErr: any) {
-        // 404/resource_missing acceptabel (al gecanceld in Stripe)
-        const isAlreadyGone = stripeErr?.code === 'resource_missing'
-                            || stripeErr?.statusCode === 404;
+      // Eerst retrieve om te weten of we daadwerkelijk moeten cancellen
+      const fetch = await fetchStripeSub(row.stripe_sub_id);
 
-        if (!isAlreadyGone) {
-          logger.error('admin.stripe.cancel_failed', {
-            tenantId:   id,
-            subId:      row.stripe_sub_id,
-            error:      stripeErr.message,
-          });
-          res.status(502).json({
-            error:   'stripe_failed',
-            message: `Stripe cancel mislukt: ${stripeErr.message}. DB niet gewijzigd.`,
-          });
-          return;
-        }
-
-        logger.warn('admin.stripe.cancel_already_gone', {
-          tenantId: id,
-          subId:    row.stripe_sub_id,
+      if ('error' in fetch) {
+        logger.error('admin.stripe.cancel_retrieve_failed', {
+          tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
         });
+        res.status(502).json({
+          error:   'stripe_failed',
+          message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+        });
+        return;
+      }
+
+      if (!fetch.found) {
+        // Sub bestaat niet meer in Stripe. Cleanup-pad: alleen DB syncen.
+        stripeAction = 'already_dead';
+        logger.warn('admin.stripe.cancel_sub_missing', {
+          tenantId: id, subId: row.stripe_sub_id,
+        });
+      } else if (fetch.sub.status === 'canceled') {
+        // Al canceled in Stripe. Cleanup-pad: alleen DB syncen.
+        stripeAction = 'already_dead';
+        logger.warn('admin.stripe.cancel_sub_already_canceled', {
+          tenantId: id, subId: row.stripe_sub_id,
+        });
+      } else {
+        // Levende sub: echte cancel doen
+        try {
+          await stripe.subscriptions.cancel(row.stripe_sub_id);
+          stripeAction = 'cancelled';
+        } catch (stripeErr: any) {
+          // Race condition mogelijk: tussen retrieve en cancel canceled
+          const isAlreadyGone = stripeErr?.code === 'resource_missing'
+                             || stripeErr?.statusCode === 404;
+          if (isAlreadyGone) {
+            stripeAction = 'already_dead';
+            logger.warn('admin.stripe.cancel_race_condition', {
+              tenantId: id, subId: row.stripe_sub_id,
+            });
+          } else {
+            logger.error('admin.stripe.cancel_failed', {
+              tenantId: id, subId: row.stripe_sub_id, error: stripeErr.message,
+            });
+            res.status(502).json({
+              error:   'stripe_failed',
+              message: `Stripe cancel mislukt: ${stripeErr.message}. DB niet gewijzigd.`,
+            });
+            return;
+          }
+        }
       }
     }
 
-    // DB updates
+    // DB updates (alleen als Stripe-deel succesvol of clean was)
     await db.query(
       `UPDATE tenants
        SET status     = 'cancelled',
@@ -292,21 +434,17 @@ router.post('/tenants/:id/cancel', async (req: AuthedRequest, res: Response, nex
       targetId:  id,
       ip:        meta.ip,
       userAgent: meta.userAgent,
-      metadata:  { stripeSubId: row.stripe_sub_id },
+      metadata:  { stripeSubId: row.stripe_sub_id, stripeAction },
     });
 
-    logger.info('admin.tenant.cancelled', { tenantId: id });
-    res.json({ success: true, action: 'cancelled' });
+    logger.info('admin.tenant.cancelled', { tenantId: id, stripeAction });
+    res.json({ success: true, action: 'cancelled', stripeAction });
   } catch (err) {
     next(err);
   }
 });
 
 // ── POST /admin/tenants/:id/reactivate ───────────────────────
-// Hervat een gepauzeerde tenant. Werkt alleen bij paused state
-// (status='suspended' + paused_at NOT NULL). Cancelled tenants
-// kunnen niet gereactiveerd worden, die moeten een nieuwe
-// checkout doorlopen.
 router.post('/tenants/:id/reactivate', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -346,16 +484,47 @@ router.post('/tenants/:id/reactivate', async (req: AuthedRequest, res: Response,
       return;
     }
 
-    // Stripe pause_collection wissen
+    // DEFENSIVE: check Stripe status voor we proberen te resumen
+    const fetch = await fetchStripeSub(row.stripe_sub_id);
+
+    if ('error' in fetch) {
+      logger.error('admin.stripe.reactivate_retrieve_failed', {
+        tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
+      });
+      res.status(502).json({
+        error:   'stripe_failed',
+        message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+      });
+      return;
+    }
+
+    if (!fetch.found) {
+      res.status(409).json({
+        error:    'stripe_sub_missing',
+        message:  'Stripe subscription bestaat niet meer. Gebruik "Definitief annuleren" om de DB te syncen.',
+        driftDetected: true,
+      });
+      return;
+    }
+
+    if (!ALIVE_STRIPE_STATUSES.has(fetch.sub.status)) {
+      res.status(409).json({
+        error:    'stripe_sub_not_alive',
+        message:  `Stripe subscription staat op '${fetch.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
+        stripeStatus:  fetch.sub.status,
+        driftDetected: true,
+      });
+      return;
+    }
+
+    // Stripe-call. Bij falen: geen DB update.
     try {
       await stripe.subscriptions.update(row.stripe_sub_id, {
         pause_collection: '' as any,
       });
     } catch (stripeErr: any) {
       logger.error('admin.stripe.reactivate_failed', {
-        tenantId:   id,
-        subId:      row.stripe_sub_id,
-        error:      stripeErr.message,
+        tenantId: id, subId: row.stripe_sub_id, error: stripeErr.message,
       });
       res.status(502).json({
         error:   'stripe_failed',
