@@ -10,19 +10,21 @@
 //
 // Sprint 3a: stage 1 echt, stages 2-5 stubs.
 // Sprint 3b: stages 2, 3, 4 echt via brand-voice, pattern-detection
-//            en baseline-plan stages. Stage 5 blijft stub voor 3c.
+//            en baseline-plan stages.
+// Sprint 3c: stage 5 echt via memory-init (pgvector embeddings)
+//            plus first-briefing seed via briefingsService.
 //
 // Stages 2/3/4 schrijven hun JSONB output rechtstreeks naar
-// baseline_marketing_plans (UPSERT per stage, single source of
-// truth voor het uiteindelijke plan). In tenant_day_zero_progress
-// stage_data slaan we alleen lichte status op (model, tokens,
-// fallback flag) voor admin/progress monitoring.
+// baseline_marketing_plans (UPSERT per stage). Stage 5 schrijft
+// naar ai_memories (vector store) en tenant_briefings (eerste
+// daily briefing). In tenant_day_zero_progress stage_data slaan
+// we alleen lichte status op (model, tokens, fallback flag).
 //
 // Bij een vangbare fout (API error, parse fail) returnt de stage
-// service result.ok=false met fallback content opgeslagen in DB.
-// Day Zero gaat door naar de volgende stage. Alleen oncatchable
-// exceptions (DB unreachable etc) komen in de outer catch en
-// markeren de stage als failed met BullMQ retry.
+// service result.ok=false met fallback content. Day Zero gaat
+// door naar de volgende stage. Alleen oncatchable exceptions
+// (DB unreachable etc) komen in de outer catch en markeren de
+// stage als failed met BullMQ retry.
 // ============================================================
 
 import { db } from '../../../infrastructure/database/connection';
@@ -32,6 +34,8 @@ import { stage1IngestionService, Stage1IngestionService } from '../stages/stage-
 import { runBrandVoiceStage } from '../stages/stage-2-brand-voice';
 import { runPatternDetectionStage } from '../stages/stage-3-pattern-detection';
 import { runBaselinePlanStage } from '../stages/stage-4-baseline-plan';
+import { runMemoryInitStage } from '../stages/stage-5-memory-init';
+import { briefingsService } from '../../briefings/service/briefings.service';
 import {
   enqueueDayZero,
   enqueueNextStage,
@@ -210,9 +214,44 @@ export class DayZeroService {
         }
 
         case 5: {
-          // Stub blijft. Wordt vervangen in Gap 3c (AI Memory v1
-          // pgvector init + first daily briefing schedule 07:00).
-          await this.runStubStage(tenantId, 5);
+          // Memory init via Voyage AI embeddings + first briefing seed.
+          // Embedt brand_voice + patterns + plan + onboarding naar ai_memories.
+          // Daarna een eerste daily briefing genereren met memory injection
+          // zodat de gebruiker direct na Day Zero een gepersonaliseerde
+          // briefing op het dashboard ziet.
+          const memResult = await runMemoryInitStage(tenantId);
+
+          await this.repo.updateStage(tenantId, 5, {
+            stage_5: {
+              ok:            memResult.ok,
+              model:         memResult.model,
+              input_tokens:  memResult.inputTokens,
+              output_tokens: memResult.outputTokens,
+              fallback:      memResult.fallback,
+              notes:         memResult.notes ?? null,
+              completed_at:  new Date().toISOString(),
+            },
+          } as any);
+
+          // First briefing seed (alleen als memory init succesvol was).
+          // Niet fataal: Day Zero markeert sowieso als completed. Bij
+          // failure genereert de email cron of dashboard de briefing later.
+          if (memResult.ok && !memResult.fallback) {
+            try {
+              const briefing = await briefingsService.generateAndStore(tenantId, 'day_zero_seed');
+              logger.info('day_zero.first_briefing.seeded', {
+                tenantId,
+                tokens:       briefing.inputTokens + briefing.outputTokens,
+                memoriesUsed: briefing.memoriesUsed,
+              });
+            } catch (briefingErr: any) {
+              logger.warn('day_zero.first_briefing.failed', {
+                tenantId,
+                error: briefingErr?.message ?? 'unknown',
+              });
+            }
+          }
+
           await this.repo.markCompleted(tenantId);
           logger.info('day_zero.completed', { tenantId });
           next = null;
@@ -241,16 +280,6 @@ export class DayZeroService {
   // Internal helpers
   // --------------------------------------------------------------
 
-  private async runStubStage(tenantId: string, stage: DayZeroStage): Promise<void> {
-    await new Promise((res) => setTimeout(res, 2000));
-    await this.repo.updateStage(tenantId, stage, {
-      [`stage_${stage}`]: {
-        stub: true,
-        completed_at: new Date().toISOString(),
-      },
-    } as any);
-  }
-
   /**
    * Plan lookup via tenant_subscriptions JOIN plans.
    * Pattern overgenomen van sync.scheduler.ts (gevalideerd in productie).
@@ -267,7 +296,7 @@ export class DayZeroService {
          ORDER BY ts.created_at DESC
          LIMIT 1`,
         [tenantId],
-        { allowNoTenant: true }
+        { allowNoTenant: true },
       );
 
       const slug = result.rows[0]?.plan_slug;
