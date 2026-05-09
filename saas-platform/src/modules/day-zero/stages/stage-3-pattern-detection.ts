@@ -4,9 +4,14 @@
 // Stage 3 van Day Zero: pattern detection via Claude Sonnet.
 //
 // Architecture Plan model assignment:
-//   "Day Zero AI setup → claude-sonnet-4-20250514
-//    First impression matters. We pay more here for a sharper
-//    baseline marketing plan."
+//   "Day Zero AI setup. First impression matters. We pay more
+//    here for a sharper baseline marketing plan."
+//
+// FIX 9-mei: loadTopSkus query had LEFT JOIN products ON p.id =
+// li.product_id. Dit faalt omdat order_line_items.product_id een
+// raw external string is (Bol EAN, Shopify product_id), niet een
+// UUID die naar products.id wijst. Verwijderd: gebruik nu li.title
+// direct en behoud li.product_id als externe identifier.
 //
 // Sonnet leest GEEN raw orders. Wij doen de zware aggregatie in
 // Postgres en geven Sonnet samengevatte data:
@@ -224,6 +229,9 @@ async function loadTotals(tenantId: string): Promise<Totals> {
 }
 
 async function loadTopSkus(tenantId: string) {
+  // GEEN JOIN op products. order_line_items.product_id is een
+  // platform-external string (Bol EAN, Shopify product_id), geen
+  // UUID die naar products.id wijst. Title staat al in li.title.
   const result = await db.query<{
     product_id:   string | null;
     title:        string;
@@ -232,16 +240,15 @@ async function loadTopSkus(tenantId: string) {
   }>(
     `SELECT
        li.product_id,
-       COALESCE(p.title, li.title)               AS title,
-       SUM(li.total_price)::text                 AS revenue,
-       SUM(li.quantity)::text                    AS units
+       MAX(li.title)                              AS title,
+       SUM(li.total_price)::text                  AS revenue,
+       SUM(li.quantity)::text                     AS units
      FROM order_line_items li
      JOIN orders o ON o.id = li.order_id
-     LEFT JOIN products p ON p.id = li.product_id
      WHERE li.tenant_id = $1
        AND o.ordered_at >= now() - INTERVAL '12 months'
        AND COALESCE(o.status, '') NOT IN ('cancelled', 'refunded')
-     GROUP BY li.product_id, COALESCE(p.title, li.title)
+     GROUP BY li.product_id
      ORDER BY SUM(li.total_price) DESC NULLS LAST
      LIMIT $2`,
     [tenantId, TOP_SKUS_LIMIT],
