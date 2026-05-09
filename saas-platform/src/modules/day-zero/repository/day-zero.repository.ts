@@ -2,37 +2,37 @@
 // src/modules/day-zero/repository/day-zero.repository.ts
 //
 // DB access voor tenant_day_zero_progress.
-// Gebruikt service role client (workers schrijven hier in BullMQ context,
-// dus geen tenant context via AsyncLocalStorage beschikbaar).
+// Gebruikt db van infrastructure/database/connection (zoals sync.worker.ts).
+// Workers draaien zonder tenant context, dus { allowNoTenant: true } overal.
 // ============================================================
 
-import { supabaseAdmin } from '../../../shared/database/supabase';
+import { db } from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 import {
   DayZeroProgressRow,
   DayZeroStage,
   DayZeroStageData,
-  DayZeroStatus,
 } from '../types/day-zero.types';
 
 export class DayZeroRepository {
+
   // --------------------------------------------------------------
   // Lookups
   // --------------------------------------------------------------
 
   async getByTenantId(tenantId: string): Promise<DayZeroProgressRow | null> {
-    const { data, error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .maybeSingle();
+    const result = await db.query<DayZeroProgressRow>(
+      `SELECT
+         tenant_id, status, current_stage, stage_data,
+         error_message, error_stage, error_count,
+         started_at, completed_at, created_at, updated_at
+       FROM tenant_day_zero_progress
+       WHERE tenant_id = $1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
 
-    if (error) {
-      logger.error('day_zero.repo.get.failed', { tenantId, error: error.message });
-      throw error;
-    }
-
-    return data as DayZeroProgressRow | null;
+    return result.rows[0] ?? null;
   }
 
   // --------------------------------------------------------------
@@ -45,80 +45,65 @@ export class DayZeroRepository {
    * bij dubbel-trigger van /api/onboarding/complete.
    */
   async createIfNotExists(tenantId: string): Promise<DayZeroProgressRow> {
-    const existing = await this.getByTenantId(tenantId);
-    if (existing) return existing;
+    const result = await db.query<DayZeroProgressRow>(
+      `INSERT INTO tenant_day_zero_progress (tenant_id, status, current_stage, stage_data)
+       VALUES ($1, 'pending', 0, '{}'::jsonb)
+       ON CONFLICT (tenant_id) DO UPDATE
+         SET tenant_id = tenant_day_zero_progress.tenant_id
+       RETURNING
+         tenant_id, status, current_stage, stage_data,
+         error_message, error_stage, error_count,
+         started_at, completed_at, created_at, updated_at`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
 
-    const { data, error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .insert({
-        tenant_id:     tenantId,
-        status:        'pending',
-        current_stage: 0,
-        stage_data:    {},
-      })
-      .select('*')
-      .single();
-
-    if (error) {
-      // Als een andere request net heeft ingevoegd, fallback naar lookup.
-      if (error.code === '23505') {
-        const row = await this.getByTenantId(tenantId);
-        if (row) return row;
-      }
-      logger.error('day_zero.repo.create.failed', { tenantId, error: error.message });
-      throw error;
-    }
-
-    return data as DayZeroProgressRow;
+    return result.rows[0];
   }
 
   async markRunning(tenantId: string, stage: DayZeroStage): Promise<void> {
-    const { error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .update({
-        status:        'running',
-        current_stage: stage,
-        started_at:    new Date().toISOString(),
-        error_message: null,
-        error_stage:   null,
-      })
-      .eq('tenant_id', tenantId);
-
-    if (error) throw error;
+    await db.query(
+      `UPDATE tenant_day_zero_progress
+       SET status        = 'running',
+           current_stage = $2,
+           started_at    = COALESCE(started_at, now()),
+           error_message = NULL,
+           error_stage   = NULL
+       WHERE tenant_id = $1`,
+      [tenantId, stage],
+      { allowNoTenant: true }
+    );
   }
 
+  /**
+   * Merge nieuwe stage output in stage_data JSONB en update current_stage.
+   * Gebruikt jsonb || voor merge zodat bestaande stages behouden blijven.
+   */
   async updateStage(
     tenantId: string,
     stage:    DayZeroStage,
     output:   DayZeroStageData,
   ): Promise<void> {
-    const current = await this.getByTenantId(tenantId);
-    if (!current) throw new Error(`Day Zero row missing for tenant ${tenantId}`);
-
-    const merged = { ...current.stage_data, ...output };
-
-    const { error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .update({
-        current_stage: stage,
-        stage_data:    merged,
-      })
-      .eq('tenant_id', tenantId);
-
-    if (error) throw error;
+    await db.query(
+      `UPDATE tenant_day_zero_progress
+       SET current_stage = $2,
+           stage_data    = stage_data || $3::jsonb
+       WHERE tenant_id = $1`,
+      [tenantId, stage, JSON.stringify(output)],
+      { allowNoTenant: true }
+    );
   }
 
   async markCompleted(tenantId: string): Promise<void> {
-    const { error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .update({
-        status:        'completed',
-        current_stage: 5,
-        completed_at:  new Date().toISOString(),
-      })
-      .eq('tenant_id', tenantId);
-
-    if (error) throw error;
+    await db.query(
+      `UPDATE tenant_day_zero_progress
+       SET status        = 'completed',
+           current_stage = 5,
+           completed_at  = now()
+       WHERE tenant_id = $1`,
+      [tenantId],
+      { allowNoTenant: true }
+    );
   }
 
   async markFailed(
@@ -126,33 +111,18 @@ export class DayZeroRepository {
     stage:    DayZeroStage,
     message:  string,
   ): Promise<void> {
-    const { error } = await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .update({
-        status:        'failed',
-        error_stage:   stage,
-        error_message: message.slice(0, 500),
-      })
-      .eq('tenant_id', tenantId);
+    await db.query(
+      `UPDATE tenant_day_zero_progress
+       SET status        = 'failed',
+           error_stage   = $2,
+           error_message = LEFT($3, 500),
+           error_count   = error_count + 1
+       WHERE tenant_id = $1`,
+      [tenantId, stage, message],
+      { allowNoTenant: true }
+    );
 
-    if (error) throw error;
-
-    // error_count atomair ophogen via RPC of separate call
-    await supabaseAdmin.rpc('increment_day_zero_error_count', { p_tenant_id: tenantId })
-      .then(() => null)
-      .catch(() => {
-        // RPC bestaat nog niet, fallback: read-modify-write
-        return this.bumpErrorCount(tenantId);
-      });
-  }
-
-  private async bumpErrorCount(tenantId: string): Promise<void> {
-    const row = await this.getByTenantId(tenantId);
-    if (!row) return;
-    await supabaseAdmin
-      .from('tenant_day_zero_progress')
-      .update({ error_count: row.error_count + 1 })
-      .eq('tenant_id', tenantId);
+    logger.warn('day_zero.repo.marked_failed', { tenantId, stage, message });
   }
 }
 
