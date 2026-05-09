@@ -8,13 +8,30 @@
 //   - getStatusDTO: aangeroepen door /api/day-zero/status polling
 //   - Plan lookup: bepalen welke priority een tenant in de queue krijgt
 //
-// Sprint 3a: stage 1 echt, stages 2-5 stubs (worden vervangen in 3b en 3c).
+// Sprint 3a: stage 1 echt, stages 2-5 stubs.
+// Sprint 3b: stages 2, 3, 4 echt via brand-voice, pattern-detection
+//            en baseline-plan stages. Stage 5 blijft stub voor 3c.
+//
+// Stages 2/3/4 schrijven hun JSONB output rechtstreeks naar
+// baseline_marketing_plans (UPSERT per stage, single source of
+// truth voor het uiteindelijke plan). In tenant_day_zero_progress
+// stage_data slaan we alleen lichte status op (model, tokens,
+// fallback flag) voor admin/progress monitoring.
+//
+// Bij een vangbare fout (API error, parse fail) returnt de stage
+// service result.ok=false met fallback content opgeslagen in DB.
+// Day Zero gaat door naar de volgende stage. Alleen oncatchable
+// exceptions (DB unreachable etc) komen in de outer catch en
+// markeren de stage als failed met BullMQ retry.
 // ============================================================
 
 import { db } from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 import { dayZeroRepository, DayZeroRepository } from '../repository/day-zero.repository';
 import { stage1IngestionService, Stage1IngestionService } from '../stages/stage-1-ingestion';
+import { runBrandVoiceStage } from '../stages/stage-2-brand-voice';
+import { runPatternDetectionStage } from '../stages/stage-3-pattern-detection';
+import { runBaselinePlanStage } from '../stages/stage-4-baseline-plan';
 import {
   enqueueDayZero,
   enqueueNextStage,
@@ -134,24 +151,67 @@ export class DayZeroService {
         }
 
         case 2: {
-          await this.runStubStage(tenantId, 2);
+          // Brand voice fingerprint via Haiku.
+          // Schrijft naar baseline_marketing_plans.brand_voice.
+          // Bol-only fallback bij description=NULL.
+          const result = await runBrandVoiceStage(tenantId);
+          await this.repo.updateStage(tenantId, 2, {
+            stage_2: {
+              ok:            result.ok,
+              model:         result.model,
+              input_tokens:  result.inputTokens,
+              output_tokens: result.outputTokens,
+              fallback:      result.fallback,
+              notes:         result.notes ?? null,
+              completed_at:  new Date().toISOString(),
+            },
+          } as any);
           next = 3;
           break;
         }
 
         case 3: {
-          await this.runStubStage(tenantId, 3);
+          // Pattern detection via Sonnet.
+          // Schrijft naar baseline_marketing_plans.patterns.
+          const result = await runPatternDetectionStage(tenantId);
+          await this.repo.updateStage(tenantId, 3, {
+            stage_3: {
+              ok:            result.ok,
+              model:         result.model,
+              input_tokens:  result.inputTokens,
+              output_tokens: result.outputTokens,
+              fallback:      result.fallback,
+              notes:         result.notes ?? null,
+              completed_at:  new Date().toISOString(),
+            },
+          } as any);
           next = 4;
           break;
         }
 
         case 4: {
-          await this.runStubStage(tenantId, 4);
+          // Baseline marketing plan via Sonnet.
+          // Combineert brand_voice + patterns + onboarding context.
+          // Schrijft naar baseline_marketing_plans.marketing_plan.
+          const result = await runBaselinePlanStage(tenantId);
+          await this.repo.updateStage(tenantId, 4, {
+            stage_4: {
+              ok:            result.ok,
+              model:         result.model,
+              input_tokens:  result.inputTokens,
+              output_tokens: result.outputTokens,
+              fallback:      result.fallback,
+              notes:         result.notes ?? null,
+              completed_at:  new Date().toISOString(),
+            },
+          } as any);
           next = 5;
           break;
         }
 
         case 5: {
+          // Stub blijft. Wordt vervangen in Gap 3c (AI Memory v1
+          // pgvector init + first daily briefing schedule 07:00).
           await this.runStubStage(tenantId, 5);
           await this.repo.markCompleted(tenantId);
           logger.info('day_zero.completed', { tenantId });
