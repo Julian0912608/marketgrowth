@@ -1,8 +1,7 @@
 // ============================================================
 // src/modules/day-zero/stages/stage-5-memory-init.ts
 //
-// Stage 5 van Day Zero: AI Memory v1 initialization + first
-// daily briefing seed.
+// Stage 5 van Day Zero: AI Memory v1 initialization.
 //
 // Master Plan §9 + Architecture Plan §Day Zero Stage 5:
 //   "Initialize AI Memory v1. Schedule first daily briefing
@@ -15,17 +14,17 @@
 //   3. Embed batch via Voyage AI voyage-3-lite (1 API call).
 //   4. Insert in ai_memories (na clear van bestaande Day Zero kinds
 //      voor idempotente re-runs via admin trigger).
-//   5. Genereer eerste briefing met de bestaande Sonnet flow en
-//      seed in tenant_settings.ai_last_briefing zodat de 06:00 UTC
-//      cron in email.worker.ts morgen direct content heeft.
 //
-// De daily briefing global cron draait al (email.worker.ts:
-// 'daily-briefing' repeat at '0 6 * * *'). Stage 5 hoeft hem
-// niet apart te schedulen.
+// Wat NIET in deze stage zit:
+//   - First daily briefing seed: tenant_settings tabel bestaat niet,
+//     en de juiste briefing storage (ai_briefings of nieuw) wordt in
+//     Gap 3c batch 2 ingericht samen met email.service.ts refactor.
+//   - Het globale 06:00 UTC cron in email.worker.ts blijft draaien;
+//     na batch 2 zal die zelf een fresh briefing genereren bij
+//     ontbrekende data.
 // ============================================================
 
 import { logger } from '../../../shared/logging/logger';
-import { db } from '../../../infrastructure/database/connection';
 import {
   BrandVoice,
   Patterns,
@@ -44,12 +43,6 @@ import {
   AiMemoryInput,
   MemoryKind,
 } from '../../ai-memory/types/ai-memory.types';
-
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const Anthropic = require('@anthropic-ai/sdk');
-const anthropic = new (Anthropic.default ?? Anthropic)();
-
-const SONNET_MODEL = 'claude-sonnet-4-20250514';
 
 // Day Zero kinds: dit zijn de memories die Stage 5 schrijft.
 // briefing_outcome komt later (V1 bij briefing-tracking).
@@ -184,40 +177,24 @@ export async function runMemoryInitStage(tenantId: string): Promise<MemoryInitSt
   }));
   await aiMemoriesRepository.insertMany(itemsToInsert);
 
-  const counts = await aiMemoriesRepository.countByKind(tenantId);
-
-  // 5. Seed first daily briefing (zodat morgen 06:00 UTC cron content heeft)
-  let briefingSeeded = false;
-  let briefingTokens = { input: 0, output: 0 };
-  try {
-    const seed = await seedFirstBriefing(tenantId, brandVoice, marketingPlan, onboarding);
-    briefingSeeded = seed.ok;
-    briefingTokens = seed.tokens;
-  } catch (err: any) {
-    logger.warn('day_zero.first_briefing.failed', {
-      tenantId,
-      error: err?.message ?? 'unknown',
-    });
-    // Niet fataal: morgen genereert /api/ai/insights het zelf bij eerste login.
-  }
-
+  const counts     = await aiMemoriesRepository.countByKind(tenantId);
   const durationMs = Date.now() - startedAt;
+
   logger.info('day_zero.memory_init.complete', {
     tenantId,
     memoriesInserted: itemsToInsert.length,
     countsByKind:     counts,
-    briefingSeeded,
     durationMs,
   });
 
   return {
     ok:           true,
     stage:        5,
-    model:        briefingSeeded ? SONNET_MODEL : EMBEDDING_MODEL,
-    inputTokens:  briefingTokens.input,
-    outputTokens: briefingTokens.output,
+    model:        EMBEDDING_MODEL,
+    inputTokens:  0,
+    outputTokens: 0,
     fallback:     false,
-    notes:        `Geseeded: ${itemsToInsert.length} memories (${Object.keys(counts).join(', ')}). First briefing: ${briefingSeeded ? 'ja' : 'wacht op 06:00 UTC cron'}.`,
+    notes:        `Geseeded: ${itemsToInsert.length} memories (${Object.keys(counts).join(', ')}). Embedding model: ${EMBEDDING_MODEL}.`,
   };
 }
 
@@ -426,118 +403,4 @@ function buildOnboardingMemoryContent(o: OnboardingContext): string | null {
 
   if (parts.length === 0) return null;
   return 'Founder context. ' + parts.join(' ');
-}
-
-// ── First daily briefing seed ───────────────────────────────
-
-async function seedFirstBriefing(
-  tenantId:   string,
-  brandVoice: BrandVoice | null,
-  plan:       MarketingPlan | null,
-  onboarding: OnboardingContext,
-): Promise<{ ok: boolean; tokens: { input: number; output: number } }> {
-
-  // Bestaat al? Skip om geen tokens te branden bij re-trigger.
-  const existing = await db.query<{ value: string }>(
-    `SELECT value FROM tenant_settings WHERE tenant_id = $1 AND key = 'ai_last_briefing'`,
-    [tenantId],
-    { allowNoTenant: true },
-  );
-  if (existing.rows[0]?.value && existing.rows[0].value.length > 20) {
-    logger.info('day_zero.first_briefing.skip_existing', { tenantId });
-    return { ok: false, tokens: { input: 0, output: 0 } };
-  }
-
-  // Haal stats voor briefing context
-  const statsResult = await db.query<{ orders: number; revenue: string }>(
-    `SELECT
-       COUNT(*)::int AS orders,
-       COALESCE(SUM(total_amount - tax_amount), 0)::text AS revenue
-     FROM orders
-     WHERE tenant_id = $1
-       AND ordered_at >= NOW() - INTERVAL '30 days'
-       AND status NOT IN ('cancelled', 'refunded')`,
-    [tenantId],
-    { allowNoTenant: true },
-  );
-
-  const stats   = statsResult.rows[0] ?? { orders: 0, revenue: '0' };
-  const country = onboarding.countryCode
-    ? (COUNTRY_NAMES[onboarding.countryCode] ?? onboarding.countryCode)
-    : 'EU';
-  const goal        = onboarding.businessGoal   ?? 'steady';
-  const style       = onboarding.marketingStyle ?? 'mix';
-  const positioning = plan?.positioning?.trim() || 'early-stage ecommerce store';
-  const focus       = plan?.next_30_days_focus?.trim() || 'establish a publishing rhythm and gather first conversion signals';
-
-  const prompt = `You are an AI ecommerce advisor for MarketGrow. Write the first daily briefing for a founder who just completed Day Zero setup.
-
-Founder context:
-- Country: ${country}
-- Business goal: ${goal}
-- Marketing style: ${style}
-- Positioning: ${positioning}
-- Next 30 days focus: ${focus}
-
-Last 30 days stats:
-- Orders: ${stats.orders}
-- Revenue (excl. VAT): EUR ${parseFloat(stats.revenue).toFixed(0)}
-
-Return ONLY valid JSON in this exact shape:
-{"briefing":"2 to 3 sentences welcoming the founder and connecting their stats to the focus","actions":[{"priority":"high|medium|low","title":"string","description":"string","channel":"meta_ads|google_ads|organic_social|email|seo|general"}],"alerts":[]}
-
-Rules:
-- Briefing must reference the focus and stats specifically.
-- Provide max 2 actions for the first briefing.
-- No fabricated numbers. Only reference the stats provided above.
-- Tone matches a real ecom advisor talking to a beginner founder.`;
-
-  const response = await anthropic.messages.create({
-    model:      SONNET_MODEL,
-    max_tokens: 800,
-    messages:   [{ role: 'user', content: prompt }],
-  });
-
-  const text  = response.content[0]?.type === 'text' ? response.content[0].text : '{}';
-  const clean = text.replace(/```json|```/g, '').trim();
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(clean);
-  } catch {
-    parsed = { briefing: text.slice(0, 300), actions: [], alerts: [] };
-  }
-
-  // email.service.ts leest tenant_settings.ai_last_briefing als briefing-text.
-  // Schrijf alleen het briefing veld (acties zijn later via /api/ai/insights).
-  const briefingText = (typeof parsed.briefing === 'string' && parsed.briefing.trim().length > 0)
-    ? parsed.briefing.trim()
-    : 'Welcome to MarketGrow. Your first daily briefing is ready. Check your dashboard for tailored recommendations.';
-
-  // Robust upsert: UPDATE eerst, INSERT als 0 rows. Geen aanname over UNIQUE constraint.
-  const updateRes = await db.query(
-    `UPDATE tenant_settings
-     SET value = $1, updated_at = now()
-     WHERE tenant_id = $2 AND key = 'ai_last_briefing'`,
-    [briefingText, tenantId],
-    { allowNoTenant: true },
-  );
-
-  if ((updateRes.rowCount ?? 0) === 0) {
-    await db.query(
-      `INSERT INTO tenant_settings (tenant_id, key, value)
-       VALUES ($1, 'ai_last_briefing', $2)`,
-      [tenantId, briefingText],
-      { allowNoTenant: true },
-    );
-  }
-
-  const usage = (response as any).usage ?? {};
-  return {
-    ok:     true,
-    tokens: {
-      input:  usage.input_tokens  ?? 0,
-      output: usage.output_tokens ?? 0,
-    },
-  };
 }
