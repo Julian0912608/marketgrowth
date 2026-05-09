@@ -8,6 +8,9 @@
 //   - Skip vanaf Step 2 = all-or-nothing (status 'skipped')
 //   - Settings biedt later edit (updateProfileFields)
 //   - Cache invalidatie na country change: tenant context + flags
+//   - Auto-completion: skipped tenant -> completed zodra alle 4
+//     velden gevuld zijn via updateProfileFields. Zorgt dat de
+//     StartSetupCard automatisch verdwijnt na Business tab save.
 //
 // Day Zero AI setup: voor Gap 2 leveren we alleen een log-stub.
 // Volledige BullMQ implementatie volgt in Gap 3.
@@ -48,7 +51,6 @@ export class OnboardingService {
     const current = await this.repo.getState(tenantId);
     if (!current) throw new Error(`Tenant not found: ${tenantId}`);
     if (current.status === 'completed') {
-      // Edits gaan via Settings, niet via wizard
       throw new Error('Onboarding already completed. Use settings to edit.');
     }
 
@@ -58,9 +60,6 @@ export class OnboardingService {
       input.sellsToCountries,
     );
 
-    // Country gewijzigd: tenant context cache + feature flags cache
-    // moeten beide leeg, anders ziet user op step 4 nog flags voor
-    // de oude country.
     await Promise.all([
       invalidateTenantContextCache(tenantId),
       featureFlagsService.invalidateAll(),
@@ -82,7 +81,6 @@ export class OnboardingService {
       throw new Error('Onboarding already completed. Use settings to edit.');
     }
     if (!current.countryCode) {
-      // Hard force: step 1 moet eerst gebeuren
       throw new Error('Step 1 must be completed first.');
     }
 
@@ -116,8 +114,6 @@ export class OnboardingService {
     return { ok: true, status: 'in_progress', nextStep: 4 };
   }
 
-  // Wordt aangeroepen na step 4 (store connected of "I'll connect later").
-  // Idempotent: dubbele calls geven gewoon de huidige state terug.
   async complete(tenantId: string, input: CompleteInput): Promise<CompleteResult> {
     const current = await this.repo.getState(tenantId);
     if (!current) throw new Error(`Tenant not found: ${tenantId}`);
@@ -135,8 +131,6 @@ export class OnboardingService {
       shopConnected: input.shopConnected,
     });
 
-    // Day Zero AI setup trigger.
-    // Gap 2 sprint: alleen een log-stub. Echte BullMQ job in Gap 3.
     let dayZeroJobId: string | undefined;
     if (input.shopConnected) {
       dayZeroJobId = `day-zero:${tenantId}:${Date.now()}`;
@@ -150,7 +144,6 @@ export class OnboardingService {
     return { ok: true, status: 'completed', dayZeroJobId };
   }
 
-  // Skip vanaf step 2 (all-or-nothing). Step 1 kan niet geskipt worden.
   async skip(tenantId: string): Promise<StepResult> {
     const current = await this.repo.getState(tenantId);
     if (!current) throw new Error(`Tenant not found: ${tenantId}`);
@@ -173,6 +166,10 @@ export class OnboardingService {
 
   // Edits via Settings, beschikbaar na completed of skipped status.
   // Bij country wijziging worden de caches opnieuw leeggemaakt.
+  // AUTO-COMPLETION: als de tenant op 'skipped' stond en met deze
+  // edit alle 4 velden gevuld zijn, transition automatisch naar
+  // 'completed'. Zo verdwijnt de StartSetupCard zonder dat de
+  // user een aparte "Mark as complete" knop hoeft te klikken.
   async updateProfileFields(
     tenantId: string,
     fields: UpdateProfileInput,
@@ -186,12 +183,31 @@ export class OnboardingService {
       ]);
     }
 
+    let state = await this.getState(tenantId);
+
+    if (state.status === 'skipped' && this.isProfileComplete(state)) {
+      await this.repo.markCompleted(tenantId);
+      logger.info('onboarding.auto_completed', { tenantId });
+      state = await this.getState(tenantId);
+    }
+
     logger.info('onboarding.profile_updated', {
       tenantId,
       fieldsUpdated: Object.keys(fields),
+      finalStatus:   state.status,
     });
 
-    return this.getState(tenantId);
+    return state;
+  }
+
+  private isProfileComplete(state: OnboardingState): boolean {
+    return Boolean(
+      state.countryCode &&
+      state.sellsToCountries &&
+      state.sellsToCountries.length > 0 &&
+      state.businessGoal &&
+      state.marketingStyle,
+    );
   }
 }
 
