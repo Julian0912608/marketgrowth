@@ -3,12 +3,16 @@
 //
 // Voyage AI embedding service.
 //   API:    https://docs.voyageai.com/reference/embeddings-api
-//   Model:  voyage-3-lite
-//   Dim:    1024
+//   Model:  voyage-3.5-lite
+//   Dim:    1024 (Matryoshka, expliciet meegegeven via output_dimension)
 //   Cost:   $0.02 per 1M tokens
 //
+// Belangrijke noot: voyage-3-lite (zonder .5) ondersteunt MAX 512 dim.
+// Alleen voyage-3.5-lite, voyage-3.5, voyage-3-large, voyage-4* en
+// voyage-code-3 ondersteunen 1024 dim. Onze ai_memories tabel is
+// VECTOR(1024), dus kies een model uit die lijst.
+//
 // input_type 'document' voor opslag, 'query' voor zoekopdrachten.
-// Voyage benchmarks tonen significante recall-winst bij correct gebruik.
 //
 // Env vars:
 //   VOYAGE_API_KEY (required) - aan te maken op voyageai.com
@@ -17,7 +21,7 @@
 import { logger } from '../../../shared/logging/logger';
 
 const VOYAGE_ENDPOINT = 'https://api.voyageai.com/v1/embeddings';
-const VOYAGE_MODEL    = 'voyage-3-lite';
+const VOYAGE_MODEL    = 'voyage-3.5-lite';
 const VOYAGE_DIM      = 1024;
 const MAX_BATCH_SIZE  = 128;        // Voyage hard limit per request
 const TIMEOUT_MS      = 30_000;
@@ -102,8 +106,9 @@ class EmbeddingService {
         },
         body: JSON.stringify({
           input,
-          model:      VOYAGE_MODEL,
-          input_type: inputType,
+          model:            VOYAGE_MODEL,
+          input_type:       inputType,
+          output_dimension: VOYAGE_DIM,
         }),
         signal: controller.signal,
       });
@@ -140,6 +145,16 @@ class EmbeddingService {
     // Defensief sorteren op index, hoewel volgorde meestal al correct is
     const sorted  = [...json.data].sort((a, b) => a.index - b.index);
     const vectors = sorted.map(d => d.embedding);
+
+    // Hard validation: alle vectors moeten exact VOYAGE_DIM lang zijn
+    for (let i = 0; i < vectors.length; i++) {
+      if (!Array.isArray(vectors[i]) || vectors[i].length !== VOYAGE_DIM) {
+        throw new Error(
+          `Voyage embedding ${i} heeft verkeerde dim: ${vectors[i]?.length ?? 0}, expected ${VOYAGE_DIM}. ` +
+          `Model ${VOYAGE_MODEL} ondersteunt deze dim mogelijk niet.`,
+        );
+      }
+    }
 
     logger.info('voyage.embed.success', {
       batch:      input.length,
