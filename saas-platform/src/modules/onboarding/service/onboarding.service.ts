@@ -12,8 +12,8 @@
 //     velden gevuld zijn via updateProfileFields. Zorgt dat de
 //     StartSetupCard automatisch verdwijnt na Business tab save.
 //
-// Day Zero AI setup: voor Gap 2 leveren we alleen een log-stub.
-// Volledige BullMQ implementatie volgt in Gap 3.
+// Sprint 3a: complete() triggert nu een echte BullMQ Day Zero job
+// via dayZeroService.initForTenant(). Geen stub meer.
 // ============================================================
 
 import { logger } from '../../../shared/logging/logger';
@@ -23,6 +23,7 @@ import {
 } from '../repository/onboarding.repository';
 import { featureFlagsService } from '../../feature-flags/service/feature-flags.service';
 import { invalidateTenantContextCache } from '../../../shared/middleware/tenant.middleware';
+import { dayZeroService } from '../../day-zero/service/day-zero.service';
 import {
   OnboardingState,
   Step1Input,
@@ -132,13 +133,27 @@ export class OnboardingService {
     });
 
     let dayZeroJobId: string | undefined;
+
     if (input.shopConnected) {
-      dayZeroJobId = `day-zero:${tenantId}:${Date.now()}`;
-      logger.info('onboarding.day_zero.queued_stub', {
-        tenantId,
-        dayZeroJobId,
-        note: 'Stub. Real BullMQ job ships in Gap 3.',
-      });
+      // Echte BullMQ Day Zero kick-off (sprint 3a).
+      // We gooien geen errors door als enqueue faalt: onboarding zelf is wel
+      // voltooid en de admin kan handmatig retriggeren via DayZeroService.
+      try {
+        const result = await dayZeroService.initForTenant(tenantId);
+        dayZeroJobId = result.jobId ?? undefined;
+        logger.info('onboarding.day_zero.initialized', {
+          tenantId,
+          status: result.status,
+          jobId:  dayZeroJobId,
+        });
+      } catch (err) {
+        logger.error('onboarding.day_zero.init_failed', {
+          tenantId,
+          error: (err as Error).message,
+        });
+      }
+    } else {
+      logger.info('onboarding.day_zero.skipped_no_shop', { tenantId });
     }
 
     return { ok: true, status: 'completed', dayZeroJobId };
@@ -164,12 +179,6 @@ export class OnboardingService {
     return { ok: true, status: 'skipped' };
   }
 
-  // Edits via Settings, beschikbaar na completed of skipped status.
-  // Bij country wijziging worden de caches opnieuw leeggemaakt.
-  // AUTO-COMPLETION: als de tenant op 'skipped' stond en met deze
-  // edit alle 4 velden gevuld zijn, transition automatisch naar
-  // 'completed'. Zo verdwijnt de StartSetupCard zonder dat de
-  // user een aparte "Mark as complete" knop hoeft te klikken.
   async updateProfileFields(
     tenantId: string,
     fields: UpdateProfileInput,
