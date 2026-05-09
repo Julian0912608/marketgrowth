@@ -216,6 +216,12 @@ try {
 } catch (e: any) { console.error('  adminOnboardingRouter FAILED:', e.message); }
 
 try {
+  const { adminBillingActionsRouter } = require('./modules/admin/api/admin-billing-actions.routes');
+  app.use('/api/admin', adminBillingActionsRouter);
+  console.log('  adminBillingActionsRouter OK');
+} catch (e: any) { console.error('  adminBillingActionsRouter FAILED:', e.message); }
+
+try {
   const { teamRouter } = require('./modules/team/api/team.routes');
   app.use('/api/team', teamRouter);
   console.log('  teamRouter OK');
