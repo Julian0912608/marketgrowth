@@ -3,13 +3,11 @@
 //
 // Voyage AI embedding service.
 //   API:    https://docs.voyageai.com/reference/embeddings-api
-//   Model:  voyage-3.5-lite (default 512 dim, $0.02/M tokens)
+//   Model:  voyage-3.5-lite (default 1024 dim, $0.02/M tokens)
 //
-// Dimension keuze: voyage-3.5-lite retourneert default 512 dim.
-// De docs claimen 1024 (default) voor lite varianten, maar in de
-// praktijk via REST API krijg je 512 terug; output_dimension
-// parameter wordt door lite-varianten niet betrouwbaar opgevolgd.
-// We aligneren onze tabel (VECTOR(512)) met de feitelijke output.
+// Geverifieerd op runtime: voyage-3.5-lite retourneert default
+// 1024 dim. Geen output_dimension parameter nodig. (voyage-3-lite
+// zonder .5 is een ander model met 512 dim default; gebruik die niet.)
 //
 // input_type 'document' voor opslag, 'query' voor zoekopdrachten.
 //
@@ -21,7 +19,7 @@ import { logger } from '../../../shared/logging/logger';
 
 const VOYAGE_ENDPOINT = 'https://api.voyageai.com/v1/embeddings';
 const VOYAGE_MODEL    = 'voyage-3.5-lite';
-const VOYAGE_DIM      = 512;
+const VOYAGE_DIM      = 1024;
 const MAX_BATCH_SIZE  = 128;        // Voyage hard limit per request
 const TIMEOUT_MS      = 30_000;
 
