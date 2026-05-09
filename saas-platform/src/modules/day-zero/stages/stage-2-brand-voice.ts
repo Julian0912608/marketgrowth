@@ -4,19 +4,19 @@
 // Stage 2 van Day Zero: brand voice fingerprint via Claude Haiku.
 //
 // Architecture Plan model assignment:
-//   "Brand voice extraction → claude-haiku-3-5-20251022
-//    Pattern matching task. Haiku is sufficient."
+//   "Brand voice extraction. Pattern matching task. Haiku is sufficient."
+//
+// FIX 9-mei: model string was 'claude-haiku-3-5-20251022' (typo
+// in Architecture Plan v1.0, datum klopt niet). Aangepast naar
+// 'claude-haiku-4-5-20251001' (huidige Haiku 4.5, beschikbaar
+// via Anthropic API mei 2026).
 //
 // Bol-only quirk: products kunnen description=NULL hebben.
 // Fallback prompt vraagt Haiku om voice af te leiden uit titles,
-// product_type, vendor, tags en price range, met confidence='low'.
+// product_type, vendor en tags, met confidence='low'.
 //
 // Public:
 //   runBrandVoiceStage(tenantId): Promise<StageRunResult>
-//     - laadt product sample
-//     - bouwt prompt (rich of fallback)
-//     - roept Haiku aan
-//     - parse + valideer + UPSERT in baseline_marketing_plans
 //
 // Vangt parse/API errors zelf op met fallback content. Throw't
 // alleen bij oncatchable exceptions (DB unreachable etc).
@@ -37,7 +37,7 @@ import { upsertBrandVoice } from '../repository/baseline-plan.repository';
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new (Anthropic.default ?? Anthropic)();
 
-const HAIKU_MODEL          = 'claude-haiku-3-5-20251022';
+const HAIKU_MODEL          = 'claude-haiku-4-5-20251001';
 const FALLBACK_MODEL       = 'fallback';
 const MAX_PRODUCTS         = 30;          // sample size voor prompt
 const MAX_DESC_CHARS       = 1500;        // per product cap
