@@ -5,24 +5,53 @@
 // tijdens V0 development. Wordt later vervangen door een knop
 // in de admin UI.
 //
-// Endpoints:
-//   POST /api/admin/tenants/:id/day-zero/trigger
-//     Wist eventuele bestaande progress row en queued een
-//     nieuwe Day Zero job. Idempotent veilig: kan herhaaldelijk
-//     gebruikt worden.
+// Pattern overgenomen van admin-onboarding.routes.ts: lokale
+// adminAuth middleware + adminSessionService import.
 //
-//   GET /api/admin/tenants/:id/day-zero/status
-//     Inspect-endpoint. Returnt huidige status + stage_data
+// Endpoints:
+//   POST /admin/tenants/:id/day-zero/trigger
+//     Wist eventuele bestaande progress row + baseline plan en
+//     queued een nieuwe Day Zero job. Idempotent veilig.
+//
+//   GET /admin/tenants/:id/day-zero/status
+//     Inspect endpoint. Returnt huidige status + stage_data
 //     voor admin debugging.
 // ============================================================
 
-import { Router, Response, NextFunction } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { db } from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
 import { dayZeroService } from '../../day-zero/service/day-zero.service';
-import type { AuthedRequest } from './admin.middleware';
+import { adminSessionService } from '../service/admin-session.service';
+
+interface AuthedRequest extends Request {
+  adminSession?: { id: string };
+}
 
 const router = Router();
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ── Admin auth middleware ────────────────────────────────────
+async function adminAuth(req: AuthedRequest, res: Response, next: NextFunction): Promise<void> {
+  const token = req.headers['x-admin-session'];
+
+  if (typeof token !== 'string') {
+    res.status(401).json({ error: 'Onbevoegd' });
+    return;
+  }
+
+  const session = await adminSessionService.verify(token);
+  if (!session) {
+    res.status(401).json({ error: 'Sessie verlopen of ongeldig' });
+    return;
+  }
+
+  req.adminSession = session;
+  next();
+}
+
+router.use(adminAuth);
 
 // ============================================================
 // POST /admin/tenants/:id/day-zero/trigger
@@ -31,7 +60,7 @@ router.post('/tenants/:id/day-zero/trigger', async (req: AuthedRequest, res: Res
   try {
     const { id } = req.params;
 
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    if (!UUID_REGEX.test(id)) {
       res.status(400).json({ error: 'Ongeldig tenant id' });
       return;
     }
@@ -67,7 +96,7 @@ router.get('/tenants/:id/day-zero/status', async (req: AuthedRequest, res: Respo
   try {
     const { id } = req.params;
 
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    if (!UUID_REGEX.test(id)) {
       res.status(400).json({ error: 'Ongeldig tenant id' });
       return;
     }
