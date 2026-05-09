@@ -3,10 +3,9 @@
 //
 // Endpoints voor de tenant-facing Day Zero progress polling.
 //
-// FIX: tenantMiddleware mount alleen op de specifieke route, niet
-// op de hele router. Anders wordt CORS preflight (OPTIONS) ook
-// door auth-check gestuurd en faalt met 401 zonder CORS headers,
-// waardoor de browser de echte request nooit verstuurt.
+// FIX: tenantMiddleware is een factory function (higher-order),
+// dus moet je hem aanroepen: tenantMiddleware().
+// Identiek aan onboarding.routes.ts en feature-flags.routes.ts.
 //
 // Endpoints:
 //   GET /api/day-zero/status
@@ -18,9 +17,10 @@ import { getTenantContext } from '../../../shared/middleware/tenant-context';
 import { dayZeroService } from '../service/day-zero.service';
 
 const router = Router();
+router.use(tenantMiddleware());
 
 // GET /api/day-zero/status
-router.get('/status', tenantMiddleware, async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/status', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const ctx = getTenantContext();
     const dto = await dayZeroService.getStatusDTO(ctx.tenantId);
