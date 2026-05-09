@@ -2,20 +2,63 @@
 // src/modules/day-zero/service/day-zero.service.ts
 //
 // Orchestratie van de 5-stage Day Zero job.
-// Wordt aangeroepen door de BullMQ worker (1 job per stage).
+// Single source of truth voor:
+//   - initForTenant: aangeroepen door /api/onboarding/complete
+//   - runStage: aangeroepen door BullMQ worker per stage
+//   - getStatusDTO: aangeroepen door /api/day-zero/status polling
+//   - Plan lookup: bepalen welke priority een tenant in de queue krijgt
 //
-// Per stage: markRunning -> uitvoer -> updateStage of markFailed.
-// Stage 5 finalize -> markCompleted.
+// Sprint 3a: stage 1 echt, stages 2-5 stubs (worden vervangen in 3b en 3c).
 // ============================================================
 
 import { logger } from '../../../shared/logging/logger';
+import { supabaseAdmin } from '../../../shared/database/supabase';
 import { dayZeroRepository, DayZeroRepository } from '../repository/day-zero.repository';
 import { stage1IngestionService, Stage1IngestionService } from '../stages/stage-1-ingestion';
 import {
+  enqueueDayZero,
+  enqueueNextStage,
+} from '../queue/day-zero.queue';
+import {
   DayZeroJobData,
+  DayZeroProgressRow,
   DayZeroStage,
+  DayZeroStatusDTO,
   STAGE_NAMES,
+  TenantPlan,
 } from '../types/day-zero.types';
+
+// --------------------------------------------------------------
+// Progress berekening config
+// --------------------------------------------------------------
+
+// Cumulatieve percentage punten per stage (eind van stage N).
+// Stage 1 = ingestion klaar, Stage 5 = alles klaar.
+const STAGE_END_PERCENTS = [0, 13, 46, 79, 95, 100];
+
+// Per-stage budget in seconden (architectuur Plan §6 Gap 3).
+const STAGE_BUDGETS_SEC: Record<DayZeroStage, number> = {
+  0: 0,
+  1: 120,
+  2: 300,
+  3: 300,
+  4: 180,
+  5: 30,
+};
+
+const TOTAL_BUDGET_SEC = Object.values(STAGE_BUDGETS_SEC).reduce((a, b) => a + b, 0);
+
+// Cumulatief: wanneer (sinds started_at) verwachten we dat stage N start.
+const STAGE_START_OFFSETS_SEC: Record<DayZeroStage, number> = {
+  0: 0,
+  1: 0,
+  2: STAGE_BUDGETS_SEC[1],
+  3: STAGE_BUDGETS_SEC[1] + STAGE_BUDGETS_SEC[2],
+  4: STAGE_BUDGETS_SEC[1] + STAGE_BUDGETS_SEC[2] + STAGE_BUDGETS_SEC[3],
+  5: STAGE_BUDGETS_SEC[1] + STAGE_BUDGETS_SEC[2] + STAGE_BUDGETS_SEC[3] + STAGE_BUDGETS_SEC[4],
+};
+
+// ============================================================
 
 export class DayZeroService {
 
@@ -24,29 +67,68 @@ export class DayZeroService {
     private readonly stage1:  Stage1IngestionService  = stage1IngestionService,
   ) {}
 
+  // --------------------------------------------------------------
+  // Public: aangeroepen door onboarding flow
+  // --------------------------------------------------------------
+
   /**
-   * Idempotent init. Aangeroepen door /api/onboarding/complete.
+   * Idempotent. Maakt rij aan en enqueued stage 1 als er nog niet draait.
+   * Aangeroepen door /api/onboarding/complete.
    */
-  async initForTenant(tenantId: string): Promise<{ created: boolean; status: string }> {
+  async initForTenant(tenantId: string): Promise<{ status: string; jobId: string | null }> {
     const row = await this.repo.createIfNotExists(tenantId);
+
+    if (row.status === 'completed') {
+      logger.info('day_zero.init.already_completed', { tenantId });
+      return { status: 'completed', jobId: null };
+    }
+    if (row.status === 'running') {
+      logger.info('day_zero.init.already_running', { tenantId });
+      return { status: 'running', jobId: null };
+    }
+
+    const plan = await this.fetchTenantPlan(tenantId);
+    await enqueueDayZero(tenantId, plan);
+
+    logger.info('day_zero.init.enqueued', { tenantId, plan });
     return {
-      created: row.status === 'pending' && row.current_stage === 0,
-      status:  row.status,
+      status: 'running',
+      jobId: `day-zero:${tenantId}:stage-1`,
     };
   }
 
-  /**
-   * Worker entry point. Wordt aangeroepen voor elke stage job.
-   * Stage 1 is gefaseerd 1->2->3->4->5; elke stage enqueue de volgende.
-   */
+  // --------------------------------------------------------------
+  // Public: aangeroepen door /api/day-zero/status
+  // --------------------------------------------------------------
+
+  async getStatusDTO(tenantId: string): Promise<DayZeroStatusDTO | null> {
+    const row = await this.repo.getByTenantId(tenantId);
+    if (!row) return null;
+
+    return {
+      status:             row.status,
+      current_stage:      row.current_stage,
+      current_stage_name: STAGE_NAMES[row.current_stage],
+      progress_percent:   computeProgressPercent(row),
+      eta_seconds:        computeEtaSeconds(row),
+      started_at:         row.started_at,
+      completed_at:       row.completed_at,
+      error_message:      row.error_message,
+    };
+  }
+
+  // --------------------------------------------------------------
+  // Public: aangeroepen door BullMQ worker
+  // --------------------------------------------------------------
+
   async runStage(job: DayZeroJobData): Promise<{ next: DayZeroStage | null }> {
     const { tenantId, stage } = job;
 
     logger.info('day_zero.stage.start', {
-      tenantId,
-      stage,
-      stageName: STAGE_NAMES[stage],
+      tenantId, stage, stageName: STAGE_NAMES[stage],
     });
+
+    let next: DayZeroStage | null = null;
 
     try {
       await this.repo.markRunning(tenantId, stage);
@@ -55,25 +137,29 @@ export class DayZeroService {
         case 1: {
           const output = await this.stage1.run(tenantId);
           await this.repo.updateStage(tenantId, 1, { stage_1: output });
-          return { next: 2 };
+          next = 2;
+          break;
         }
 
         case 2: {
           // Sprint 3b: brand voice via Haiku op products.description
           await this.runStubStage(tenantId, 2);
-          return { next: 3 };
+          next = 3;
+          break;
         }
 
         case 3: {
           // Sprint 3b: pattern detection (top SKUs, seasonality, segments)
           await this.runStubStage(tenantId, 3);
-          return { next: 4 };
+          next = 4;
+          break;
         }
 
         case 4: {
           // Sprint 3b: baseline plan generation via Sonnet
           await this.runStubStage(tenantId, 4);
-          return { next: 5 };
+          next = 5;
+          break;
         }
 
         case 5: {
@@ -81,7 +167,8 @@ export class DayZeroService {
           await this.runStubStage(tenantId, 5);
           await this.repo.markCompleted(tenantId);
           logger.info('day_zero.completed', { tenantId });
-          return { next: null };
+          next = null;
+          break;
         }
 
         default:
@@ -89,19 +176,26 @@ export class DayZeroService {
       }
     } catch (err: any) {
       const message = err?.message ?? 'unknown error';
-      logger.error('day_zero.stage.failed', {
-        tenantId,
-        stage,
-        error: message,
-      });
+      logger.error('day_zero.stage.failed', { tenantId, stage, error: message });
       await this.repo.markFailed(tenantId, stage, message);
       throw err;  // BullMQ retry triggeren
     }
+
+    // Auto-enqueue volgende stage met dezelfde plan-priority
+    if (next !== null) {
+      const plan = await this.fetchTenantPlan(tenantId);
+      await enqueueNextStage(tenantId, next, plan);
+    }
+
+    return { next };
   }
 
+  // --------------------------------------------------------------
+  // Internal helpers
+  // --------------------------------------------------------------
+
   /**
-   * Tijdelijk: zet stage_data zodat polling page progress laat zien.
-   * Vervangen door echte logica in sprint 3b en 3c.
+   * Tijdelijk voor sprint 3a. Vervangen in sprint 3b en 3c door echte logica.
    */
   private async runStubStage(tenantId: string, stage: DayZeroStage): Promise<void> {
     await new Promise((res) => setTimeout(res, 2000));
@@ -112,6 +206,71 @@ export class DayZeroService {
       },
     } as any);
   }
+
+  /**
+   * ASSUMPTION: tenants.plan kolom bestaat met 'starter' | 'growth' | 'scale'.
+   * Als jouw schema plan in subscriptions of via Stripe doet, pas hier aan.
+   * Fallback bij onbekend plan: 'starter' (laagste priority, veiligste default).
+   */
+  private async fetchTenantPlan(tenantId: string): Promise<TenantPlan> {
+    const { data, error } = await supabaseAdmin
+      .from('tenants')
+      .select('plan')
+      .eq('id', tenantId)
+      .maybeSingle();
+
+    if (error || !data) {
+      logger.warn('day_zero.plan_fallback', { tenantId, error: error?.message });
+      return 'starter';
+    }
+
+    const plan = (data as any).plan as string;
+    if (plan === 'scale' || plan === 'growth' || plan === 'starter') return plan;
+    return 'starter';
+  }
+}
+
+// ============================================================
+// Pure helpers (geexporteerd voor testbaarheid)
+// ============================================================
+
+export function computeProgressPercent(row: DayZeroProgressRow): number {
+  if (row.status === 'pending')   return 0;
+  if (row.status === 'completed') return 100;
+
+  if (row.status === 'failed') {
+    // Geen forward progress fake bij fout. Toon laatste afgeronde stage.
+    const lastDone = Math.max(0, row.current_stage - 1);
+    return STAGE_END_PERCENTS[lastDone] ?? 0;
+  }
+
+  // Running: smooth interpolatie binnen huidige stage op basis van elapsed time
+  const stage = row.current_stage;
+  const stageStartPct = STAGE_END_PERCENTS[stage - 1] ?? 0;
+  const stageEndPct   = STAGE_END_PERCENTS[stage]     ?? 100;
+
+  const startedAtMs = row.started_at ? new Date(row.started_at).getTime() : Date.now();
+  const elapsedSec  = (Date.now() - startedAtMs) / 1000;
+
+  const stageStartOffset = STAGE_START_OFFSETS_SEC[stage] ?? 0;
+  const stageBudget      = STAGE_BUDGETS_SEC[stage]       ?? 60;
+
+  const elapsedInStage = Math.max(0, elapsedSec - stageStartOffset);
+  const stageProgress  = Math.min(1, elapsedInStage / stageBudget);
+
+  const pct = stageStartPct + (stageEndPct - stageStartPct) * stageProgress;
+  return Math.max(0, Math.min(99, Math.round(pct)));
+}
+
+export function computeEtaSeconds(row: DayZeroProgressRow): number | null {
+  if (row.status === 'pending')   return TOTAL_BUDGET_SEC;
+  if (row.status === 'completed') return 0;
+  if (row.status === 'failed')    return null;
+
+  if (!row.started_at) return TOTAL_BUDGET_SEC;
+
+  const elapsedSec = (Date.now() - new Date(row.started_at).getTime()) / 1000;
+  return Math.max(0, Math.round(TOTAL_BUDGET_SEC - elapsedSec));
 }
 
 export const dayZeroService = new DayZeroService();
