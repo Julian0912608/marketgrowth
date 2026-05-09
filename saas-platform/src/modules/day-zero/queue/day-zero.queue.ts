@@ -2,14 +2,11 @@
 // src/modules/day-zero/queue/day-zero.queue.ts
 //
 // BullMQ queue voor Day Zero stage jobs.
-//
-// LET OP: ik maak hier mijn eigen Queue + Redis connection vanuit env.
-// Als jouw codebase al een shared Redis-helper heeft (bijv.
-// shared/queue/redis.ts), vervang `connection` door die import.
+// Gebruikt hetzelfde Redis-pattern als sync.worker.ts en email.worker.ts:
+// TLS-aware connection met servername hint voor Upstash.
 // ============================================================
 
 import { Queue, QueueEvents } from 'bullmq';
-import IORedis from 'ioredis';
 import { logger } from '../../../shared/logging/logger';
 import {
   DayZeroJobData,
@@ -18,24 +15,35 @@ import {
   TenantPlan,
 } from '../types/day-zero.types';
 
-// --------------------------------------------------------------
-// Connection
-// --------------------------------------------------------------
+// ── Redis connectie (gelijk aan sync/email workers) ───────────
+function buildConnection() {
+  const url = process.env.REDIS_URL;
+  const IORedis = require('ioredis');
 
-const REDIS_URL = process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL;
-if (!REDIS_URL) {
-  throw new Error('REDIS_URL or UPSTASH_REDIS_URL must be set for Day Zero queue.');
+  if (!url) {
+    return new IORedis({ host: 'localhost', port: 6379, maxRetriesPerRequest: null });
+  }
+
+  const isTLS  = url.startsWith('rediss://');
+  let hostname = 'localhost';
+  try { hostname = new URL(url).hostname; } catch {}
+
+  return new IORedis(url, {
+    tls: isTLS ? { rejectUnauthorized: false, servername: hostname } : undefined,
+    maxRetriesPerRequest: null,
+    enableOfflineQueue:   true,
+    lazyConnect:          false,
+    family:               4,
+    retryStrategy: (times: number) => {
+      if (times > 10) return null;
+      return Math.min(times * 500, 5000);
+    },
+  });
 }
 
-export const dayZeroConnection = new IORedis(REDIS_URL, {
-  maxRetriesPerRequest:  null,    // BullMQ vereiste
-  enableReadyCheck:      false,
-});
+export const dayZeroConnection = buildConnection();
 
-// --------------------------------------------------------------
-// Queue
-// --------------------------------------------------------------
-
+// ── Queue ─────────────────────────────────────────────────────
 export const DAY_ZERO_QUEUE_NAME = 'day-zero';
 
 export const dayZeroQueue = new Queue<DayZeroJobData>(DAY_ZERO_QUEUE_NAME, {
@@ -44,21 +52,21 @@ export const dayZeroQueue = new Queue<DayZeroJobData>(DAY_ZERO_QUEUE_NAME, {
     attempts: 3,
     backoff: {
       type:  'exponential',
-      delay: 30_000,    // 30s, 60s, 120s
+      delay: 30_000,
     },
     removeOnComplete: {
-      age:   60 * 60 * 24,    // 24h
+      age:   60 * 60 * 24,
       count: 1000,
     },
     removeOnFail: {
-      age: 60 * 60 * 24 * 7,  // 7d voor debugging
+      age: 60 * 60 * 24 * 7,
     },
   },
 });
 
-// QueueEvents instance voor logging
+// ── Queue events voor logging ─────────────────────────────────
 export const dayZeroQueueEvents = new QueueEvents(DAY_ZERO_QUEUE_NAME, {
-  connection: dayZeroConnection.duplicate(),
+  connection: buildConnection(),
 });
 
 dayZeroQueueEvents.on('failed', ({ jobId, failedReason }) => {
@@ -69,14 +77,7 @@ dayZeroQueueEvents.on('completed', ({ jobId, returnvalue }) => {
   logger.info('day_zero.queue.completed', { jobId, returnvalue });
 });
 
-// --------------------------------------------------------------
-// Public API
-// --------------------------------------------------------------
-
-/**
- * Enqueue de eerste stage. Volgende stages worden door de worker
- * zelf ge-enqueued na succesvolle completion.
- */
+// ── Public API ────────────────────────────────────────────────
 export async function enqueueDayZero(
   tenantId: string,
   plan:     TenantPlan,
@@ -88,17 +89,13 @@ export async function enqueueDayZero(
     { tenantId, stage: 1 },
     {
       priority,
-      jobId: `day-zero:${tenantId}:stage-1`,    // idempotent: zelfde tenant kan niet twee keer stage 1 starten
+      jobId: `day-zero:${tenantId}:stage-1`,
     },
   );
 
   logger.info('day_zero.queue.enqueued', { tenantId, plan, priority, stage: 1 });
 }
 
-/**
- * Wordt door de worker aangeroepen na een succesvolle stage,
- * om de volgende stage te plannen.
- */
 export async function enqueueNextStage(
   tenantId: string,
   nextStage: DayZeroStage,
