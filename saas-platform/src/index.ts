@@ -222,6 +222,12 @@ try {
 } catch (e: any) { console.error('  adminBillingActionsRouter FAILED:', e.message); }
 
 try {
+  const { adminDayZeroRouter } = require('./modules/admin/api/admin-day-zero.routes');
+  app.use('/api/admin/day-zero', adminDayZeroRouter);
+  console.log('  adminDayZeroRouter OK');
+} catch (e: any) { console.error('  adminDayZeroRouter FAILED:', e.message); }
+
+try {
   const { teamRouter } = require('./modules/team/api/team.routes');
   app.use('/api/team', teamRouter);
   console.log('  teamRouter OK');
