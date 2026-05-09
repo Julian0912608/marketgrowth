@@ -4,10 +4,10 @@
 // BullMQ queue voor Day Zero stage jobs.
 // Gebruikt hetzelfde Redis-pattern als sync.worker.ts en email.worker.ts.
 //
-// IDEMPOTENCY: per-run timestamp in jobId. Voorkomt dat een verse
-// run van dezelfde tenant geblokkeerd wordt door een oude completed
-// job met dezelfde ID. DB-rij status check in DayZeroService.initForTenant
-// doet de echte "draait al" guard.
+// IDEMPOTENCY: BullMQ genereert zelf jobIds. De "draait al" guard
+// zit in DayZeroService.initForTenant via DB status check op
+// tenant_day_zero_progress. Dat is genoeg en voorkomt dat we
+// custom jobIds met colons gebruiken (wat BullMQ 5.x weigert).
 // ============================================================
 
 import { Queue, QueueEvents } from 'bullmq';
@@ -59,7 +59,7 @@ export const dayZeroQueue = new Queue<DayZeroJobData>(DAY_ZERO_QUEUE_NAME, {
       delay: 30_000,
     },
     removeOnComplete: {
-      age:   60 * 60,    // 1 uur (was 24, korter is veiliger voor idempotency)
+      age:   60 * 60,
       count: 1000,
     },
     removeOnFail: {
@@ -85,22 +85,24 @@ dayZeroQueueEvents.on('completed', ({ jobId, returnvalue }) => {
 export async function enqueueDayZero(
   tenantId: string,
   plan:     TenantPlan,
-): Promise<void> {
+): Promise<string> {
   const priority = PLAN_PRIORITY[plan] ?? PLAN_PRIORITY.starter;
-  const runId    = Date.now();
 
-  await dayZeroQueue.add(
+  const job = await dayZeroQueue.add(
     'stage',
     { tenantId, stage: 1 },
-    {
-      priority,
-      // Per-run unieke jobId. Idempotency voor "already running"
-      // wordt afgehandeld in DayZeroService.initForTenant via DB status.
-      jobId: `day-zero:${tenantId}:stage-1:${runId}`,
-    },
+    { priority },
   );
 
-  logger.info('day_zero.queue.enqueued', { tenantId, plan, priority, stage: 1, runId });
+  logger.info('day_zero.queue.enqueued', {
+    tenantId,
+    plan,
+    priority,
+    stage:  1,
+    jobId:  job.id,
+  });
+
+  return job.id ?? 'unknown';
 }
 
 export async function enqueueNextStage(
@@ -111,16 +113,17 @@ export async function enqueueNextStage(
   if (nextStage < 1 || nextStage > 5) return;
 
   const priority = PLAN_PRIORITY[plan] ?? PLAN_PRIORITY.starter;
-  const runId    = Date.now();
 
-  await dayZeroQueue.add(
+  const job = await dayZeroQueue.add(
     'stage',
     { tenantId, stage: nextStage },
-    {
-      priority,
-      jobId: `day-zero:${tenantId}:stage-${nextStage}:${runId}`,
-    },
+    { priority },
   );
 
-  logger.info('day_zero.queue.next', { tenantId, nextStage, priority, runId });
+  logger.info('day_zero.queue.next', {
+    tenantId,
+    nextStage,
+    priority,
+    jobId: job.id,
+  });
 }
