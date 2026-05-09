@@ -6,7 +6,7 @@
 //
 // Defensive checks:
 //   - Voor pause/reactivate: retrieve Stripe sub eerst, checken
-//     dat die echt actief is. Voorkomt errors op DB ↔ Stripe drift.
+//     dat die echt actief is. Voorkomt errors op DB <-> Stripe drift.
 //   - Cancel: behandelt 'resource_missing' en 'al gecancelde' subs
 //     als success-pad (DB syncen) ipv als fout.
 //   - Billing-status: rapporteert drift terug aan de UI.
@@ -47,9 +47,19 @@ interface TenantBillingRow {
   stripe_customer_id:   string | null;
 }
 
+// Plat result-object ipv discriminated union (universele TS-compat).
+//   - found=true                -> sub bevat de Stripe Subscription
+//   - found=false, error=undef  -> 404 / resource_missing in Stripe
+//   - found=false, error set    -> netwerk- of API-fout
+interface StripeSubResult {
+  found:  boolean;
+  sub?:   Stripe.Subscription;
+  error?: string;
+}
+
 // Stripe subscription statussen die we als 'levend' beschouwen
-// (kunnen pauzeren / cancellen / reactiveren).
-const ALIVE_STRIPE_STATUSES: ReadonlySet<Stripe.Subscription.Status> = new Set([
+// (kunnen pauzeren / cancellen / reactiveren). Strings voor TS-compat.
+const ALIVE_STRIPE_STATUSES = new Set<string>([
   'active', 'trialing', 'past_due', 'unpaid',
 ]);
 
@@ -107,15 +117,11 @@ async function invalidateAllTenantCaches(tenantId: string): Promise<void> {
   ]);
 }
 
-// Probeer Stripe subscription op te halen. Returns:
-//   { found: true, sub }     - bestaat
-//   { found: false }         - bestaat niet meer (resource_missing)
-//   { error: '...' }         - andere fout (network, auth, etc)
-async function fetchStripeSub(stripeSubId: string): Promise
-  | { found: true;  sub: Stripe.Subscription }
-  | { found: false }
-  | { error: string }
-> {
+// Probeer Stripe subscription op te halen. Drie uitkomsten:
+//   { found: true, sub }        -> bestaat
+//   { found: false }            -> bestaat niet (resource_missing)
+//   { found: false, error: x }  -> andere fout (network, auth, etc)
+async function fetchStripeSub(stripeSubId: string): Promise<StripeSubResult> {
   try {
     const sub = await stripe.subscriptions.retrieve(stripeSubId);
     return { found: true, sub };
@@ -123,12 +129,11 @@ async function fetchStripeSub(stripeSubId: string): Promise
     if (err?.code === 'resource_missing' || err?.statusCode === 404) {
       return { found: false };
     }
-    return { error: err?.message ?? 'Onbekende Stripe-fout' };
+    return { found: false, error: err?.message ?? 'Onbekende Stripe-fout' };
   }
 }
 
 // ── GET /admin/tenants/:id/billing-status ────────────────────
-// Rapporteert ook DB ↔ Stripe drift wanneer dat detecteerbaar is.
 router.get('/tenants/:id/billing-status', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -143,25 +148,21 @@ router.get('/tenants/:id/billing-status', async (req: AuthedRequest, res: Respon
       return;
     }
 
-    // Optioneel: live Stripe-status ophalen voor drift-detectie.
-    // We doen dit alleen wanneer er een sub_id is. Bij netwerkfout
-    // returneren we de DB-state met stripeStatus=null (geen drift-signal).
-    let stripeStatus: Stripe.Subscription.Status | null = null;
-    let stripeMissing = false;
-    let stripePauseCollection = false;
+    let stripeStatus:          string | null = null;
+    let stripeMissing:         boolean       = false;
+    let stripePauseCollection: boolean       = false;
 
     if (row.stripe_sub_id) {
       const result = await fetchStripeSub(row.stripe_sub_id);
-      if ('found' in result && result.found) {
-        stripeStatus = result.sub.status;
+      if (result.found && result.sub) {
+        stripeStatus          = result.sub.status;
         stripePauseCollection = Boolean(result.sub.pause_collection);
-      } else if ('found' in result && !result.found) {
+      } else if (!result.found && !result.error) {
         stripeMissing = true;
       }
-      // Bij netwerkfout: stripeStatus blijft null
+      // Bij netwerkfout: stripeStatus blijft null (geen drift-signal)
     }
 
-    // Drift detectie: DB zegt active maar Stripe is dood/missing
     const driftDetected = row.tenant_status === 'active' && (
       stripeMissing ||
       (stripeStatus !== null && !ALIVE_STRIPE_STATUSES.has(stripeStatus))
@@ -229,20 +230,20 @@ router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next
     }
 
     // DEFENSIVE: check live Stripe status voor we proberen te pauzeren.
-    const fetch = await fetchStripeSub(row.stripe_sub_id);
+    const result = await fetchStripeSub(row.stripe_sub_id);
 
-    if ('error' in fetch) {
+    if (result.error) {
       logger.error('admin.stripe.pause_retrieve_failed', {
-        tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
+        tenantId: id, subId: row.stripe_sub_id, error: result.error,
       });
       res.status(502).json({
         error:   'stripe_failed',
-        message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+        message: `Stripe ophalen mislukt: ${result.error}. DB niet gewijzigd.`,
       });
       return;
     }
 
-    if (!fetch.found) {
+    if (!result.found || !result.sub) {
       res.status(409).json({
         error:    'stripe_sub_missing',
         message:  'Stripe subscription bestaat niet meer. Gebruik "Definitief annuleren" om de DB te syncen.',
@@ -251,31 +252,33 @@ router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next
       return;
     }
 
-    if (!ALIVE_STRIPE_STATUSES.has(fetch.sub.status)) {
+    if (!ALIVE_STRIPE_STATUSES.has(result.sub.status)) {
       res.status(409).json({
         error:    'stripe_sub_not_alive',
-        message:  `Stripe subscription staat op '${fetch.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
-        stripeStatus:  fetch.sub.status,
+        message:  `Stripe subscription staat op '${result.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
+        stripeStatus:  result.sub.status,
         driftDetected: true,
       });
       return;
     }
 
-    if (fetch.sub.pause_collection) {
-      res.status(409).json({
-        error:    'already_paused_in_stripe',
-        message:  'Stripe subscription is al gepauzeerd. DB wordt nu gesynct.',
-      });
-      // Ook al is Stripe al pauzed, syncen we de DB alvast voor consistentie
+    if (result.sub.pause_collection) {
+      // Stripe is al gepauzeerd: alleen DB syncen
       await db.query(
         `UPDATE tenants
-         SET status = 'suspended',
-             paused_at = COALESCE(paused_at, NOW()),
+         SET status     = 'suspended',
+             paused_at  = COALESCE(paused_at, NOW()),
              updated_at = NOW()
          WHERE id = $1`,
         [id], { allowNoTenant: true }
       );
       await invalidateAllTenantCaches(id);
+
+      res.status(200).json({
+        success:  true,
+        action:   'db_synced_to_stripe_pause',
+        message:  'Stripe was al gepauzeerd. DB nu in sync.',
+      });
       return;
     }
 
@@ -325,8 +328,6 @@ router.post('/tenants/:id/pause', async (req: AuthedRequest, res: Response, next
 });
 
 // ── POST /admin/tenants/:id/cancel ───────────────────────────
-// Behandelt resource_missing en al-gecancelde subs als success
-// (DB syncen). Voor andere fouten: fail-fast.
 router.post('/tenants/:id/cancel', async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -353,39 +354,37 @@ router.post('/tenants/:id/cancel', async (req: AuthedRequest, res: Response, nex
     let stripeAction: 'cancelled' | 'already_dead' | 'no_sub' = 'no_sub';
 
     if (row.stripe_sub_id) {
-      // Eerst retrieve om te weten of we daadwerkelijk moeten cancellen
-      const fetch = await fetchStripeSub(row.stripe_sub_id);
+      const result = await fetchStripeSub(row.stripe_sub_id);
 
-      if ('error' in fetch) {
+      if (result.error) {
         logger.error('admin.stripe.cancel_retrieve_failed', {
-          tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
+          tenantId: id, subId: row.stripe_sub_id, error: result.error,
         });
         res.status(502).json({
           error:   'stripe_failed',
-          message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+          message: `Stripe ophalen mislukt: ${result.error}. DB niet gewijzigd.`,
         });
         return;
       }
 
-      if (!fetch.found) {
-        // Sub bestaat niet meer in Stripe. Cleanup-pad: alleen DB syncen.
+      if (!result.found) {
+        // Sub bestaat niet meer in Stripe. Cleanup-pad.
         stripeAction = 'already_dead';
         logger.warn('admin.stripe.cancel_sub_missing', {
           tenantId: id, subId: row.stripe_sub_id,
         });
-      } else if (fetch.sub.status === 'canceled') {
-        // Al canceled in Stripe. Cleanup-pad: alleen DB syncen.
+      } else if (result.sub && result.sub.status === 'canceled') {
+        // Al canceled in Stripe. Cleanup-pad.
         stripeAction = 'already_dead';
         logger.warn('admin.stripe.cancel_sub_already_canceled', {
           tenantId: id, subId: row.stripe_sub_id,
         });
       } else {
-        // Levende sub: echte cancel doen
+        // Levende sub: echte cancel
         try {
           await stripe.subscriptions.cancel(row.stripe_sub_id);
           stripeAction = 'cancelled';
         } catch (stripeErr: any) {
-          // Race condition mogelijk: tussen retrieve en cancel canceled
           const isAlreadyGone = stripeErr?.code === 'resource_missing'
                              || stripeErr?.statusCode === 404;
           if (isAlreadyGone) {
@@ -484,21 +483,20 @@ router.post('/tenants/:id/reactivate', async (req: AuthedRequest, res: Response,
       return;
     }
 
-    // DEFENSIVE: check Stripe status voor we proberen te resumen
-    const fetch = await fetchStripeSub(row.stripe_sub_id);
+    const result = await fetchStripeSub(row.stripe_sub_id);
 
-    if ('error' in fetch) {
+    if (result.error) {
       logger.error('admin.stripe.reactivate_retrieve_failed', {
-        tenantId: id, subId: row.stripe_sub_id, error: fetch.error,
+        tenantId: id, subId: row.stripe_sub_id, error: result.error,
       });
       res.status(502).json({
         error:   'stripe_failed',
-        message: `Stripe ophalen mislukt: ${fetch.error}. DB niet gewijzigd.`,
+        message: `Stripe ophalen mislukt: ${result.error}. DB niet gewijzigd.`,
       });
       return;
     }
 
-    if (!fetch.found) {
+    if (!result.found || !result.sub) {
       res.status(409).json({
         error:    'stripe_sub_missing',
         message:  'Stripe subscription bestaat niet meer. Gebruik "Definitief annuleren" om de DB te syncen.',
@@ -507,11 +505,11 @@ router.post('/tenants/:id/reactivate', async (req: AuthedRequest, res: Response,
       return;
     }
 
-    if (!ALIVE_STRIPE_STATUSES.has(fetch.sub.status)) {
+    if (!ALIVE_STRIPE_STATUSES.has(result.sub.status)) {
       res.status(409).json({
         error:    'stripe_sub_not_alive',
-        message:  `Stripe subscription staat op '${fetch.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
-        stripeStatus:  fetch.sub.status,
+        message:  `Stripe subscription staat op '${result.sub.status}'. Gebruik "Definitief annuleren" om de DB te syncen.`,
+        stripeStatus:  result.sub.status,
         driftDetected: true,
       });
       return;
