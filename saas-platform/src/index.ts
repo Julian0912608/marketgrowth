@@ -246,6 +246,13 @@ try {
   console.log('  syncScheduler OK — incremental sync every 15 minutes');
 } catch (e: any) { console.error('  syncScheduler FAILED:', e.message); }
 
+// ── Day Zero worker (sprint 3a) ───────────────────────────────
+try {
+  const { createDayZeroWorker } = require('./modules/day-zero/queue/day-zero.worker');
+  createDayZeroWorker();
+  console.log('  dayZeroWorker OK');
+} catch (e: any) { console.error('  dayZeroWorker FAILED:', e.message); }
+
 // ── 404 + error handler ───────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: 'not_found' });
