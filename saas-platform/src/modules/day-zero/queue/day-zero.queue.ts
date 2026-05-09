@@ -2,8 +2,12 @@
 // src/modules/day-zero/queue/day-zero.queue.ts
 //
 // BullMQ queue voor Day Zero stage jobs.
-// Gebruikt hetzelfde Redis-pattern als sync.worker.ts en email.worker.ts:
-// TLS-aware connection met servername hint voor Upstash.
+// Gebruikt hetzelfde Redis-pattern als sync.worker.ts en email.worker.ts.
+//
+// IDEMPOTENCY: per-run timestamp in jobId. Voorkomt dat een verse
+// run van dezelfde tenant geblokkeerd wordt door een oude completed
+// job met dezelfde ID. DB-rij status check in DayZeroService.initForTenant
+// doet de echte "draait al" guard.
 // ============================================================
 
 import { Queue, QueueEvents } from 'bullmq';
@@ -55,7 +59,7 @@ export const dayZeroQueue = new Queue<DayZeroJobData>(DAY_ZERO_QUEUE_NAME, {
       delay: 30_000,
     },
     removeOnComplete: {
-      age:   60 * 60 * 24,
+      age:   60 * 60,    // 1 uur (was 24, korter is veiliger voor idempotency)
       count: 1000,
     },
     removeOnFail: {
@@ -83,17 +87,20 @@ export async function enqueueDayZero(
   plan:     TenantPlan,
 ): Promise<void> {
   const priority = PLAN_PRIORITY[plan] ?? PLAN_PRIORITY.starter;
+  const runId    = Date.now();
 
   await dayZeroQueue.add(
     'stage',
     { tenantId, stage: 1 },
     {
       priority,
-      jobId: `day-zero:${tenantId}:stage-1`,
+      // Per-run unieke jobId. Idempotency voor "already running"
+      // wordt afgehandeld in DayZeroService.initForTenant via DB status.
+      jobId: `day-zero:${tenantId}:stage-1:${runId}`,
     },
   );
 
-  logger.info('day_zero.queue.enqueued', { tenantId, plan, priority, stage: 1 });
+  logger.info('day_zero.queue.enqueued', { tenantId, plan, priority, stage: 1, runId });
 }
 
 export async function enqueueNextStage(
@@ -104,15 +111,16 @@ export async function enqueueNextStage(
   if (nextStage < 1 || nextStage > 5) return;
 
   const priority = PLAN_PRIORITY[plan] ?? PLAN_PRIORITY.starter;
+  const runId    = Date.now();
 
   await dayZeroQueue.add(
     'stage',
     { tenantId, stage: nextStage },
     {
       priority,
-      jobId: `day-zero:${tenantId}:stage-${nextStage}`,
+      jobId: `day-zero:${tenantId}:stage-${nextStage}:${runId}`,
     },
   );
 
-  logger.info('day_zero.queue.next', { tenantId, nextStage, priority });
+  logger.info('day_zero.queue.next', { tenantId, nextStage, priority, runId });
 }
