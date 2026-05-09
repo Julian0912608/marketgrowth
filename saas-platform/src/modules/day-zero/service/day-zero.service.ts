@@ -11,8 +11,8 @@
 // Sprint 3a: stage 1 echt, stages 2-5 stubs (worden vervangen in 3b en 3c).
 // ============================================================
 
+import { db } from '../../../infrastructure/database/connection';
 import { logger } from '../../../shared/logging/logger';
-import { supabaseAdmin } from '../../../shared/database/supabase';
 import { dayZeroRepository, DayZeroRepository } from '../repository/day-zero.repository';
 import { stage1IngestionService, Stage1IngestionService } from '../stages/stage-1-ingestion';
 import {
@@ -32,11 +32,8 @@ import {
 // Progress berekening config
 // --------------------------------------------------------------
 
-// Cumulatieve percentage punten per stage (eind van stage N).
-// Stage 1 = ingestion klaar, Stage 5 = alles klaar.
 const STAGE_END_PERCENTS = [0, 13, 46, 79, 95, 100];
 
-// Per-stage budget in seconden (architectuur Plan §6 Gap 3).
 const STAGE_BUDGETS_SEC: Record<DayZeroStage, number> = {
   0: 0,
   1: 120,
@@ -48,7 +45,6 @@ const STAGE_BUDGETS_SEC: Record<DayZeroStage, number> = {
 
 const TOTAL_BUDGET_SEC = Object.values(STAGE_BUDGETS_SEC).reduce((a, b) => a + b, 0);
 
-// Cumulatief: wanneer (sinds started_at) verwachten we dat stage N start.
 const STAGE_START_OFFSETS_SEC: Record<DayZeroStage, number> = {
   0: 0,
   1: 0,
@@ -71,10 +67,6 @@ export class DayZeroService {
   // Public: aangeroepen door onboarding flow
   // --------------------------------------------------------------
 
-  /**
-   * Idempotent. Maakt rij aan en enqueued stage 1 als er nog niet draait.
-   * Aangeroepen door /api/onboarding/complete.
-   */
   async initForTenant(tenantId: string): Promise<{ status: string; jobId: string | null }> {
     const row = await this.repo.createIfNotExists(tenantId);
 
@@ -142,28 +134,24 @@ export class DayZeroService {
         }
 
         case 2: {
-          // Sprint 3b: brand voice via Haiku op products.description
           await this.runStubStage(tenantId, 2);
           next = 3;
           break;
         }
 
         case 3: {
-          // Sprint 3b: pattern detection (top SKUs, seasonality, segments)
           await this.runStubStage(tenantId, 3);
           next = 4;
           break;
         }
 
         case 4: {
-          // Sprint 3b: baseline plan generation via Sonnet
           await this.runStubStage(tenantId, 4);
           next = 5;
           break;
         }
 
         case 5: {
-          // Sprint 3c: pgvector init + first daily briefing schedule
           await this.runStubStage(tenantId, 5);
           await this.repo.markCompleted(tenantId);
           logger.info('day_zero.completed', { tenantId });
@@ -178,10 +166,9 @@ export class DayZeroService {
       const message = err?.message ?? 'unknown error';
       logger.error('day_zero.stage.failed', { tenantId, stage, error: message });
       await this.repo.markFailed(tenantId, stage, message);
-      throw err;  // BullMQ retry triggeren
+      throw err;
     }
 
-    // Auto-enqueue volgende stage met dezelfde plan-priority
     if (next !== null) {
       const plan = await this.fetchTenantPlan(tenantId);
       await enqueueNextStage(tenantId, next, plan);
@@ -194,9 +181,6 @@ export class DayZeroService {
   // Internal helpers
   // --------------------------------------------------------------
 
-  /**
-   * Tijdelijk voor sprint 3a. Vervangen in sprint 3b en 3c door echte logica.
-   */
   private async runStubStage(tenantId: string, stage: DayZeroStage): Promise<void> {
     await new Promise((res) => setTimeout(res, 2000));
     await this.repo.updateStage(tenantId, stage, {
@@ -208,25 +192,34 @@ export class DayZeroService {
   }
 
   /**
-   * ASSUMPTION: tenants.plan kolom bestaat met 'starter' | 'growth' | 'scale'.
-   * Als jouw schema plan in subscriptions of via Stripe doet, pas hier aan.
-   * Fallback bij onbekend plan: 'starter' (laagste priority, veiligste default).
+   * Plan lookup via tenant_subscriptions JOIN plans.
+   * Pattern overgenomen van sync.scheduler.ts (gevalideerd in productie).
+   * Fallback bij geen actieve sub: 'starter' (laagste priority, veiligste default).
    */
   private async fetchTenantPlan(tenantId: string): Promise<TenantPlan> {
-    const { data, error } = await supabaseAdmin
-      .from('tenants')
-      .select('plan')
-      .eq('id', tenantId)
-      .maybeSingle();
+    try {
+      const result = await db.query<{ plan_slug: string }>(
+        `SELECT COALESCE(p.slug, 'starter') AS plan_slug
+         FROM tenant_subscriptions ts
+         JOIN plans p ON p.id = ts.plan_id
+         WHERE ts.tenant_id = $1
+           AND ts.status IN ('active', 'trialing')
+         ORDER BY ts.created_at DESC
+         LIMIT 1`,
+        [tenantId],
+        { allowNoTenant: true }
+      );
 
-    if (error || !data) {
-      logger.warn('day_zero.plan_fallback', { tenantId, error: error?.message });
+      const slug = result.rows[0]?.plan_slug;
+      if (slug === 'scale' || slug === 'growth' || slug === 'starter') return slug;
+      return 'starter';
+    } catch (err) {
+      logger.warn('day_zero.plan_fallback', {
+        tenantId,
+        error: (err as Error).message,
+      });
       return 'starter';
     }
-
-    const plan = (data as any).plan as string;
-    if (plan === 'scale' || plan === 'growth' || plan === 'starter') return plan;
-    return 'starter';
   }
 }
 
@@ -239,12 +232,10 @@ export function computeProgressPercent(row: DayZeroProgressRow): number {
   if (row.status === 'completed') return 100;
 
   if (row.status === 'failed') {
-    // Geen forward progress fake bij fout. Toon laatste afgeronde stage.
     const lastDone = Math.max(0, row.current_stage - 1);
     return STAGE_END_PERCENTS[lastDone] ?? 0;
   }
 
-  // Running: smooth interpolatie binnen huidige stage op basis van elapsed time
   const stage = row.current_stage;
   const stageStartPct = STAGE_END_PERCENTS[stage - 1] ?? 0;
   const stageEndPct   = STAGE_END_PERCENTS[stage]     ?? 100;
