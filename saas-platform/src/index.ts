@@ -234,6 +234,12 @@ try {
 } catch (e: any) { console.error('  adminDayZeroRouter FAILED:', e.message); }
 
 try {
+  const { dayZeroRouter } = require('./modules/day-zero/api/day-zero.routes');
+  app.use('/api/day-zero', dayZeroRouter);
+  console.log('  dayZeroRouter OK');
+} catch (e: any) { console.error('  dayZeroRouter FAILED:', e.message); }
+
+try {
   const { teamRouter } = require('./modules/team/api/team.routes');
   app.use('/api/team', teamRouter);
   console.log('  teamRouter OK');
