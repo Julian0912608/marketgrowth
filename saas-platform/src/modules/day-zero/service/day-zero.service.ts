@@ -79,13 +79,13 @@ export class DayZeroService {
       return { status: 'running', jobId: null };
     }
 
-    const plan = await this.fetchTenantPlan(tenantId);
-    await enqueueDayZero(tenantId, plan);
+    const plan  = await this.fetchTenantPlan(tenantId);
+    const jobId = await enqueueDayZero(tenantId, plan);
 
-    logger.info('day_zero.init.enqueued', { tenantId, plan });
+    logger.info('day_zero.init.enqueued', { tenantId, plan, jobId });
     return {
       status: 'running',
-      jobId: `day-zero:${tenantId}:stage-1`,
+      jobId,
     };
   }
 
