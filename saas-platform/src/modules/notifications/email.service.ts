@@ -1,11 +1,28 @@
 // ============================================================
 // saas-platform/src/modules/notifications/email.service.ts
 //
-// UPDATE: Revenue wordt nu expliciet als excl. BTW getoond
+// Daily briefing email cron. Wordt aangeroepen door
+// email.worker.ts 'daily-briefing' BullMQ repeat job op
+// '0 6 * * *' (06:00 UTC = 07:00/08:00 Amsterdam).
+//
+// Wijzigingen Gap 3c batch 3 (9 mei 2026):
+//   - aiInsight wordt nu uit tenant_briefings gelezen via
+//     briefingsService.getOrGenerateForToday(tenantId, 'email_cron').
+//     Het oude tenant_settings.ai_last_briefing pad bestond niet
+//     en wordt verwijderd. Briefings die nog niet bestaan voor
+//     vandaag worden hier on-the-fly gegenereerd met memory
+//     injection vanuit ai_memories.
+//   - Top action uit briefing.actions wordt toegevoegd aan de
+//     email als gestructureerd CTA blok onder het AI insight.
+//
+// Revenue wordt expliciet als excl. BTW getoond
+// (orders.total_amount - orders.tax_amount).
 // ============================================================
 
 import { db }     from '../../infrastructure/database/connection';
 import { logger } from '../../shared/logging/logger';
+import { briefingsService } from '../briefings/service/briefings.service';
+import { BriefingAction } from '../briefings/types/briefings.types';
 
 const RESEND_API_KEY  = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL      = 'MarketGrow <briefing@marketgrow.ai>';
@@ -20,6 +37,22 @@ interface TenantBriefingData {
   orders7d:    number;
   topProduct:  string | null;
   aiInsight:   string | null;
+  topAction:   BriefingAction | null;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function priorityColor(priority: BriefingAction['priority']): string {
+  if (priority === 'high')   return '#f87171';     // red-400
+  if (priority === 'medium') return '#fbbf24';     // amber-400
+  return '#64748b';                                // slate-500
 }
 
 function buildEmailHtml(data: TenantBriefingData): string {
@@ -58,7 +91,7 @@ function buildEmailHtml(data: TenantBriefingData): string {
                   </td>
                 </tr>
               </table>
-              <p style="color:#94a3b8;font-size:13px;margin:12px 0 0;">Daily briefing · ${dateFormatted}</p>
+              <p style="color:#94a3b8;font-size:13px;margin:12px 0 0;">Daily briefing · ${escapeHtml(dateFormatted)}</p>
             </td>
           </tr>
 
@@ -66,7 +99,7 @@ function buildEmailHtml(data: TenantBriefingData): string {
           <tr>
             <td style="background:#1e293b;padding:32px 40px 24px;">
               <h1 style="color:#fff;font-size:22px;font-weight:800;margin:0 0 8px;font-family:Georgia,serif;">
-                Good morning, ${data.firstName} 👋
+                Good morning, ${escapeHtml(data.firstName)} 👋
               </h1>
               <p style="color:#94a3b8;font-size:14px;margin:0;line-height:1.6;">
                 Here's your store overview for the last 7 days.
@@ -101,7 +134,7 @@ function buildEmailHtml(data: TenantBriefingData): string {
             <td style="background:#1e293b;padding:0 40px 24px;">
               <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px 20px;">
                 <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 6px;">Top product this week</p>
-                <p style="color:#fff;font-size:15px;font-weight:600;margin:0;">${data.topProduct}</p>
+                <p style="color:#fff;font-size:15px;font-weight:600;margin:0;">${escapeHtml(data.topProduct)}</p>
               </div>
             </td>
           </tr>` : ''}
@@ -109,10 +142,31 @@ function buildEmailHtml(data: TenantBriefingData): string {
           ${data.aiInsight ? `
           <!-- AI insight -->
           <tr>
-            <td style="background:#1e293b;padding:0 40px 32px;">
+            <td style="background:#1e293b;padding:0 40px 24px;">
               <div style="background:#1e1b4b;border:1px solid #3730a3;border-radius:12px;padding:16px 20px;">
                 <p style="color:#818cf8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">⚡ AI insight</p>
-                <p style="color:#c7d2fe;font-size:14px;line-height:1.6;margin:0;">${data.aiInsight}</p>
+                <p style="color:#c7d2fe;font-size:14px;line-height:1.6;margin:0;">${escapeHtml(data.aiInsight)}</p>
+              </div>
+            </td>
+          </tr>` : ''}
+
+          ${data.topAction ? `
+          <!-- Top action -->
+          <tr>
+            <td style="background:#1e293b;padding:0 40px 32px;">
+              <div style="background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px 20px;">
+                <table cellpadding="0" cellspacing="0" style="width:100%;">
+                  <tr>
+                    <td style="vertical-align:top;width:8px;padding-top:6px;">
+                      <div style="width:8px;height:8px;border-radius:50%;background:${priorityColor(data.topAction.priority)};"></div>
+                    </td>
+                    <td style="padding-left:12px;">
+                      <p style="color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 4px;">Today's top action</p>
+                      <p style="color:#fff;font-size:15px;font-weight:700;margin:0 0 6px;">${escapeHtml(data.topAction.title)}</p>
+                      <p style="color:#94a3b8;font-size:13px;line-height:1.6;margin:0;">${escapeHtml(data.topAction.description)}</p>
+                    </td>
+                  </tr>
+                </table>
               </div>
             </td>
           </tr>` : ''}
@@ -171,10 +225,32 @@ async function sendBriefingEmail(data: TenantBriefingData): Promise<void> {
     throw new Error('Resend API error (' + res.status + '): ' + body.slice(0, 200));
   }
 
-  logger.info('email.briefing.sent', { tenantId: data.tenantId, email: data.email });
+  logger.info('email.briefing.sent', {
+    tenantId:    data.tenantId,
+    email:       data.email,
+    hasInsight:  !!data.aiInsight,
+    hasAction:   !!data.topAction,
+  });
+}
+
+/**
+ * Selecteer de "top action" voor de email.
+ * Prioriteit volgorde: high > medium > low.
+ * Tied priorities: eerste in de array wint (AI volgorde).
+ */
+function pickTopAction(actions: BriefingAction[]): BriefingAction | null {
+  if (!Array.isArray(actions) || actions.length === 0) return null;
+
+  const sorted = [...actions].sort((a, b) => {
+    const order: Record<BriefingAction['priority'], number> = { high: 0, medium: 1, low: 2 };
+    return (order[a.priority] ?? 99) - (order[b.priority] ?? 99);
+  });
+
+  return sorted[0] ?? null;
 }
 
 export async function sendDailyBriefings(): Promise<void> {
+  const startedAt = Date.now();
   logger.info('email.daily_briefing.start');
 
   const tenantsResult = await db.query(
@@ -197,9 +273,16 @@ export async function sendDailyBriefings(): Promise<void> {
 
   logger.info('email.daily_briefing.tenants', { count: tenantsResult.rows.length });
 
+  let sentCount    = 0;
+  let failedCount  = 0;
+  let withInsight  = 0;
+  let withAction   = 0;
+  let totalMemoriesUsed = 0;
+
   for (const tenant of tenantsResult.rows) {
     try {
-      const [statsResult, topProductResult, aiResult] = await Promise.all([
+      // 1. Stats + top product (DB only, snel)
+      const [statsResult, topProductResult] = await Promise.all([
         db.query(
           // total_amount - tax_amount = excl. BTW
           `SELECT
@@ -226,17 +309,48 @@ export async function sendDailyBriefings(): Promise<void> {
           [tenant.tenant_id],
           { allowNoTenant: true }
         ),
-        db.query(
-          `SELECT value FROM tenant_settings WHERE tenant_id = $1 AND key = 'ai_last_briefing'`,
-          [tenant.tenant_id],
-          { allowNoTenant: true }
-        ).catch(() => ({ rows: [] })),
       ]);
 
       const stats      = statsResult.rows[0];
       const topProduct = topProductResult.rows[0]?.title || null;
-      const aiInsight  = aiResult.rows[0]?.value || null;
 
+      // 2. AI briefing via briefingsService (memory-injected Sonnet)
+      //    - Als briefing voor vandaag al bestaat: DB read, geen tokens.
+      //    - Anders: nieuwe Sonnet call met memory injection.
+      //    Bij failure: aiInsight blijft null en de email gaat door zonder
+      //    het indigo blok (zelfde gedrag als oud, geen email-blocker).
+      let aiInsight: string | null      = null;
+      let topAction: BriefingAction | null = null;
+
+      try {
+        const briefing = await briefingsService.getOrGenerateForToday(
+          tenant.tenant_id,
+          'email_cron',
+        );
+
+        aiInsight  = briefing.briefing ?? null;
+        topAction  = pickTopAction(briefing.actions);
+
+        if (aiInsight)  withInsight++;
+        if (topAction)  withAction++;
+        totalMemoriesUsed += briefing.memoriesUsed;
+
+        logger.info('email.briefing.loaded', {
+          tenantId:     tenant.tenant_id,
+          fromCache:    briefing.fromCache,
+          memoriesUsed: briefing.memoriesUsed,
+          actionCount:  briefing.actions.length,
+        });
+      } catch (briefingErr: any) {
+        logger.warn('email.briefing.load_failed', {
+          tenantId: tenant.tenant_id,
+          error:    briefingErr?.message ?? 'unknown',
+        });
+        // aiInsight + topAction blijven null. Email gaat door zonder
+        // AI blokken (oude gedrag).
+      }
+
+      // 3. Send
       await sendBriefingEmail({
         tenantId:   tenant.tenant_id,
         email:      tenant.email,
@@ -246,10 +360,13 @@ export async function sendDailyBriefings(): Promise<void> {
         orders7d:   parseInt(stats.orders || '0'),
         topProduct,
         aiInsight,
+        topAction,
       });
 
+      sentCount++;
       await new Promise(r => setTimeout(r, 200));
     } catch (err) {
+      failedCount++;
       logger.error('email.briefing.failed', {
         tenantId: tenant.tenant_id,
         error:    (err as Error).message,
@@ -257,5 +374,13 @@ export async function sendDailyBriefings(): Promise<void> {
     }
   }
 
-  logger.info('email.daily_briefing.complete', { count: tenantsResult.rows.length });
+  logger.info('email.daily_briefing.complete', {
+    total:             tenantsResult.rows.length,
+    sent:              sentCount,
+    failed:            failedCount,
+    withInsight,
+    withAction,
+    totalMemoriesUsed,
+    durationMs:        Date.now() - startedAt,
+  });
 }
