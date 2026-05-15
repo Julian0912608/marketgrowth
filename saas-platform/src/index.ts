@@ -181,6 +181,12 @@ try {
 } catch (e: any) { console.error('  integrationRouter FAILED:', e.message); }
 
 try {
+  const { shopifyWebhookRouter } = require('./modules/integrations/api/shopify-webhook.routes');
+  app.use('/api/integrations/webhook', shopifyWebhookRouter);
+  console.log('  shopifyWebhookRouter OK');
+} catch (e: any) { console.error('  shopifyWebhookRouter FAILED:', e.message); }
+
+try {
   const { shopifyInstallRouter } = require('./modules/integrations/api/shopify-install.routes');
   app.use('/api/shopify', shopifyInstallRouter);
   console.log('  shopifyInstallRouter OK');
