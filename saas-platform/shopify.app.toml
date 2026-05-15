@@ -5,9 +5,10 @@ embedded = false
 
 [access]
 redirect_urls = [
-  "https://marketgrowth-production.up.railway.app/api/shopify/install/callback",
   "https://marketgrowth-production.up.railway.app/api/integrations/callback/shopify",
-  "https://marketgrow.ai/api/integrations/callback/shopify"
+  "https://marketgrow.ai/api/integrations/callback/shopify",
+  "https://marketgrowth-production.up.railway.app/api/shopify/install/callback",
+  "https://marketgrow.ai/api/shopify/install/callback"
 ]
 
 [webhooks]
@@ -19,7 +20,8 @@ api_version = "2026-01"
 
 [auth]
 redirect_urls = [
-  "https://marketgrowth-production.up.railway.app/api/shopify/install/callback",
   "https://marketgrowth-production.up.railway.app/api/integrations/callback/shopify",
-  "https://marketgrow.ai/api/integrations/callback/shopify"
+  "https://marketgrow.ai/api/integrations/callback/shopify",
+  "https://marketgrowth-production.up.railway.app/api/shopify/install/callback",
+  "https://marketgrow.ai/api/shopify/install/callback"
 ]
