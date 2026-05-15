@@ -17,11 +17,16 @@
 // blijft onveranderd. Deze service is uitsluitend voor de
 // App Store install path.
 //
-// FIX 15-mei: buildCallbackUrl() gebruikt nu BACKEND_PUBLIC_URL
-// (fallback Railway) ipv APP_URL. Reden: APP_URL is gezet op
-// marketgrow.ai voor de frontend-facing OAuth callbacks die via
-// Vercel rewrites naar Railway gaan. Voor /api/shopify/* bestaat
-// die rewrite niet, waardoor de install callback 404 gaf.
+// FIX 15-mei (1): buildCallbackUrl() gebruikt nu BACKEND_PUBLIC_URL
+// (fallback Railway) ipv APP_URL. Vercel heeft geen rewrite voor
+// /api/shopify/*.
+//
+// FIX 15-mei (2): re-install branch verwijderd. Backend redirect
+// nu ALTIJD naar /shopify/connect met handoff token. De frontend
+// connect page detecteert via finalize() of de shop al gekoppeld
+// is en toont dat. Dit voorkomt dat we naar een auth-protected
+// dashboard route redirecten zonder dat de gebruiker ingelogd is,
+// wat in interceptor-redirect naar /login resulteerde.
 // ============================================================
 
 import crypto from 'crypto';
@@ -63,6 +68,11 @@ interface InstallStartResult {
 interface InstallCallbackResult {
   redirectTo: string;
 }
+
+export type FinalizeOutcome =
+  | { outcome: 'connected';     integrationId: string; shop: string }
+  | { outcome: 'relinked';      integrationId: string; shop: string }
+  | { outcome: 'already_yours'; integrationId: string; shop: string };
 
 export class ShopifyInstallService {
 
@@ -114,11 +124,9 @@ export class ShopifyInstallService {
 
   /**
    * OAuth callback. Verifieert state + HMAC + shop, wisselt code
-   * in voor offline access token, bewaart token tijdelijk onder
-   * een handoff token, en geeft de frontend redirect URL terug.
-   *
-   * Als de shop al gekoppeld is aan een tenant (re-install):
-   * direct dashboard redirect, geen handoff.
+   * in voor offline access token, bewaart token onder een handoff
+   * token en redirect ALTIJD naar /shopify/connect. De connect
+   * page handelt re-install detection af via finalize().
    */
   async handleCallback(query: Record<string, string>): Promise<InstallCallbackResult> {
     const { code, hmac, shop, state } = query;
@@ -178,7 +186,6 @@ export class ShopifyInstallService {
     }
 
     // Verifieer dat alle gevraagde scopes ook gegrant zijn.
-    // (Shopify staat toe dat de user scopes terugschroeft in de URL.)
     const grantedScopes = new Set(
       (tokenJson.scope || '').split(',').map(s => s.trim()).filter(Boolean)
     );
@@ -206,49 +213,8 @@ export class ShopifyInstallService {
       }
     } catch { /* niet kritiek */ }
 
-    // Bestaat deze shop al als integration?
-    const existing = await db.query<{ tenant_id: string }>(
-      `SELECT tenant_id FROM tenant_integrations
-       WHERE platform_slug = 'shopify' AND shop_domain = $1 AND status != 'disconnected'
-       LIMIT 1`,
-      [shop],
-      { allowNoTenant: true }
-    );
-
-    if (existing.rows[0]) {
-      // Re-install: update token onder de bestaande tenant.
-      const tenantId      = existing.rows[0].tenant_id;
-      const integrationId = await upsertShopifyIntegration({
-        tenantId,
-        shop,
-        shopName,
-        accessToken: tokenJson.access_token,
-      });
-
-      try {
-        await syncQueue.add('sync:shopify:' + integrationId + ':reinstall', {
-          integrationId,
-          tenantId,
-          platformSlug: 'shopify',
-          jobType:      'full_sync' as const,
-          syncJobDbId:  uuidv4(),
-        }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
-      } catch (err: any) {
-        logger.warn('shopify.install.reinstall_sync_enqueue_failed', {
-          tenantId,
-          error: err.message,
-        });
-      }
-
-      logger.info('shopify.install.reinstalled', { tenantId, shop });
-      return {
-        redirectTo:
-          buildFrontendUrl() +
-          '/dashboard/integrations?reconnected=shopify',
-      };
-    }
-
-    // Nieuwe install: handoff token uitgeven, frontend kan finalizen.
+    // ALTIJD een handoff token uitgeven, ongeacht re-install state.
+    // Re-install detectie + correct gedrag gebeurt in finalize().
     const handoffToken = crypto.randomBytes(32).toString('hex');
     const handoff: HandoffData = {
       shop,
@@ -279,7 +245,7 @@ export class ShopifyInstallService {
    */
   async previewHandoff(
     handoffToken: string
-  ): Promise<{ shop: string; shopName: string | null }> {
+  ): Promise<{ shop: string; shopName: string | null; existsInDb: boolean }> {
     if (!isValidHandoffToken(handoffToken)) {
       throw makeError(400, 'Invalid handoff token');
     }
@@ -288,19 +254,41 @@ export class ShopifyInstallService {
       throw makeError(410, 'Handoff token expired or already used');
     }
     const data = JSON.parse(raw) as HandoffData;
-    return { shop: data.shop, shopName: data.shopName };
+
+    // Vertel de frontend of deze shop al in onze DB staat. Geen
+    // tenant_id lekken: alleen booleans.
+    const existing = await db.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM tenant_integrations
+         WHERE platform_slug = 'shopify' AND shop_domain = $1 AND status != 'disconnected'
+       ) AS exists`,
+      [data.shop],
+      { allowNoTenant: true }
+    );
+
+    return {
+      shop:       data.shop,
+      shopName:   data.shopName,
+      existsInDb: existing.rows[0]?.exists ?? false,
+    };
   }
 
   /**
    * Geroepen door ingelogde user vanaf /shopify/connect. Bindt
    * Shopify integratie aan de huidige tenant en consumeert de
-   * handoff (atomair: cache.del voor DB-werk om double-submit
-   * af te vangen).
+   * handoff.
+   *
+   * Outcomes:
+   *   - 'connected':     nieuwe koppeling
+   *   - 'relinked':      shop hoorde al bij deze tenant, token ge-update
+   *   - 'already_yours': shop is al van deze tenant, geen token-update nodig
+   *
+   * Bij conflict (shop hoort bij andere tenant): 409 error.
    */
   async finalize(
     tenantId: string,
     handoffToken: string
-  ): Promise<{ integrationId: string; shop: string }> {
+  ): Promise<FinalizeOutcome> {
     if (!isValidHandoffToken(handoffToken)) {
       throw makeError(400, 'Invalid handoff token');
     }
@@ -314,23 +302,61 @@ export class ShopifyInstallService {
     // Atomic consume voor DB-werk.
     await cache.del('shopify:install:handoff:' + handoffToken);
 
-    // Voorkom cross-tenant hijack.
-    const existing = await db.query<{ tenant_id: string }>(
-      `SELECT tenant_id FROM tenant_integrations
+    // Bestaande integratie ophalen.
+    const existing = await db.query<{ id: string; tenant_id: string }>(
+      `SELECT id, tenant_id FROM tenant_integrations
        WHERE platform_slug = 'shopify' AND shop_domain = $1 AND status != 'disconnected'
        LIMIT 1`,
       [data.shop],
       { allowNoTenant: true }
     );
-    if (existing.rows[0] && existing.rows[0].tenant_id !== tenantId) {
-      logger.warn('shopify.install.cross_tenant_attempt', {
-        currentTenant:  tenantId,
-        existingTenant: existing.rows[0].tenant_id,
-        shop:           data.shop,
+
+    if (existing.rows[0]) {
+      if (existing.rows[0].tenant_id !== tenantId) {
+        logger.warn('shopify.install.cross_tenant_attempt', {
+          currentTenant:  tenantId,
+          existingTenant: existing.rows[0].tenant_id,
+          shop:           data.shop,
+        });
+        throw makeError(
+          409,
+          'This Shopify store is already linked to another MarketGrow account. ' +
+          'Please contact support if you believe this is incorrect.'
+        );
+      }
+
+      // Re-link: zelfde tenant, token ververst.
+      const integrationId = await upsertShopifyIntegration({
+        tenantId,
+        shop:        data.shop,
+        shopName:    data.shopName,
+        accessToken: data.accessToken,
       });
-      throw makeError(409, 'This Shopify store is already linked to another MarketGrow account.');
+
+      try {
+        await syncQueue.add('sync:shopify:' + integrationId + ':relink', {
+          integrationId,
+          tenantId,
+          platformSlug: 'shopify',
+          jobType:      'full_sync' as const,
+          syncJobDbId:  uuidv4(),
+        }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
+      } catch (err: any) {
+        logger.warn('shopify.install.relink_sync_enqueue_failed', {
+          tenantId,
+          error: err.message,
+        });
+      }
+
+      logger.info('shopify.install.relinked', {
+        tenantId,
+        shop: data.shop,
+        integrationId,
+      });
+      return { outcome: 'relinked', integrationId, shop: data.shop };
     }
 
+    // Nieuwe koppeling.
     const integrationId = await upsertShopifyIntegration({
       tenantId,
       shop:        data.shop,
@@ -338,7 +364,6 @@ export class ShopifyInstallService {
       accessToken: data.accessToken,
     });
 
-    // Trigger initial full_sync.
     try {
       await syncQueue.add('sync:shopify:' + integrationId + ':initial', {
         integrationId,
@@ -359,7 +384,7 @@ export class ShopifyInstallService {
       shop: data.shop,
       integrationId,
     });
-    return { integrationId, shop: data.shop };
+    return { outcome: 'connected', integrationId, shop: data.shop };
   }
 }
 
@@ -380,14 +405,9 @@ function requireClientSecret(): string {
 }
 
 /**
- * Backend public URL voor de install callback. Gebruikt expliciet
- * BACKEND_PUBLIC_URL ipv APP_URL omdat:
- *  - APP_URL = https://marketgrow.ai (frontend host)
- *  - Vercel heeft alleen rewrites voor /api/integrations/* en
- *    NIET voor /api/shopify/*, dus de callback moet direct naar
- *    Railway.
- *  - Fallback is de Railway production URL, zodat dit zonder env
- *    aanpassing werkt.
+ * Backend public URL voor de install callback. Expliciet
+ * BACKEND_PUBLIC_URL ipv APP_URL: Vercel heeft geen rewrite voor
+ * /api/shopify/*, dus de callback moet direct naar Railway.
  */
 function buildCallbackUrl(): string {
   const base = process.env.BACKEND_PUBLIC_URL
