@@ -8,6 +8,9 @@
 //
 // V0 Gap 1: featureFlagsRouter geregistreerd op /api/feature-flags.
 // V0 Gap 1 admin: adminFeatureFlagsRouter op /api/admin/feature-flags.
+//
+// V0 Gap 4: kbRouter op /api/kb (public read, optional auth).
+// V0 Gap 4 admin: adminKbRouter op /api/admin/kb (CRUD).
 // ============================================================
 
 process.on('uncaughtException', (err) => {
@@ -103,7 +106,6 @@ app.use(requestLogger);
 app.get('/health', async (_req, res) => {
   const start = Date.now();
 
-  // DB check
   let dbOk    = false;
   let dbMs    = 0;
   let redisOk = false;
@@ -161,6 +163,14 @@ try {
   app.use('/api/feature-flags', featureFlagsRouter);
   console.log('  featureFlagsRouter OK');
 } catch (e: any) { console.error('  featureFlagsRouter FAILED:', e.message); }
+
+// V0 Gap 4: Knowledge Base public read.
+// Optional auth: non-auth users krijgen preview, auth users full body.
+try {
+  const { kbRouter } = require('./modules/knowledge-base/api/kb.routes');
+  app.use('/api/kb', kbRouter);
+  console.log('  kbRouter OK');
+} catch (e: any) { console.error('  kbRouter FAILED:', e.message); }
 
 try {
   const { dayZeroRouter } = require('./modules/day-zero/api/day-zero.routes');
@@ -228,6 +238,14 @@ try {
   app.use('/api/admin/feature-flags', adminFeatureFlagsRouter);
   console.log('  adminFeatureFlagsRouter OK');
 } catch (e: any) { console.error('  adminFeatureFlagsRouter FAILED:', e.message); }
+
+// V0 Gap 4 admin: knowledge base CRUD.
+// MOET vóór adminRouter geregistreerd zijn (zelfde reden als feature-flags).
+try {
+  const { adminKbRouter } = require('./modules/admin/api/admin-kb.routes');
+  app.use('/api/admin/kb', adminKbRouter);
+  console.log('  adminKbRouter OK');
+} catch (e: any) { console.error('  adminKbRouter FAILED:', e.message); }
 
 try {
   const { adminRouter } = require('./modules/admin/api/admin.routes');
@@ -297,7 +315,6 @@ app.listen(PORT, '0.0.0.0', () => {
   logger.info('server.started', { port: PORT, env: process.env.NODE_ENV });
   console.log(`Server running on port ${PORT}`);
 
-  // Full sync na opstarten — 10s delay zodat DB connectie stabiel is
   setTimeout(() => {
     try {
       const { startupFullSync } = require('./modules/integrations/workers/startup-sync');
