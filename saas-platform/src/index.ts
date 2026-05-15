@@ -181,6 +181,12 @@ try {
 } catch (e: any) { console.error('  integrationRouter FAILED:', e.message); }
 
 try {
+  const { shopifyInstallRouter } = require('./modules/integrations/api/shopify-install.routes');
+  app.use('/api/shopify', shopifyInstallRouter);
+  console.log('  shopifyInstallRouter OK');
+} catch (e: any) { console.error('  shopifyInstallRouter FAILED:', e.message); }
+
+try {
   const { analyticsRouter } = require('./modules/analytics/api/analytics.routes');
   app.use('/api/analytics', analyticsRouter);
   console.log('  analyticsRouter OK');
