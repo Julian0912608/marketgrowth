@@ -16,6 +16,12 @@
 // De bestaande dashboard flow (POST /api/integrations/shopify/install)
 // blijft onveranderd. Deze service is uitsluitend voor de
 // App Store install path.
+//
+// FIX 15-mei: buildCallbackUrl() gebruikt nu BACKEND_PUBLIC_URL
+// (fallback Railway) ipv APP_URL. Reden: APP_URL is gezet op
+// marketgrow.ai voor de frontend-facing OAuth callbacks die via
+// Vercel rewrites naar Railway gaan. Voor /api/shopify/* bestaat
+// die rewrite niet, waardoor de install callback 404 gaf.
 // ============================================================
 
 import crypto from 'crypto';
@@ -102,7 +108,7 @@ export class ShopifyInstallService {
         state,
       }).toString();
 
-    logger.info('shopify.install.started', { shop });
+    logger.info('shopify.install.started', { shop, redirectUri });
     return { authUrl };
   }
 
@@ -373,8 +379,19 @@ function requireClientSecret(): string {
   return v;
 }
 
+/**
+ * Backend public URL voor de install callback. Gebruikt expliciet
+ * BACKEND_PUBLIC_URL ipv APP_URL omdat:
+ *  - APP_URL = https://marketgrow.ai (frontend host)
+ *  - Vercel heeft alleen rewrites voor /api/integrations/* en
+ *    NIET voor /api/shopify/*, dus de callback moet direct naar
+ *    Railway.
+ *  - Fallback is de Railway production URL, zodat dit zonder env
+ *    aanpassing werkt.
+ */
 function buildCallbackUrl(): string {
-  const base = process.env.APP_URL || 'https://marketgrowth-production.up.railway.app';
+  const base = process.env.BACKEND_PUBLIC_URL
+    || 'https://marketgrowth-production.up.railway.app';
   return base + '/api/shopify/install/callback';
 }
 
