@@ -174,12 +174,20 @@ try {
   console.log('  billingRouter OK');
 } catch (e: any) { console.error('  billingRouter FAILED:', e.message); }
 
+// V0 Gap 6: Shopify install flow (OAuth before any UI).
+// MOET vóór integrationRouter zodat /api/shopify/* niet door
+// een generieke handler wordt opgepakt.
 try {
-  const { integrationRouter } = require('./modules/integrations/api/integration.routes');
-  app.use('/api/integrations', integrationRouter);
-  console.log('  integrationRouter OK');
-} catch (e: any) { console.error('  integrationRouter FAILED:', e.message); }
+  const { shopifyInstallRouter } = require('./modules/integrations/api/shopify-install.routes');
+  app.use('/api/shopify', shopifyInstallRouter);
+  console.log('  shopifyInstallRouter OK');
+} catch (e: any) { console.error('  shopifyInstallRouter FAILED:', e.message); }
 
+// V0 Gap 6.1: Shopify GDPR compliance webhooks (HMAC validated).
+// KRITIEK: MOET vóór integrationRouter zodat de specifieke route
+// /api/integrations/webhook/shopify niet door de catchall
+// /webhook/:platform in integration.routes.ts wordt opgepakt.
+// Express matcht mounts in registratie-volgorde.
 try {
   const { shopifyWebhookRouter } = require('./modules/integrations/api/shopify-webhook.routes');
   app.use('/api/integrations/webhook', shopifyWebhookRouter);
@@ -241,21 +249,9 @@ try {
 
 try {
   const { adminDayZeroRouter } = require('./modules/admin/api/admin-day-zero.routes');
-  app.use('/api/admin', adminDayZeroRouter);
-  console.log('  adminDayZeroRouter OK');
-} catch (e: any) { console.error('  adminDayZeroRouter FAILED:', e.message); }
-
-try {
-  const { adminDayZeroRouter } = require('./modules/admin/api/admin-day-zero.routes');
   app.use('/api/admin/day-zero', adminDayZeroRouter);
   console.log('  adminDayZeroRouter OK');
 } catch (e: any) { console.error('  adminDayZeroRouter FAILED:', e.message); }
-
-try {
-  const { dayZeroRouter } = require('./modules/day-zero/api/day-zero.routes');
-  app.use('/api/day-zero', dayZeroRouter);
-  console.log('  dayZeroRouter OK');
-} catch (e: any) { console.error('  dayZeroRouter FAILED:', e.message); }
 
 try {
   const { teamRouter } = require('./modules/team/api/team.routes');
