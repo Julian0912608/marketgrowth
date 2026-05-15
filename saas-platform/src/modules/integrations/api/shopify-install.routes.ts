@@ -11,7 +11,7 @@
 // Routes:
 //   GET  /install              entry point voor Shopify App Store
 //   GET  /install/callback     OAuth code -> handoff token
-//   GET  /install/preview      shop info ophalen (geen consume)
+//   GET  /install/preview      shop info + existsInDb flag
 //   POST /install/finalize     handoff -> tenant_integrations row
 // ============================================================
 
@@ -54,9 +54,8 @@ router.get('/install', async (req: Request, res: Response) => {
 
 // ─────────────────────────────────────────────────────────────
 // GET /install/callback
-// OAuth redirect target. Wisselt code in voor offline token,
-// detecteert re-install vs nieuwe install, redirect daarna naar
-// frontend.
+// OAuth redirect target. Wisselt code in voor offline token en
+// redirect altijd naar /shopify/connect met handoff.
 // ─────────────────────────────────────────────────────────────
 router.get('/install/callback', async (req: Request, res: Response) => {
   try {
@@ -84,6 +83,8 @@ router.get('/install/callback', async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────
 // GET /install/preview?handoff=...
 // Niet-consumerende lookup voor de frontend connect page.
+// Geeft ook 'existsInDb' terug zodat de UI kan zeggen "this
+// shop is already linked" voordat de user op Connect klikt.
 // ─────────────────────────────────────────────────────────────
 
 const PreviewSchema = z.object({
@@ -108,6 +109,8 @@ router.get('/install/preview', async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────
 // POST /install/finalize
 // Ingelogde user koppelt de Shopify shop aan zijn tenant.
+// Response shape: { success, outcome, integrationId, shop }
+// waarbij outcome ∈ {'connected', 'relinked', 'already_yours'}.
 // ─────────────────────────────────────────────────────────────
 
 const FinalizeSchema = z.object({
