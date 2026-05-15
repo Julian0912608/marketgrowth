@@ -172,6 +172,20 @@ try {
   console.log('  kbRouter OK');
 } catch (e: any) { console.error('  kbRouter FAILED:', e.message); }
 
+// V0 Gap 5b: web push subscribe/unsubscribe/eligibility.
+try {
+  const { notificationsRouter } = require('./modules/notifications/api/notifications.routes');
+  app.use('/api/notifications', notificationsRouter);
+  console.log('  notificationsRouter OK');
+} catch (e: any) { console.error('  notificationsRouter FAILED:', e.message); }
+
+// V0 Gap 5b: admin push test endpoint.
+try {
+  const { adminPushRouter } = require('./modules/admin/api/admin-push.routes');
+  app.use('/api/admin/push', adminPushRouter);
+  console.log('  adminPushRouter OK');
+} catch (e: any) { console.error('  adminPushRouter FAILED:', e.message); }
+
 try {
   const { dayZeroRouter } = require('./modules/day-zero/api/day-zero.routes');
   app.use('/api/day-zero', dayZeroRouter);
