@@ -541,16 +541,16 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
   } catch (err) { next(err); }
 });
 
+// Note: POST /api/integrations/webhook/shopify wordt afgehandeld
+// door shopifyWebhookRouter (zie src/index.ts mount). Andere
+// platforms hebben nog geen webhook handler; we returnen 410 Gone
+// zodat ze geen 501 (review red flag) krijgen.
 router.post('/webhook/:platform', async (req: Request, res: Response) => {
-  logger.warn('webhook.unimplemented_called', {
+  logger.info('webhook.no_handler_for_platform', {
     platform: req.params.platform,
-    ip: req.ip,
-    note: 'No webhook handler implemented yet for this platform',
+    note: 'shopify is afgehandeld door dedicated router; andere platforms nog niet ondersteund',
   });
-  res.status(501).json({
-    error: 'Webhook handler not implemented',
-    platform: req.params.platform,
-  });
+  res.status(410).type('text/plain').send('Webhook topic not supported');
 });
 
 export { router as integrationRouter };
