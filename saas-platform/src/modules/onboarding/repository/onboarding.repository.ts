@@ -2,7 +2,8 @@
 // src/modules/onboarding/repository/onboarding.repository.ts
 //
 // Enige plek die de onboarding-kolommen op tenants leest/schrijft.
-// Plus een afgeleide check op tenant_integrations voor shopConnected.
+// Plus afgeleide checks op tenant_integrations (shopConnected) en
+// tenant_subscriptions (hasActiveSubscription).
 //
 // Schema verifiable via:
 //   SELECT column_name FROM information_schema.columns
@@ -16,6 +17,9 @@
 //   onboarding_status TEXT NOT NULL DEFAULT 'in_progress'
 //   onboarding_step SMALLINT NOT NULL DEFAULT 1
 //   onboarding_completed_at TIMESTAMPTZ NULL
+//
+// V0 Gap 7 (16 mei 2026): getState query uitgebreid met EXISTS
+// op tenant_subscriptions om hasActiveSubscription te leveren.
 // ============================================================
 
 import { db } from '../../../infrastructure/database/connection';
@@ -38,12 +42,14 @@ interface OnboardingRow {
   business_goal:           string | null;
   marketing_style:         string | null;
   shop_connected:          boolean;
+  has_active_subscription: boolean;
 }
 
 export class OnboardingRepository {
 
-  // Haal complete state op. shop_connected wordt afgeleid uit
-  // tenant_integrations met status = 'active'.
+  // Haal complete state op. shop_connected en has_active_subscription
+  // worden afgeleid uit respectievelijk tenant_integrations en
+  // tenant_subscriptions in dezelfde query (één round-trip).
   async getState(tenantId: string): Promise<OnboardingState | null> {
     const result = await db.query<OnboardingRow>(
       `SELECT
@@ -58,7 +64,12 @@ export class OnboardingRepository {
            SELECT 1 FROM tenant_integrations ti
            WHERE ti.tenant_id = t.id
              AND ti.status = 'active'
-         ) AS shop_connected
+         ) AS shop_connected,
+         EXISTS (
+           SELECT 1 FROM tenant_subscriptions ts
+           WHERE ts.tenant_id = t.id
+             AND ts.status IN ('active', 'trialing')
+         ) AS has_active_subscription
        FROM tenants t
        WHERE t.id = $1
        LIMIT 1`,
@@ -69,14 +80,15 @@ export class OnboardingRepository {
 
     const row = result.rows[0];
     return {
-      status:           row.onboarding_status,
-      step:             this.clampStep(row.onboarding_step),
-      countryCode:      row.country_code as CountryCode | null,
-      sellsToCountries: row.sells_to_countries as SellsToCode[] | null,
-      businessGoal:     row.business_goal as BusinessGoal | null,
-      marketingStyle:   row.marketing_style as MarketingStyle | null,
-      shopConnected:    row.shop_connected,
-      completedAt:      row.onboarding_completed_at?.toISOString() ?? null,
+      status:                row.onboarding_status,
+      step:                  this.clampStep(row.onboarding_step),
+      countryCode:           row.country_code as CountryCode | null,
+      sellsToCountries:      row.sells_to_countries as SellsToCode[] | null,
+      businessGoal:          row.business_goal as BusinessGoal | null,
+      marketingStyle:        row.marketing_style as MarketingStyle | null,
+      shopConnected:         row.shop_connected,
+      hasActiveSubscription: row.has_active_subscription,
+      completedAt:           row.onboarding_completed_at?.toISOString() ?? null,
     };
   }
 
