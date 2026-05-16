@@ -1,18 +1,24 @@
 // ============================================================
-// src/modules/notifications/email.worker.ts — DEFINITIEF
+// src/modules/notifications/email.worker.ts
 // Jobs:
-//   1. daily-briefing   — elke dag 07:00 — klant AI briefing
-//   2. trial-emails     — elke dag 09:00 — dag 10 + dag 13 trial
-//   3. weekly-report    — elke maandag 08:00 — weekrapport
-//   4. admin-daily-update — elke dag 18:00 — admin overzicht
+//   1. daily-briefing     (07:00 NL) klant AI briefing + push
+//   2. trial-emails       (09:00 NL) dag 10 + dag 13 trial
+//   3. weekly-report      (maandag 08:00 NL) weekrapport
+//   4. admin-daily-update (18:00 NL) admin overzicht
+//
+// V0 Gap 5c (16 mei 2026): daily-briefing case nu ook
+// sendDailyBriefingPushes() na de email run. Push draait in
+// eigen try/catch zodat een push failure de email niet
+// ondermijnt.
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
 import { logger }               from '../../shared/logging/logger';
-import { sendDailyBriefings }   from './email.service';
-import { sendDailyAdminUpdate } from './admin.notifications.service';
-import { sendTrialEmails }      from './trial.email.service';
-import { sendWeeklyReports }    from './weekly.report.service';
+import { sendDailyBriefings }      from './email.service';
+import { sendDailyBriefingPushes } from './daily-briefing-push.service';
+import { sendDailyAdminUpdate }    from './admin.notifications.service';
+import { sendTrialEmails }         from './trial.email.service';
+import { sendWeeklyReports }       from './weekly.report.service';
 
 function buildConnection() {
   const url = process.env.REDIS_URL;
@@ -83,10 +89,10 @@ export async function scheduleEmailJobs(): Promise<void> {
 
   logger.info('email.scheduler.registered', {
     jobs: [
-      '0 6 * * *  (UTC) = 07:00 Amsterdam — klant briefings',
-      '0 8 * * *  (UTC) = 09:00 Amsterdam — trial emails',
-      '0 7 * * 1  (UTC) = 08:00 Amsterdam maandag — weekrapport',
-      '0 17 * * * (UTC) = 18:00 Amsterdam — admin update',
+      '0 6 * * *  (UTC) = 07:00 Amsterdam, klant briefing email + push',
+      '0 8 * * *  (UTC) = 09:00 Amsterdam, trial emails',
+      '0 7 * * 1  (UTC) = 08:00 Amsterdam maandag, weekrapport',
+      '0 17 * * * (UTC) = 18:00 Amsterdam, admin update',
     ],
   });
 }
@@ -99,6 +105,16 @@ export const emailWorker = new Worker(
     switch (job.name) {
       case 'daily-briefing':
         await sendDailyBriefings();
+        // Push runs in its own try/catch so it cannot break the
+        // email flow. Briefings are already DB-cached, so this
+        // is a cheap read + push-send pass.
+        try {
+          await sendDailyBriefingPushes();
+        } catch (err) {
+          logger.error('email.daily_briefing.push_step_failed', {
+            error: (err as Error).message,
+          });
+        }
         break;
       case 'trial-emails':
         await sendTrialEmails();
