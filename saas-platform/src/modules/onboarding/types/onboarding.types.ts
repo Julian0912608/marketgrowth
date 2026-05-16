@@ -1,8 +1,7 @@
 // ============================================================
 // src/modules/onboarding/types/onboarding.types.ts
 //
-// Types en allowed-value lijsten voor de 4-stappen onboarding
-// wizard (V0 Gap 2).
+// Types en allowed-value lijsten voor de onboarding wizard.
 //
 // Bron-of-truth voor:
 //   - allowed country codes (single en multi-select)
@@ -10,6 +9,11 @@
 //   - request/response shapes
 //
 // Wordt gedeeld door repository, service en routes.
+//
+// V0 Gap 7 (16 mei 2026): hasActiveSubscription toegevoegd aan
+// OnboardingState. Wordt afgeleid uit tenant_subscriptions in de
+// repository. Frontend gebruikt dit om visuele step 4 (plan) vs
+// 5 (store) te bepalen.
 // ============================================================
 
 import { BusinessGoal, MarketingStyle } from '../../../shared/types/tenant';
@@ -21,9 +25,6 @@ export type OnboardingStep   = 1 | 2 | 3 | 4;
 
 // ── Country codes ────────────────────────────────────────────
 // EU-27 + UK + NO + CH = 30 codes. ISO 3166-1 alpha-2.
-// Master Plan v3.1 sectie 7: "single select EU + UK".
-// CH en NO toegevoegd omdat ze in de feature_flags country override
-// matrix kunnen verschijnen (Phase 2 expansion).
 
 export const ALLOWED_COUNTRY_CODES = [
   'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR',
@@ -33,8 +34,6 @@ export const ALLOWED_COUNTRY_CODES = [
 
 export type CountryCode = typeof ALLOWED_COUNTRY_CODES[number];
 
-// sells_to_countries mag ook 'GLOBAL' bevatten als pseudo-keuze
-// voor founders die wereldwijd verkopen.
 export const ALLOWED_SELLS_TO_CODES = [
   ...ALLOWED_COUNTRY_CODES,
   'GLOBAL',
@@ -55,14 +54,15 @@ export const MARKETING_STYLES: readonly MarketingStyle[] = [
 // ── State response voor frontend hydration ──────────────────
 
 export interface OnboardingState {
-  status:           OnboardingStatus;
-  step:             OnboardingStep;
-  countryCode:      CountryCode | null;
-  sellsToCountries: SellsToCode[] | null;
-  businessGoal:     BusinessGoal | null;
-  marketingStyle:   MarketingStyle | null;
-  shopConnected:    boolean;
-  completedAt:      string | null;  // ISO 8601
+  status:                OnboardingStatus;
+  step:                  OnboardingStep;
+  countryCode:           CountryCode | null;
+  sellsToCountries:      SellsToCode[] | null;
+  businessGoal:          BusinessGoal | null;
+  marketingStyle:        MarketingStyle | null;
+  shopConnected:         boolean;
+  hasActiveSubscription: boolean;
+  completedAt:           string | null;  // ISO 8601
 }
 
 // ── Inputs per stap ─────────────────────────────────────────
