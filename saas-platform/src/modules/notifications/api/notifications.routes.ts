@@ -3,6 +3,15 @@
 //
 // V0 Gap 5b: Web Push subscribe/unsubscribe + eligibility check.
 //
+// V0 Gap 5c fix (16 mei 2026): de hasActiveSubscription check
+// is verwijderd uit shouldShowPrompt. Subscriptions zijn per
+// device-browser, dus een sub op laptop mag de prompt op iPhone
+// niet onderdrukken. De client filtert al via
+// Notification.permission === 'granted' op users die op DIT
+// device al subscribed zijn. hasActiveSubscription blijft in de
+// response als info-veld voor analytics, maar bepaalt niet meer
+// of de banner verschijnt.
+//
 // Endpoints (all behind tenantMiddleware, JWT required):
 //   POST   /api/notifications/subscribe     -> upsert subscription
 //   DELETE /api/notifications/subscribe     -> soft-disable
@@ -125,15 +134,18 @@ router.delete('/subscribe', async (req: Request, res: Response, next: NextFuncti
 });
 
 // ── GET /api/notifications/eligibility ───────────────────────
-// Backend gate for the prompt: applies the 24h-after-signup rule
-// and the "already subscribed?" check. The frontend layers a
-// dismiss-cooldown on top of this.
+// Backend gate for the prompt: applies the 24h-after-signup rule.
+// The "already subscribed?" check is done client-side via
+// Notification.permission (per device-browser). The frontend
+// layers a dismiss-cooldown on top of this.
 
 router.get('/eligibility', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = getTenantContext();
 
-    // Pull user signup timestamp + count active subs in one round-trip
+    // Pull user signup timestamp + count active subs in one round-trip.
+    // active_subscription_count is returned for info only, not used as
+    // a gate (see file header).
     const result = await db.query<{
       user_created_at: Date;
       active_subscription_count: string;
@@ -171,10 +183,7 @@ router.get('/eligibility', async (req: Request, res: Response, next: NextFunctio
     let shouldShowPrompt = true;
     let reason: string | undefined;
 
-    if (hasActiveSubscription) {
-      shouldShowPrompt = false;
-      reason = 'already_subscribed';
-    } else if (!oldEnough) {
+    if (!oldEnough) {
       shouldShowPrompt = false;
       reason = 'too_early';
     }
