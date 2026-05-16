@@ -1,7 +1,7 @@
 // ============================================================
 // src/modules/onboarding/service/onboarding.service.ts
 //
-// Business logic voor de 4-stappen onboarding wizard.
+// Business logic voor de onboarding wizard.
 //
 // Beslissingen vanuit Master Plan v3.1 + Julian:
 //   - Step 1 is hard required (country drives feature flags)
@@ -14,6 +14,10 @@
 //
 // Sprint 3a: complete() triggert nu een echte BullMQ Day Zero job
 // via dayZeroService.initForTenant(). Geen stub meer.
+//
+// V0 Gap 7 (16 mei 2026): complete() vereist nu
+// hasActiveSubscription. User moet eerst plan kiezen (visuele
+// step 4) voordat onboarding kan worden voltooid.
 // ============================================================
 
 import { logger } from '../../../shared/logging/logger';
@@ -123,6 +127,16 @@ export class OnboardingService {
     }
     if (current.status === 'completed') {
       return { ok: true, status: 'completed' };
+    }
+
+    // V0 Gap 7: subscription is verplicht. User moet via Stripe
+    // checkout een active of trialing subscription hebben voordat
+    // onboarding compleet kan zijn. Frontend toont Step4Plan tot
+    // hasActiveSubscription true is, dus dit zou alleen triggeren
+    // in race conditions of als de trial vervalt tijdens onboarding.
+    if (!current.hasActiveSubscription) {
+      logger.warn('onboarding.complete.blocked_no_subscription', { tenantId });
+      throw new Error('A subscription is required to complete onboarding. Please pick a plan first.');
     }
 
     await this.repo.markCompleted(tenantId);
