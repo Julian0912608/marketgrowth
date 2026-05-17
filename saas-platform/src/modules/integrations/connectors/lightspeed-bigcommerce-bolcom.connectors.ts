@@ -4,7 +4,16 @@
 // FIX: fetchViaOrders (incremental sync) haalt nu ook FBB orders
 // op en haalt per order het detail op via /retailer/orders/{id}
 // zodat open/pending orders correct worden opgeslagen met de
-// juiste prijs, datum en status — net zoals de full sync.
+// juiste prijs, datum en status, net zoals de full sync.
+//
+// V0 Bol fix (17 mei 2026):
+//   - Alle normalizeShipment/normalizeOrderDetail/normalizeOrderSummary
+//     line item mappings zetten nu zowel sku als productId op de EAN.
+//     De EAN is onze koppel-sleutel naar products.ean en moet
+//     consistent overal beschikbaar zijn.
+//   - Eerste 5 raw shipment items per sync worden gelogd zodat we
+//     in Railway kunnen zien of Bol API daadwerkelijk ean velden
+//     levert.
 // ============================================================
 
 import crypto from 'crypto';
@@ -106,17 +115,19 @@ export class LightspeedConnector implements IPlatformConnector {
       externalId:     String(p.id),
       title:          String(p.title || ''),
       status:         p.isVisible ? 'active' : 'draft',
-      totalInventory: parseInt(String(p.total_stock || '0')),
-      priceMin:       parseFloat(String(p.price || '0')),
-      updatedAt:      new Date(String(p.date_modified || p.date_created)),
+      totalInventory: parseInt(String(p.stockLevel || '0')),
+      priceMin:       parseFloat(String(p.priceIncl || '0')),
+      updatedAt:      new Date(String(p.updatedAt || p.createdAt || new Date())),
     };
   }
 
   private async get(creds: IntegrationCredentials, path: string): Promise<unknown> {
-    const res = await fetch((creds.storeUrl || '') + path, {
+    const url = (creds.storeUrl || '').replace(/\/$/, '') + path;
+    const auth = Buffer.from(`${creds.apiKey}:${creds.apiSecret}`).toString('base64');
+    const res = await fetch(url, {
       headers: {
-        'Authorization': 'Bearer ' + (creds.accessToken || creds.apiKey || ''),
-        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + auth,
+        'Accept':        'application/json',
       },
     });
     if (!res.ok) throw new Error('Lightspeed API fout ' + res.status);
@@ -133,19 +144,19 @@ export class BigCommerceConnector implements IPlatformConnector {
   async testConnection(creds: IntegrationCredentials): Promise<ConnectionTestResult> {
     try {
       const storeHash = this.extractStoreHash(creds);
-      await this.get(creds, storeHash, '/v2/store');
-      return { success: true, shopName: 'BigCommerce Store', shopCurrency: 'USD', shopCountry: 'US' };
+      await this.get(creds, storeHash, '/v2/orders?limit=1');
+      return { success: true, shopName: 'BigCommerce Store', shopCurrency: 'EUR', shopCountry: 'NL' };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : 'Verbinding mislukt' };
     }
   }
 
   async fetchOrders(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedOrder>> {
+    const storeHash = this.extractStoreHash(creds);
     const page  = options.page || 1;
     const limit = Math.min(options.limit || 250, 250);
     const params = new URLSearchParams({ page: String(page), limit: String(limit) });
     if (options.updatedAfter) params.set('min_date_modified', options.updatedAfter.toISOString());
-    const storeHash = this.extractStoreHash(creds);
     const orders = await this.get(creds, storeHash, '/v2/orders?' + params.toString()) as Record<string, unknown>[];
     const items  = (Array.isArray(orders) ? orders : []).map(o => this.normalizeOrder(o));
     return { items, hasNextPage: items.length === limit, nextPage: items.length === limit ? page + 1 : undefined };
@@ -235,6 +246,10 @@ export class BigCommerceConnector implements IPlatformConnector {
 export class BolcomConnector implements IPlatformConnector {
   readonly platform = 'bolcom' as const;
 
+  // V0 Bol fix (17 mei 2026): debug-log counter zodat we per
+  // sync alleen de eerste paar items dumpen, niet de hele batch.
+  private debugLogsRemaining = 0;
+
   async testConnection(creds: IntegrationCredentials): Promise<ConnectionTestResult> {
     try {
       await this.getAccessToken(creds);
@@ -245,6 +260,10 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   async fetchOrders(creds: IntegrationCredentials, options: FetchOptions): Promise<PaginatedResult<NormalizedOrder>> {
+    // Reset debug counter aan begin van elke fetchOrders call. Per
+    // page worden er max 5 raw items gelogd ter verificatie.
+    this.debugLogsRemaining = 5;
+
     const token      = await this.getAccessToken(creds);
     const page       = options.page || 1;
     const isFullSync = options.jobType === 'full_sync' || !options.updatedAfter;
@@ -295,7 +314,7 @@ export class BolcomConnector implements IPlatformConnector {
     return { items: orders, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
-  // FIX: Incremental sync — haalt altijd open orders op (geen tijdsfilter)
+  // FIX: Incremental sync, haalt altijd open orders op (geen tijdsfilter)
   // plus recent gewijzigde orders via change-interval-minute.
   private async fetchViaOrders(token: string, updatedAfter: Date | undefined, page: number): Promise<PaginatedResult<NormalizedOrder>> {
     const minutesAgo = updatedAfter
@@ -322,16 +341,24 @@ export class BolcomConnector implements IPlatformConnector {
       );
     }
 
-    const allResults = await Promise.all([...openOrdersPromises, ...changedOrdersPromises]);
-    const allOrders = allResults.flatMap(r => r.orders || []);
-    const hasNextPage = allResults.some(r => (r.orders || []).length === 50);
+    const [openFbr, openFbb, ...changedResults] = await Promise.all([
+      ...openOrdersPromises,
+      ...changedOrdersPromises,
+    ]);
 
-    // Dedupleer op orderId
+    const allOrderSummaries: Record<string, unknown>[] = [
+      ...(openFbr.orders || []),
+      ...(openFbb.orders || []),
+      ...changedResults.flatMap(r => r.orders || []),
+    ];
+
+    const hasNextPage = (openFbr.orders?.length === 50) || (openFbb.orders?.length === 50);
+
     const seenOrderIds = new Set<string>();
     const orders: NormalizedOrder[] = [];
 
-    for (const o of allOrders) {
-      const orderId = String(o.orderId || '');
+    for (const summary of allOrderSummaries) {
+      const orderId = String(summary.orderId || '');
       if (!orderId || seenOrderIds.has(orderId)) continue;
       seenOrderIds.add(orderId);
 
@@ -342,8 +369,8 @@ export class BolcomConnector implements IPlatformConnector {
           orders.push(normalized);
         }
       } catch {
-        const normalized = this.normalizeOrderSummary(o);
-        if (normalized.externalId) {
+        const normalized = this.normalizeOrderSummary(summary);
+        if (normalized.orderedAt && !isNaN(normalized.orderedAt.getTime()) && normalized.orderedAt.getTime() > 0) {
           orders.push(normalized);
         }
       }
@@ -352,17 +379,34 @@ export class BolcomConnector implements IPlatformConnector {
     return { items: orders, hasNextPage, nextPage: hasNextPage ? page + 1 : undefined };
   }
 
-  // ── Normaliseer order detail (heeft volledige prijs info) ──
+  // ── Normaliseer order detail (volledige data via /retailer/orders/{id})
+  // V0 Bol fix: productId = EAN, naast sku = EAN.
   private normalizeOrderDetail(o: Record<string, unknown>): NormalizedOrder {
     const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = orderItems.map(item => {
       const unitPrice = parsePrice(item.unitPrice);
       const quantity  = safeInt(item.quantity || 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
+      const ean       = String(item.ean || product?.ean || '');
+
+      // V0 Bol fix debug-log: dump eerste paar items per sync zodat
+      // we in Railway logs kunnen zien wat Bol API exact teruggeeft.
+      if (this.debugLogsRemaining > 0) {
+        this.debugLogsRemaining -= 1;
+        // eslint-disable-next-line no-console
+        console.debug('bol.order_detail.line_item_raw ' + JSON.stringify({
+          orderItemId: item.orderItemId,
+          ean:         item.ean,
+          productEan:  product?.ean,
+          productTitle: product?.title,
+        }));
+      }
+
       return {
         externalId:     String(item.orderItemId || ''),
-        sku:            String(item.ean || ''),
-        title:          String(product?.title || item.title || item.ean || ''),
+        productId:      ean || undefined,
+        sku:            ean || undefined,
+        title:          String(product?.title || item.ean || ''),
         quantity,
         unitPrice,
         totalPrice:     Math.round(unitPrice * quantity * 100) / 100,
@@ -370,7 +414,7 @@ export class BolcomConnector implements IPlatformConnector {
       };
     });
 
-    const totalAmount = lineItems.reduce((acc, li) => acc + li.totalPrice, 0);
+    const totalAmount  = lineItems.reduce((acc, li) => acc + li.totalPrice, 0);
     const orderedAtRaw = o.orderPlacedDateTime ? new Date(String(o.orderPlacedDateTime)) : new Date(0);
 
     // Bepaal status op basis van Bol.com order status
@@ -398,16 +442,20 @@ export class BolcomConnector implements IPlatformConnector {
     };
   }
 
-  // ── Normaliseer order summary (fallback — minder data) ────
+  // ── Normaliseer order summary (fallback, minder data) ────
+  // V0 Bol fix: productId = EAN, naast sku = EAN.
   private normalizeOrderSummary(o: Record<string, unknown>): NormalizedOrder {
     const orderItems = (o.orderItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = orderItems.map(item => {
       const unitPrice = parsePrice(item.unitPrice);
       const quantity  = safeInt(item.quantity || 1, 1);
       const product   = item.product as Record<string, unknown> | undefined;
+      const ean       = String(item.ean || product?.ean || '');
+
       return {
         externalId:     String(item.orderItemId || ''),
-        sku:            String(item.ean || ''),
+        productId:      ean || undefined,
+        sku:            ean || undefined,
         title:          String(product?.title || item.ean || ''),
         quantity,
         unitPrice,
@@ -441,6 +489,9 @@ export class BolcomConnector implements IPlatformConnector {
   }
 
   // ── Normaliseer shipment (fallback als order detail faalt) ─
+  // V0 Bol fix: productId = EAN, naast sku = EAN. Debug-log eerste
+  // 5 raw items per sync zodat we kunnen valideren dat Bol API
+  // de ean velden levert.
   private normalizeShipment(s: Record<string, unknown>, orderId: string): NormalizedOrder {
     const items = (s.shipmentItems as Record<string, unknown>[] | undefined) || [];
     const lineItems: NormalizedLineItem[] = items.map(item => {
@@ -448,9 +499,25 @@ export class BolcomConnector implements IPlatformConnector {
       const quantity   = safeInt(item.quantity || item.quantityShipped || 1, 1);
       const product    = item.product as Record<string, unknown> | undefined;
       const finalPrice = unitPrice > 0 ? unitPrice : parsePrice(item.fulfilmentPrice);
+      const ean        = String(item.ean || product?.ean || '');
+
+      if (this.debugLogsRemaining > 0) {
+        this.debugLogsRemaining -= 1;
+        // eslint-disable-next-line no-console
+        console.debug('bol.shipment.line_item_raw ' + JSON.stringify({
+          shipmentItemId: item.shipmentItemId,
+          orderItemId:    item.orderItemId,
+          ean:            item.ean,
+          productEan:     product?.ean,
+          productTitle:   product?.title,
+          title:          item.title,
+        }));
+      }
+
       return {
         externalId:     String(item.shipmentItemId || item.orderItemId || ''),
-        sku:            String(item.ean || product?.ean || ''),
+        productId:      ean || undefined,
+        sku:            ean || undefined,
         title:          String(product?.title || item.title || item.ean || ''),
         quantity,
         unitPrice:      finalPrice,
