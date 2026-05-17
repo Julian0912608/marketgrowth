@@ -13,9 +13,20 @@
 // UUID die naar products.id wijst. Verwijderd: gebruik nu li.title
 // direct en behoud li.product_id als externe identifier.
 //
+// V0 Gap 3c (17 mei 2026): twee verbeteringen voor product_id
+// fidelity.
+//   (1) Prompt: top_skus invoer toont nu expliciet product_id
+//       per regel met "PID:" prefix, en de regels in JSON-shape
+//       eisen letterlijk overnemen op positie-volgorde.
+//   (2) normalizePatterns: factual fallback. Als Sonnet
+//       product_id "unknown" of leeg of niet-matchend levert,
+//       vullen we de bron-product_id uit loadTopSkus() op
+//       positie-volgorde aan. Voorkomt SKU-memory koppeling
+//       breuk in Stage 5.
+//
 // Sonnet leest GEEN raw orders. Wij doen de zware aggregatie in
 // Postgres en geven Sonnet samengevatte data:
-//   - Top 10 SKUs (revenue, units, contribution share)
+//   - Top 10 SKUs (revenue, units, contribution share, product_id)
 //   - Monthly revenue voor 12 maanden
 //   - Customer counts (totaal + first-orders)
 //   - Channel mix per platform_slug
@@ -155,10 +166,10 @@ export async function runPatternDetectionStage(tenantId: string): Promise<StageR
   }
 
   const patterns = normalizePatterns(parsed, {
-    factualTopSkus: topSkus,
+    factualTopSkus:  topSkus,
     factualChannels: channelMix,
-    totalRevenue: totals.revenue,
-    totalOrders: totals.orders,
+    totalRevenue:    totals.revenue,
+    totalOrders:     totals.orders,
     customerStats,
   });
 
@@ -167,12 +178,19 @@ export async function runPatternDetectionStage(tenantId: string): Promise<StageR
     inputTokens, outputTokens,
   });
 
+  // V0 Gap 3c: log when factual product_id fallback was used
+  const pidFallbacksUsed = patterns.top_skus.filter((s, i) => {
+    const factual = topSkus[i]?.productId ?? null;
+    return s.product_id === factual && factual !== null;
+  }).length;
+
   logger.info('day_zero.patterns.complete', {
     tenantId,
-    topSkus:        patterns.top_skus.length,
-    segments:       patterns.customer_segments.length,
-    channels:       patterns.channel_mix.length,
-    quality:        patterns.data_quality,
+    topSkus:                patterns.top_skus.length,
+    segments:               patterns.customer_segments.length,
+    channels:               patterns.channel_mix.length,
+    quality:                patterns.data_quality,
+    productIdFallbacksUsed: pidFallbacksUsed,
     inputTokens,
     outputTokens,
   });
@@ -319,50 +337,47 @@ async function loadCustomerStats(tenantId: string): Promise<CustomerStats> {
   );
 
   const row = result.rows[0];
-  const totalCustomers  = parseInt(row?.total_customers ?? '0', 10);
+  const totalCustomers  = parseInt(row?.total_customers   ?? '0', 10);
   const firstOrderCount = parseInt(row?.first_order_count ?? '0', 10);
 
   return {
     totalCustomers,
     firstOrderCount,
-    // Bol-only tenants hebben totalCustomers=0 want Bol API
-    // levert geen customer entities. Meegeven als signaal aan Sonnet.
     hasCustomerTable: totalCustomers > 0,
   };
 }
 
 async function loadChannelMix(tenantId: string) {
-  const blockList = STORE_PLATFORM_BLOCKLIST.map(p => `'${p}'`).join(', ');
   const result = await db.query<{
-    platform_slug:  string;
-    revenue:        string;
-    orders:         string;
+    platform_slug: string;
+    revenue:       string;
+    orders:        string;
   }>(
     `SELECT
-       platform_slug,
-       SUM(total_amount - tax_amount)::text  AS revenue,
-       COUNT(*)::text                        AS orders
+       COALESCE(platform_slug, 'unknown')               AS platform_slug,
+       SUM(total_amount - tax_amount)::text             AS revenue,
+       COUNT(*)::text                                   AS orders
      FROM orders
      WHERE tenant_id = $1
        AND ordered_at >= now() - INTERVAL '12 months'
        AND COALESCE(status, '') NOT IN ('cancelled', 'refunded')
-       AND platform_slug NOT IN (${blockList})
-     GROUP BY platform_slug
-     ORDER BY SUM(total_amount - tax_amount) DESC NULLS LAST`,
-    [tenantId],
+       AND COALESCE(platform_slug, '') NOT IN ($2, $3, $4)
+     GROUP BY COALESCE(platform_slug, 'unknown')
+     ORDER BY SUM(total_amount - tax_amount) DESC`,
+    [tenantId, ...STORE_PLATFORM_BLOCKLIST],
     { allowNoTenant: true }
   );
 
   return result.rows.map(r => ({
-    platformSlug:  r.platform_slug,
-    revenue:       parseFloat(r.revenue) || 0,
-    orders:        parseInt(r.orders, 10) || 0,
+    platformSlug: r.platform_slug,
+    revenue:      parseFloat(r.revenue) || 0,
+    orders:       parseInt(r.orders, 10) || 0,
   }));
 }
 
 // ── Prompt construction ─────────────────────────────────────
 
-interface PromptInput {
+interface PromptInputs {
   onboarding:      OnboardingContext;
   totals:          Totals;
   topSkus:         { productId: string | null; title: string; revenue: number; units: number }[];
@@ -371,25 +386,26 @@ interface PromptInput {
   channelMix:      { platformSlug: string; revenue: number; orders: number }[];
 }
 
-function buildPrompt(input: PromptInput): string {
-  const { onboarding, totals, topSkus, monthlyRevenue, customerStats, channelMix } = input;
+function buildPrompt(inp: PromptInputs): string {
+  const { onboarding, totals, topSkus, monthlyRevenue, customerStats, channelMix } = inp;
 
-  const topSkusText = topSkus.length
+  // V0 Gap 3c: explicit PID per line so Sonnet can copy verbatim.
+  // The "PID:" prefix makes the identifier visually distinct from
+  // the title and reduces confusion with the title field.
+  const topSkusText = topSkus.length > 0
     ? topSkus.map((s, i) => {
-        const share = totals.revenue > 0
-          ? ((s.revenue / totals.revenue) * 100).toFixed(1)
-          : '0.0';
-        return `${i + 1}. ${s.title} (id=${s.productId ?? 'unknown'}): EUR ${s.revenue.toFixed(2)} excl VAT, ${s.units} units, ${share}% of revenue`;
+        const pid = s.productId ?? '(no product_id)';
+        return `  ${i + 1}. PID: ${pid} | Title: ${s.title} | Revenue: EUR ${s.revenue.toFixed(2)} | Units: ${s.units}`;
       }).join('\n')
-    : '(no SKU sales in last 12 months)';
+    : '  (no SKU data)';
 
-  const monthlyText = monthlyRevenue.length
+  const monthlyText = monthlyRevenue.length > 0
     ? monthlyRevenue.map(m =>
-        `  ${m.yearMonth} (month ${m.month}): EUR ${m.revenue.toFixed(2)} excl VAT, ${m.orders} orders`
+        `  ${m.yearMonth}: EUR ${m.revenue.toFixed(2)} (${m.orders} orders)`
       ).join('\n')
     : '  (no monthly data)';
 
-  const channelText = channelMix.length
+  const channelText = channelMix.length > 0
     ? channelMix.map(c =>
         `  ${c.platformSlug}: EUR ${c.revenue.toFixed(2)} excl VAT, ${c.orders} orders`
       ).join('\n')
@@ -416,7 +432,7 @@ function buildPrompt(input: PromptInput): string {
     `  first order date: ${totals.firstOrderAt ?? 'unknown'}`,
     `  last order date: ${totals.lastOrderAt ?? 'unknown'}`,
     '',
-    'Top SKUs by revenue:',
+    'Top SKUs by revenue (each line lists PID = product_id and Title verbatim):',
     topSkusText,
     '',
     'Monthly revenue:',
@@ -448,7 +464,8 @@ function buildPrompt(input: PromptInput): string {
     '}',
     '',
     'Rules:',
-    '- top_skus: copy product_id, title, revenue_excl_vat, units_sold from input. contribution_pct sums to 100 across listed SKUs.',
+    '- top_skus: copy product_id (PID), title, revenue_excl_vat (= Revenue), units_sold (= Units) VERBATIM from the input lines in the SAME ORDER. Do not invent, abbreviate, or replace product_id with "unknown" or "n/a". If a PID is missing (line shows "(no product_id)"), use null for product_id. The product_id field is a platform-external string (Bol EAN, Shopify product_id) and must be returned exactly as given.',
+    '- top_skus: add contribution_pct yourself; the listed SKUs combined sum to 100.',
     '- seasonality: include all 12 months. index 1.0 = year average. Mark notable when index > 1.3 or < 0.7.',
     '- customer_segments: max 3 segments. If customer table is empty, infer from order behaviour and top SKUs.',
     '- channel_mix: one entry per platform_slug from input. Compute shares from totals.',
@@ -467,16 +484,49 @@ interface NormalizeContext {
   customerStats:    CustomerStats;
 }
 
+// V0 Gap 3c: detect Sonnet output that lost product_id fidelity.
+// "unknown", "n/a", empty strings and obvious placeholders all
+// signal the model dropped the actual identifier.
+const SUSPECT_PID_VALUES = new Set([
+  'unknown', 'n/a', 'na', 'none', 'null', 'placeholder', '-', '?',
+]);
+
+function isSuspectProductId(raw: unknown): boolean {
+  if (raw == null) return true;
+  const s = String(raw).trim();
+  if (s.length === 0) return true;
+  return SUSPECT_PID_VALUES.has(s.toLowerCase());
+}
+
 function normalizePatterns(parsed: unknown, ctx: NormalizeContext): Patterns {
   const obj = (parsed && typeof parsed === 'object')
     ? parsed as Record<string, unknown>
     : {};
 
   const topSkus: TopSku[] = Array.isArray(obj.top_skus)
-    ? obj.top_skus.slice(0, TOP_SKUS_LIMIT).map((s: unknown) => {
+    ? obj.top_skus.slice(0, TOP_SKUS_LIMIT).map((s: unknown, i: number) => {
         const o = s as Record<string, unknown>;
+
+        // V0 Gap 3c: factual fallback for product_id. If Sonnet
+        // returned a placeholder ("unknown", "n/a", empty) or null,
+        // restore the real identifier from loadTopSkus() based on
+        // positional order (prompt asks Sonnet to preserve order).
+        let productId: string | null = null;
+        if (isSuspectProductId(o.product_id)) {
+          productId = ctx.factualTopSkus[i]?.productId ?? null;
+          if (productId) {
+            logger.info('day_zero.patterns.pid_fallback_applied', {
+              position:        i,
+              suspectValue:    String(o.product_id ?? '').slice(0, 32),
+              factualValue:    productId.slice(0, 32),
+            });
+          }
+        } else {
+          productId = String(o.product_id).slice(0, 64);
+        }
+
         return {
-          product_id:        o.product_id == null ? null : String(o.product_id).slice(0, 64),
+          product_id:        productId,
           title:             String(o.title ?? '').slice(0, 200),
           revenue_excl_vat:  toNum(o.revenue_excl_vat),
           units_sold:        Math.round(toNum(o.units_sold)),
@@ -502,8 +552,8 @@ function normalizePatterns(parsed: unknown, ctx: NormalizeContext): Patterns {
     ? obj.customer_segments.slice(0, 3).map((s: unknown) => {
         const o = s as Record<string, unknown>;
         return {
-          label:                String(o.label ?? '').slice(0, 80),
-          description:          String(o.description ?? '').slice(0, 400),
+          label:                String(o.label                ?? '').slice(0, 80),
+          description:          String(o.description          ?? '').slice(0, 400),
           estimated_share_pct:  clampPct(toNum(o.estimated_share_pct)),
           signals:              Array.isArray(o.signals)
             ? o.signals.slice(0, 5).map(x => String(x).slice(0, 200))
@@ -513,44 +563,37 @@ function normalizePatterns(parsed: unknown, ctx: NormalizeContext): Patterns {
     : [];
 
   const channelMix: ChannelMix[] = Array.isArray(obj.channel_mix)
-    ? obj.channel_mix.map((c: unknown) => {
+    ? obj.channel_mix.slice(0, 10).map((c: unknown) => {
         const o = c as Record<string, unknown>;
-        const trendOptions = ['up', 'down', 'stable', 'unknown'];
-        const trend = typeof o.trend === 'string' && trendOptions.includes(o.trend)
-          ? o.trend as ChannelMix['trend']
-          : 'unknown';
+        const trend = String(o.trend ?? 'unknown').toLowerCase();
         return {
           channel:            String(o.channel ?? '').slice(0, 60),
           revenue_share_pct:  clampPct(toNum(o.revenue_share_pct)),
           orders_share_pct:   clampPct(toNum(o.orders_share_pct)),
-          trend,
+          trend:              ['up', 'down', 'stable', 'unknown'].includes(trend)
+                                ? (trend as ChannelMix['trend'])
+                                : 'unknown',
         };
       })
     : [];
 
-  const dataQualityOptions: Confidence[] = ['low', 'medium', 'high'];
-  const dataQuality = typeof obj.data_quality === 'string'
-    && (dataQualityOptions as string[]).includes(obj.data_quality as string)
-    ? obj.data_quality as Confidence
-    : inferDataQuality(ctx);
+  const keyInsights: string[] = Array.isArray(obj.key_insights)
+    ? obj.key_insights.slice(0, 5).map(x => String(x).slice(0, 400))
+    : [];
+
+  const dataQuality = ['low', 'medium', 'high'].includes(String(obj.data_quality))
+    ? (String(obj.data_quality) as Confidence)
+    : 'medium';
 
   return {
-    top_skus:             topSkus,
+    top_skus:              topSkus,
     seasonality,
-    seasonality_summary:  String(obj.seasonality_summary ?? '').slice(0, 400),
-    customer_segments:    customerSegments,
-    channel_mix:          channelMix,
-    key_insights: Array.isArray(obj.key_insights)
-      ? obj.key_insights.slice(0, 5).map(x => String(x).slice(0, 300))
-      : [],
-    data_quality:         dataQuality,
+    seasonality_summary:   String(obj.seasonality_summary ?? '').slice(0, 400),
+    customer_segments:     customerSegments,
+    channel_mix:           channelMix,
+    key_insights:          keyInsights,
+    data_quality:          dataQuality,
   };
-}
-
-function inferDataQuality(ctx: NormalizeContext): Confidence {
-  if (ctx.totalOrders < 50)  return 'low';
-  if (ctx.totalOrders > 500) return 'high';
-  return 'medium';
 }
 
 function toNum(v: unknown): number {
