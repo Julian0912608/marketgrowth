@@ -15,6 +15,13 @@
 // Fallback prompt vraagt Haiku om voice af te leiden uit titles,
 // product_type, vendor en tags, met confidence='low'.
 //
+// V0 Gap 3c (17 mei 2026): prompt source_note instructie scherper
+// gemaakt. Was: Haiku schreef soms "no titles available" terwijl
+// titles wel werden meegegeven (er zijn altijd titles, alleen
+// description/type/vendor/tags/price kunnen ontbreken). Nu wordt
+// in de prompt expliciet beschreven welke velden wel/niet
+// aanwezig zijn, plus de toegestane source_note variants.
+//
 // Public:
 //   runBrandVoiceStage(tenantId): Promise<StageRunResult>
 //
@@ -204,13 +211,36 @@ function buildPrompt(products: ProductSample[], useFallback: boolean): string {
     })
     .join('\n\n');
 
+  // V0 Gap 3c: explicit availability map so Haiku does not misreport
+  // "no titles available" when titles ARE present. Titles are always
+  // present (NOT NULL in products table). The other fields are optional.
+  const richCount         = products.filter(
+    p => p.description && p.description.trim().length >= MIN_DESC_CHARS
+  ).length;
+  const withProductType   = products.filter(p => p.product_type).length;
+  const withVendor        = products.filter(p => p.vendor).length;
+  const withTags          = products.filter(p => p.tags && p.tags.length > 0).length;
+  const withPrice         = products.filter(p => p.price).length;
+
+  const availabilityNote = [
+    'Field availability across the sample:',
+    `  titles: ${products.length} of ${products.length} (always present)`,
+    `  rich descriptions (>= ${MIN_DESC_CHARS} chars): ${richCount} of ${products.length}`,
+    `  product_type: ${withProductType} of ${products.length}`,
+    `  vendor: ${withVendor} of ${products.length}`,
+    `  tags: ${withTags} of ${products.length}`,
+    `  price: ${withPrice} of ${products.length}`,
+  ].join('\n');
+
   const fallbackNote = useFallback
-    ? '\nIMPORTANT: no rich product descriptions are available in this catalogue. Base your fingerprint primarily on titles, product types, vendor, tags, and price range. Set confidence to "low" and explain the limited data in source_note.\n'
+    ? '\nIMPORTANT: rich descriptions are absent or too short across the catalogue. Base your fingerprint primarily on titles, product types, vendor, tags, and price range. Set confidence to "low" and reference the limited description data in source_note.\n'
     : '';
 
   return [
     'You are extracting the brand voice fingerprint for an ecommerce store.',
     'Analyse the product catalogue below and return a structured fingerprint.',
+    '',
+    availabilityNote,
     fallbackNote,
     'Catalogue sample:',
     compact,
@@ -225,7 +255,7 @@ function buildPrompt(products: ProductSample[], useFallback: boolean): string {
     '  "target_audience_hint": "1 sentence on who buys here",',
     '  "language_register": "informal" | "formal" | "mixed",',
     '  "confidence": "low" | "medium" | "high",',
-    '  "source_note": "1 sentence explaining the data basis"',
+    '  "source_note": "1 sentence explaining which fields formed the basis"',
     '}',
     '',
     'Rules:',
@@ -233,6 +263,7 @@ function buildPrompt(products: ProductSample[], useFallback: boolean): string {
     '- signature_phrases: 0 to 5 short recurring phrases or hooks.',
     '- taboos: 0 to 3 words or topics this brand should avoid.',
     '- All strings stay under 300 characters.',
+    '- source_note: describe which fields were available and used. NEVER write "no titles available" because titles are always present. If descriptions are missing, write something like "Based on titles, types and tags; descriptions absent" or "Based on titles and price range only; minimal metadata".',
   ].join('\n');
 }
 
@@ -264,45 +295,45 @@ function normalizeBrandVoice(
     tone: Array.isArray(obj.tone)
       ? obj.tone.slice(0, 5).map(t => String(t).slice(0, 40).toLowerCase())
       : [],
-    personality:           String(obj.personality ?? '').slice(0, 400),
+    personality:           String(obj.personality           ?? '').slice(0, 300),
     style,
-    signature_phrases: Array.isArray(obj.signature_phrases)
-      ? obj.signature_phrases.slice(0, 5).map(s => String(s).slice(0, 200))
+    signature_phrases:     Array.isArray(obj.signature_phrases)
+      ? obj.signature_phrases.slice(0, 5).map(p => String(p).slice(0, 100))
       : [],
-    taboos: Array.isArray(obj.taboos)
-      ? obj.taboos.slice(0, 3).map(s => String(s).slice(0, 100))
+    taboos:                Array.isArray(obj.taboos)
+      ? obj.taboos.slice(0, 3).map(t => String(t).slice(0, 60))
       : [],
-    target_audience_hint:  String(obj.target_audience_hint ?? '').slice(0, 300),
+    target_audience_hint:  String(obj.target_audience_hint  ?? '').slice(0, 300),
     language_register:     register,
     confidence,
-    source_note:           String(obj.source_note ?? '').slice(0, 300),
+    source_note:           String(obj.source_note           ?? '').slice(0, 300),
   };
 }
 
-function isOneOf<T extends string>(value: unknown, options: T[]): boolean {
-  return typeof value === 'string' && (options as string[]).includes(value);
+function isOneOf<T extends string>(val: unknown, options: readonly T[]): boolean {
+  return typeof val === 'string' && (options as readonly string[]).includes(val);
 }
 
-// ── Fallback voice ──────────────────────────────────────────
+// ── Neutral fallback ────────────────────────────────────────
 
 function neutralFallbackVoice(
-  reason: 'no_products' | 'parse_error' | 'api_error',
+  reason: 'no_products' | 'api_error' | 'parse_error',
 ): BrandVoice {
-  const reasonText: Record<typeof reason, string> = {
-    no_products:  'No products available at Day Zero time. Neutral baseline applied.',
-    parse_error:  'Brand voice extraction returned invalid JSON. Neutral baseline applied.',
-    api_error:    'Brand voice extraction call failed. Neutral baseline applied.',
+  const sourceNote: Record<typeof reason, string> = {
+    no_products: 'No products synced yet. Neutral fingerprint applied.',
+    api_error:   'Brand voice extraction failed. Neutral fingerprint applied.',
+    parse_error: 'Brand voice output invalid. Neutral fingerprint applied.',
   };
 
   return {
-    tone:                 ['friendly', 'clear', 'practical'],
-    personality:          'A helpful, approachable ecommerce brand that focuses on solving customer problems.',
-    style:                'mixed',
-    signature_phrases:    [],
-    taboos:               [],
-    target_audience_hint: 'Practical buyers comparing options before purchase.',
-    language_register:    'mixed',
-    confidence:           'low',
-    source_note:          reasonText[reason],
+    tone:                  ['friendly', 'clear', 'practical'],
+    personality:           'Helpful and direct.',
+    style:                 'mixed',
+    signature_phrases:     [],
+    taboos:                [],
+    target_audience_hint:  'Mainstream ecommerce shoppers.',
+    language_register:     'mixed',
+    confidence:            'low',
+    source_note:           sourceNote[reason],
   };
 }
