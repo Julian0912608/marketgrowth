@@ -4,7 +4,19 @@
 // PR 3a.3 UPDATE: products INSERT/UPDATE schrijft nu ook
 //   description, images, variants_summary, seo_description
 // (nieuwe kolommen uit migration 008). Voor Bol.com blijven
-// deze NULL — geen API support.
+// deze NULL, geen API support.
+//
+// V0 Bol fix (17 mei 2026):
+//   1. bulkInsertLineItems fallback voor product_id. Was:
+//      li.productId || null (NULL voor Bol omdat normalize geen
+//      productId zette). Nu: li.productId || li.sku || null,
+//      zodat de EAN uit Bol shipments alsnog landt in
+//      order_line_items.product_id.
+//
+//   2. Post-sync title backfill voor Bol-only producten waar
+//      products.title een EAN-getal bevat. We zoeken de echte
+//      naam in order_line_items.title via products.ean match
+//      en updaten. Draait alleen voor platform='bolcom'.
 // ============================================================
 
 import { Queue, Worker, Job } from 'bullmq';
@@ -122,6 +134,11 @@ function getPriority(planSlug?: string): number {
 }
 
 // ── Bulk INSERT helper voor line items ────────────────────────
+//
+// V0 Bol fix (17 mei 2026): product_id valt nu terug op sku
+// als productId leeg is. Voor Bol shipments waar de connector
+// alleen sku=EAN zet, krijgt order_line_items.product_id ook
+// de EAN. Dit maakt downstream JOINs op products.ean mogelijk.
 async function bulkInsertLineItems(
   orderId: string,
   tenantId: string,
@@ -141,9 +158,18 @@ async function bulkInsertLineItems(
       `($${offset+1},$${offset+2},$${offset+3},$${offset+4},$${offset+5},$${offset+6},$${offset+7},$${offset+8},$${offset+9},$${offset+10},$${offset+11},$${offset+12})`
     );
     values.push(
-      orderId, tenantId, li.externalId, li.productId || null, li.variantId || null,
-      li.sku || null, li.title, li.quantity, li.unitPrice, li.totalPrice,
-      li.discountAmount, platformSlug
+      orderId,
+      tenantId,
+      li.externalId,
+      li.productId || li.sku || null,     // V0 Bol fix: sku fallback
+      li.variantId || null,
+      li.sku || null,
+      li.title,
+      li.quantity,
+      li.unitPrice,
+      li.totalPrice,
+      li.discountAmount,
+      platformSlug
     );
   }
 
@@ -157,10 +183,76 @@ async function bulkInsertLineItems(
        quantity    = EXCLUDED.quantity,
        unit_price  = EXCLUDED.unit_price,
        total_price = EXCLUDED.total_price,
-       title       = EXCLUDED.title`,
+       title       = EXCLUDED.title,
+       product_id  = COALESCE(order_line_items.product_id, EXCLUDED.product_id),
+       sku         = COALESCE(order_line_items.sku, EXCLUDED.sku)`,
     values,
     { allowNoTenant: true }
   );
+}
+
+// ── Bol-only post-sync title backfill ──────────────────────────
+//
+// V0 Bol fix (17 mei 2026): vult products.title met de echte
+// naam uit order_line_items.title wanneer products.title een
+// EAN-achtig getal is. Match via products.ean = li.sku of
+// products.ean = li.product_id.
+//
+// Looks-like-EAN test: title is alleen cijfers, lengte 8 tot 14.
+// Veilig: raakt geen Shopify titles want die zijn nooit puur
+// numeriek.
+async function backfillBolProductTitles(tenantId: string, integrationId: string): Promise<void> {
+  try {
+    const result = await db.query<{ updated: string }>(
+      `WITH best_titles AS (
+         SELECT
+           p.id AS product_id,
+           (
+             SELECT li.title
+             FROM order_line_items li
+             WHERE li.tenant_id = p.tenant_id
+               AND (li.sku = p.ean OR li.product_id = p.ean)
+               AND li.title IS NOT NULL
+               AND li.title !~ '^\\d+$'
+               AND length(li.title) > 13
+             GROUP BY li.title
+             ORDER BY COUNT(*) DESC
+             LIMIT 1
+           ) AS new_title
+         FROM products p
+         WHERE p.tenant_id = $1
+           AND p.integration_id = $2
+           AND p.title ~ '^\\d{8,14}$'
+           AND p.ean IS NOT NULL
+       )
+       UPDATE products p
+       SET title      = bt.new_title,
+           updated_at = now()
+       FROM best_titles bt
+       WHERE p.id = bt.product_id
+         AND bt.new_title IS NOT NULL
+       RETURNING (SELECT COUNT(*)::text FROM best_titles WHERE new_title IS NOT NULL) AS updated`,
+      [tenantId, integrationId],
+      { allowNoTenant: true }
+    );
+
+    const updated = parseInt(result.rows[0]?.updated ?? '0', 10);
+    if (updated > 0) {
+      logger.info('sync.bol.title_backfill', {
+        tenantId,
+        integrationId,
+        updated,
+      });
+    }
+  } catch (err) {
+    // Niet kritiek. Sync zelf is voltooid, alleen cosmetische
+    // verbetering die in volgende run alsnog kan plaatsvinden.
+    logger.warn('sync.bol.title_backfill_failed', {
+      tenantId,
+      integrationId,
+      error: (err as Error).message,
+    });
+  }
 }
 
 // ── Sync worker ───────────────────────────────────────────────
@@ -172,7 +264,7 @@ export const syncWorker = new Worker<SyncJobPayload>(
     const slotAcquired = await acquireTenantSlot(tenantId);
     if (!slotAcquired) {
       logger.warn('sync.job.throttled', { integrationId, tenantId, platformSlug });
-      throw Object.assign(new Error('Tenant concurrency limit bereikt — wordt opnieuw geprobeerd'), {
+      throw Object.assign(new Error('Tenant concurrency limit bereikt, wordt opnieuw geprobeerd'), {
         retryable: true,
       });
     }
@@ -366,6 +458,14 @@ export const syncWorker = new Worker<SyncJobPayload>(
             productPage = result.hasNextPage
               ? (result.nextCursor ?? result.nextPage)
               : undefined;
+          }
+
+          // ── V0 Bol fix: post-sync title backfill ────────────
+          // Alleen voor Bol omdat alleen daar title=EAN voorkomt.
+          // Draait na orders + products zodat order_line_items.title
+          // beschikbaar is voor matching.
+          if (platformSlug === 'bolcom') {
+            await backfillBolProductTitles(tenantId, integrationId);
           }
 
           await db.query(
